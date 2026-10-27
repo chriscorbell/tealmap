@@ -1,5 +1,6 @@
 import * as THREE from 'three'
 import { MapControls } from 'three/examples/jsm/controls/MapControls.js'
+import { type DecodedTile, GROUPS, LEAF_INTERIOR, QUAD_ROW, TABLE_ROW } from './tile'
 import type { Request, Response } from './worker'
 import { hiresFragment, hiresVertex, lowresFragment, lowresVertex } from './shaders'
 
@@ -53,6 +54,7 @@ const FADE_MS = 450
 /** Hires tiles dissolve in over the lowres, which stays drawn until they finish. */
 const HIRES_FADE_MS = 200
 const UPLOAD_BYTES_PER_FRAME = 12e6
+const LEAF_NEAR = 150
 
 interface HiresTile {
   tx: number
@@ -138,8 +140,8 @@ export class MapEngine {
 
   private hires = new Map<string, HiresTile>()
   private lowres = new Map<string, LowresTile>()
-  private fading = new Set<THREE.Mesh>()
-  private fadeStart = new Map<THREE.Mesh, number>()
+  /** Hires tiles dissolving in, with their start times. */
+  private fading = new Map<HiresTile, number>()
 
   hiresDistance = 192
   /** Tiles waiting for their GPU upload, closest first. Each returns the bytes it uploads. */
@@ -557,7 +559,8 @@ export class MapEngine {
       }
       if (res.kind !== 'hires') return
       this.downloaded += res.bytes
-      if (!res.buf) {
+      if (!res.tile) {
+        this.fading.delete(tile)
         if (tile.group) this.disposeGroup(tile.group)
         tile.group = null
         tile.gpuBytes = 0
@@ -566,7 +569,7 @@ export class MapEngine {
         this.dirty = true
         return
       }
-      const { group, bytes } = this.buildHires(res.buf)
+      const { group, bytes } = this.buildHires(res.tile)
       // Three uploads geometry the first time it's drawn. Queue the tile so each
       // frame uploads only a bounded amount; it counts as loading until then.
       this.uploads.push(() => {
@@ -575,6 +578,7 @@ export class MapEngine {
           return 0
         }
         const old = tile.group
+        this.fading.delete(tile)
         tile.group = group
         tile.gpuBytes = bytes
         tile.state = 'ready'
@@ -589,7 +593,8 @@ export class MapEngine {
           this.setCover(tx, tz, true)
         } else {
           // A first load dissolves in over the lowres, which stays until the fade ends.
-          group.children.forEach((c) => this.fadeIn(c as THREE.Mesh, tile))
+          this.setAppear(group, 0)
+          this.fading.set(tile, performance.now())
         }
         this.lastPlan = 0
         this.dirty = true
@@ -600,6 +605,7 @@ export class MapEngine {
 
   private dropHires(key: string, tile: HiresTile) {
     if (tile.state === 'loading') this.workers.abort(tile.req)
+    this.fading.delete(tile)
     if (tile.group) this.disposeGroup(tile.group)
     this.hires.delete(key)
     this.setCover(tile.tx, tile.tz, false)
@@ -609,13 +615,17 @@ export class MapEngine {
   private disposeGroup(g: THREE.Group) {
     this.scene.remove(g)
     for (const c of g.children) {
-      const mesh = c as THREE.Mesh
-      this.endFade(mesh)
-      const geo = mesh.geometry
+      const geo = (c as THREE.Mesh).geometry
       // The index is shared between tiles; detach it so dispose keeps it.
       geo.setIndex(null)
       geo.dispose()
     }
+    for (const m of g.userData.materials as THREE.Material[]) m.dispose()
+    for (const t of g.userData.textures as THREE.Texture[]) t.dispose()
+  }
+
+  private setAppear(g: THREE.Group, k: number) {
+    for (const m of g.userData.materials as THREE.ShaderMaterial[]) m.uniforms.uAppear.value = k
   }
 
   private indexFor(quads: number): THREE.BufferAttribute {
@@ -636,47 +646,57 @@ export class MapEngine {
     return this.sharedIndex
   }
 
-  private buildHires(buf: ArrayBuffer): { group: THREE.Group; bytes: number } {
-    const dv = new DataView(buf)
-    const ox = dv.getInt32(4, true)
-    const oy = dv.getInt32(8, true)
-    const oz = dv.getInt32(12, true)
-    const minQ = dv.getUint16(16, true)
-    const maxQ = dv.getUint16(18, true)
-    const group = new THREE.Group()
-    let off = 32
-    let bytes = 0
-    const align = (n: number) => (n + 3) & ~3
+  private buildHires(t: DecodedTile): { group: THREE.Group; bytes: number } {
+    const dataTex = (data: Uint32Array | Uint16Array | Uint8Array, w: number, h: number, format: THREE.PixelFormat, type: THREE.TextureDataType, internal: THREE.PixelFormatGPU | null) => {
+      const tex = new THREE.DataTexture(data, w, h, format, type)
+      tex.internalFormat = internal
+      tex.magFilter = tex.minFilter = THREE.NearestFilter
+      tex.generateMipmaps = false
+      tex.flipY = false
+      tex.colorSpace = THREE.NoColorSpace
+      tex.needsUpdate = true
+      return tex
+    }
+    const quads = dataTex(t.quads, QUAD_ROW, t.quadRows, THREE.RGIntegerFormat, THREE.UnsignedIntType, 'RG32UI')
+    const templates = dataTex(t.templates, TABLE_ROW, t.templateRows, THREE.RGBAIntegerFormat, THREE.UnsignedShortType, 'RGBA16UI')
+    const colors = dataTex(t.colors, TABLE_ROW, t.colorRows, THREE.RGBAFormat, THREE.UnsignedByteType, null)
+    // One material per pass for this tile; the program and shared uniforms are reused.
+    const materials = this.materials.map((base) => {
+      const m = base.clone()
+      m.uniforms = { ...base.uniforms, uQuads: { value: quads }, uTpl: { value: templates }, uPal: { value: colors }, uAppear: { value: 1 } }
+      return m
+    })
+    const [minQ, maxQ] = [t.minQ, t.maxQ]
     const sphere = new THREE.Sphere(
       new THREE.Vector3(33 * 64, (minQ + maxQ) / 2, 33 * 64),
       Math.hypot(33 * 64, 33 * 64, (maxQ - minQ) / 2),
     )
-    for (let g = 0; g < 3; g++) {
-      const n = dv.getUint32(20 + g * 4, true)
-      if (n === 0) continue
-      const pos = new Uint16Array(buf, off, n * 3)
-      off += align(n * 6)
-      const uvl = new Uint16Array(buf, off, n * 3)
-      off += align(n * 6)
-      const col = new Uint8Array(buf, off, n * 4)
-      off += n * 4
-      const geo = new THREE.BufferGeometry()
-      geo.setAttribute('position', new THREE.BufferAttribute(pos, 3))
-      geo.setAttribute('uvl', new THREE.BufferAttribute(uvl, 3))
-      geo.setAttribute('tmColor', new THREE.BufferAttribute(col, 4, true))
-      geo.setIndex(this.indexFor(n / 4))
-      geo.setDrawRange(0, (n / 4) * 6)
-      geo.boundingSphere = sphere
-      const mesh = new THREE.Mesh(geo, this.materials[g])
-      mesh.position.set(ox, oy, oz)
-      mesh.scale.setScalar(1 / 64)
-      mesh.renderOrder = g
-      mesh.matrixAutoUpdate = false
-      mesh.updateMatrix()
-      group.add(mesh)
-      bytes += n * 16
+    const group = new THREE.Group()
+    let start = 0
+    for (let g = 0; g < GROUPS; g++) {
+      const n = t.counts[g]
+      if (n > 0) {
+        const geo = new THREE.BufferGeometry()
+        geo.setIndex(this.indexFor(start + n))
+        geo.setDrawRange(start * 6, n * 6)
+        geo.boundingSphere = sphere
+        // Leaf interiors draw with the cutout pass; translucent is the last group.
+        const pass = g === LEAF_INTERIOR ? 1 : Math.min(g, 2)
+        const mesh = new THREE.Mesh(geo, materials[pass])
+        mesh.position.set(t.origin[0], t.origin[1], t.origin[2])
+        mesh.scale.setScalar(1 / 64)
+        mesh.renderOrder = pass
+        mesh.matrixAutoUpdate = false
+        mesh.updateMatrix()
+        if (g === LEAF_INTERIOR) group.userData.leafInterior = mesh
+        group.add(mesh)
+      }
+      start += n
     }
+    group.userData.materials = materials
+    group.userData.textures = [quads, templates, colors]
     group.matrixAutoUpdate = false
+    const bytes = t.quads.byteLength + t.templates.byteLength + t.colors.byteLength
     return { group, bytes }
   }
 
@@ -813,8 +833,7 @@ export class MapEngine {
     if (tile.level === 1) {
       for (const h of this.hires.values()) {
         // Tiles still dissolving in don't cover yet; their fade sets the bit when it ends.
-        const fading = h.group?.children.some((c) => this.fading.has(c as THREE.Mesh))
-        if (h.state === 'ready' && !fading && Math.floor(h.tx / 8) === tile.x && Math.floor(h.tz / 8) === tile.z) {
+        if (h.state === 'ready' && !this.fading.has(h) && Math.floor(h.tx / 8) === tile.x && Math.floor(h.tz / 8) === tile.z) {
           setBit(tile, (h.tz - tile.z * 8) * 8 + (h.tx - tile.x * 8), true)
         }
       }
@@ -841,28 +860,6 @@ export class MapEngine {
 
   // ---------------------------------------------------------------- frame
 
-  private fadeIn(mesh: THREE.Mesh, tile: HiresTile) {
-    const base = mesh.material as THREE.ShaderMaterial
-    const m = base.clone()
-    m.uniforms = { ...base.uniforms, uAppear: { value: 0 } }
-    mesh.material = m
-    this.fading.add(mesh)
-    this.fadeStart.set(mesh, performance.now())
-    mesh.userData.base = base
-    mesh.userData.tile = tile
-  }
-
-  /** Ends a fade; `done` means it ran to completion, so the lowres under it can go. */
-  private endFade(mesh: THREE.Mesh, done = false) {
-    if (!this.fading.has(mesh)) return
-    ;(mesh.material as THREE.Material).dispose()
-    mesh.material = mesh.userData.base
-    this.fading.delete(mesh)
-    this.fadeStart.delete(mesh)
-    const tile = mesh.userData.tile as HiresTile
-    if (done && tile.state === 'ready') this.setCover(tile.tx, tile.tz, true)
-  }
-
   private frame = (now: number) => {
     this.raf = requestAnimationFrame(this.frame)
     const moved = this.controls.update()
@@ -887,11 +884,14 @@ export class MapEngine {
       this.plan(now)
     }
 
-    // Fades.
-    for (const mesh of this.fading) {
-      const k = Math.min(1, (now - this.fadeStart.get(mesh)!) / HIRES_FADE_MS)
-      ;(mesh.material as THREE.ShaderMaterial).uniforms.uAppear.value = k
-      if (k >= 1) this.endFade(mesh, true)
+    // Fades. Once a hires tile is fully in, the lowres under it can go.
+    for (const [tile, start] of this.fading) {
+      const k = Math.min(1, (now - start) / HIRES_FADE_MS)
+      this.setAppear(tile.group!, k)
+      if (k >= 1) {
+        this.fading.delete(tile)
+        this.setCover(tile.tx, tile.tz, true)
+      }
       this.dirty = true
     }
     for (const lt of this.lowres.values()) {
@@ -911,9 +911,9 @@ export class MapEngine {
     }
 
     if (moved || this.dirty || this.bench) {
+      this.gateLeaves()
       const fog = this.fogRange()
       for (const m of this.materials) (m.uniforms.uFogRange.value as THREE.Vector2).copy(fog)
-      for (const mesh of this.fading) ((mesh.material as THREE.ShaderMaterial).uniforms.uFogRange.value as THREE.Vector2).copy(fog)
       for (const lt of this.lowres.values()) lt.material?.uniforms.uFogRange.value.copy(fog)
       const t0 = performance.now()
       const q = this.gpuTimer?.begin()
@@ -960,6 +960,21 @@ export class MapEngine {
       this.frames = 0
       this.frameMsAcc = 0
       this.lastStats = now
+    }
+  }
+
+  /**
+   * Leaf faces that touch other leaves only show up close; past LEAF_NEAR the
+   * outer faces already cover them, so they're skipped.
+   */
+  private gateLeaves() {
+    const cam = this.camera.position
+    for (const h of this.hires.values()) {
+      const mesh = h.group?.userData.leafInterior as THREE.Mesh | undefined
+      if (!mesh) continue
+      const dx = Math.max(h.tx * TILE - cam.x, 0, cam.x - (h.tx + 1) * TILE)
+      const dz = Math.max(h.tz * TILE - cam.z, 0, cam.z - (h.tz + 1) * TILE)
+      mesh.visible = Math.hypot(dx, dz) < LEAF_NEAR
     }
   }
 

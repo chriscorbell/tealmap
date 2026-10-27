@@ -1,8 +1,11 @@
 // Fetches and decodes tiles off the main thread.
 //
 // Hires tiles arrive gzip-encoded over HTTP, so the browser inflates them;
-// the worker only checks the header. Lowres PNGs are decoded to raw RGBA
-// here, along with a coarse height grid.
+// the worker unpacks them into texture data. Lowres PNGs are decoded to raw
+// RGBA here, along with a coarse height grid.
+
+import { type DecodedTile, decodeTile } from './tile'
+
 
 export type Request =
   | { kind: 'hires'; id: number; url: string }
@@ -10,7 +13,7 @@ export type Request =
   | { kind: 'abort'; id: number }
 
 export type Response =
-  | { kind: 'hires'; id: number; buf: ArrayBuffer | null; bytes: number }
+  | { kind: 'hires'; id: number; tile: DecodedTile | null; bytes: number }
   | {
       kind: 'lowres'
       id: number
@@ -41,11 +44,10 @@ self.onmessage = async (e: MessageEvent<Request>) => {
     if (!res.ok) throw new Error(`${res.status} ${res.statusText}`)
     if (req.kind === 'hires') {
       const buf = await res.arrayBuffer()
-      const magic = new Uint8Array(buf, 0, 4)
-      if (String.fromCharCode(...magic) !== 'TMH1') throw new Error('bad tile header')
+      const tile = decodeTile(buf)
       // Count bytes on the wire: Content-Length is the gzipped size.
       const wire = Number(res.headers.get('content-length')) || buf.byteLength
-      post({ kind: 'hires', id: req.id, buf, bytes: wire }, [buf])
+      post({ kind: 'hires', id: req.id, tile, bytes: wire }, [tile.quads.buffer, tile.templates.buffer, tile.colors.buffer])
     } else {
       const blob = await res.blob()
       const out = await decodeLowres(blob)
@@ -60,7 +62,7 @@ self.onmessage = async (e: MessageEvent<Request>) => {
 }
 
 function empty(req: Request): Response {
-  if (req.kind === 'hires') return { kind: 'hires', id: req.id, buf: null, bytes: 0 }
+  if (req.kind === 'hires') return { kind: 'hires', id: req.id, tile: null, bytes: 0 }
   return { kind: 'lowres', id: req.id, rgba: null, coarse: null, bytes: 0 }
 }
 

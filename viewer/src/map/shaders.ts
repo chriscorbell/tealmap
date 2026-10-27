@@ -9,17 +9,33 @@ const fog = /* glsl */ `
   }
 `
 
+// Vertex pulling: each quad is two words in uQuads (block anchor; template and
+// color indices). Quad q's four corners are vertices 4q..4q+3 through a shared
+// index buffer, and each corner reads its offset and UV from the template.
 export const hiresVertex = /* glsl */ `
-  in vec3 uvl;
-  in vec4 tmColor;
+  precision highp usampler2D;
+  uniform highp usampler2D uQuads;
+  uniform highp usampler2D uTpl;
+  uniform sampler2D uPal;
   out vec3 vUv;
   out vec3 vColor;
   out float vDist;
   void main() {
-    vec4 mv = modelViewMatrix * vec4(position, 1.0);
+    int q = gl_VertexID >> 2;
+    int c = gl_VertexID & 3;
+    uvec2 w = texelFetch(uQuads, ivec2(q & 2047, q >> 11), 0).xy;
+    vec3 anchor = vec3(float(w.x & 127u), float((w.x >> 14) & 1023u), float((w.x >> 7) & 127u));
+    int tid = int(w.y & 0xffffu);
+    int ci = int(w.y >> 16);
+    int ti = tid * 8 + c;
+    uvec4 corner = texelFetch(uTpl, ivec2(ti & 4095, ti >> 12), 0);
+    int tu = tid * 8 + 4 + (c >> 1);
+    uvec4 uvs = texelFetch(uTpl, ivec2(tu & 4095, tu >> 12), 0);
+    vec2 uv = (c & 1) == 0 ? vec2(uvs.xy) : vec2(uvs.zw);
+    vec4 mv = modelViewMatrix * vec4(anchor * 64.0 + vec3(corner.xyz) - 64.0, 1.0);
     gl_Position = projectionMatrix * mv;
-    vUv = vec3(uvl.xy / 4096.0, uvl.z);
-    vColor = tmColor.rgb;
+    vUv = vec3(uv / 4096.0, float(corner.w));
+    vColor = texelFetch(uPal, ivec2(ci & 4095, ci >> 12), 0).rgb;
     vDist = length(mv.xyz);
   }
 `

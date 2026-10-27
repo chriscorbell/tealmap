@@ -100,6 +100,7 @@ pub const F_WATERLOGGED: u8 = 8;
 /// Culls faces against the same block (glass, ice).
 pub const F_CULL_SAME: u8 = 16;
 pub const F_UNKNOWN: u8 = 32;
+pub const F_LEAVES: u8 = 64;
 
 pub struct BlockInfo {
     pub name: String,
@@ -552,7 +553,9 @@ impl Baker {
                 }
             }
         }
-        if full == 0x3f && occludes != 0x3f && !short.contains("leaves") {
+        if short.contains("leaves") {
+            flags |= F_LEAVES;
+        } else if full == 0x3f && occludes != 0x3f {
             flags |= F_CULL_SAME;
         }
 
