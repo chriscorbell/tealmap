@@ -44,7 +44,9 @@ self.onmessage = async (e: MessageEvent<Request>) => {
       const buf = await res.arrayBuffer()
       const magic = new Uint8Array(buf, 0, 4)
       if (String.fromCharCode(...magic) !== 'TMH1') throw new Error('bad tile header')
-      post({ kind: 'hires', id: req.id, buf, bytes: buf.byteLength }, [buf])
+      // Count bytes on the wire: Content-Length is the gzipped size.
+      const wire = Number(res.headers.get('content-length')) || buf.byteLength
+      post({ kind: 'hires', id: req.id, buf, bytes: wire }, [buf])
     } else {
       const blob = await res.blob()
       const out = await decodeLowres(blob)

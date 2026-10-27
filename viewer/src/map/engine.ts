@@ -384,8 +384,14 @@ export class MapEngine {
     // On connect and every reconnect, catch up on anything published while
     // the stream was down; the server doesn't replay events.
     es.onopen = () => {
-      if (this.manifest) this.refreshManifest(this.generation)
-      else this.pendingUpdate = true
+      if (!this.manifest) {
+        this.pendingUpdate = true
+        return
+      }
+      // Revalidate resident tiles too; unchanged ones come back as 304s.
+      for (const t of this.hires.values()) t.stale = true
+      for (const t of this.lowres.values()) t.stale = true
+      this.refreshManifest(this.generation)
     }
     this.events = es
   }
