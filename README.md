@@ -4,7 +4,8 @@ A 3D web map for Minecraft worlds, in the spirit of [BlueMap](https://github.com
 
 - **Zero server impact.** tealmap runs as its own process next to the server and reads region files directly from a read-only mount. Nothing runs inside the Minecraft JVM, so it can't slow ticks, grow the heap, or crash the server.
 - **Fast renders.** It's a Rust renderer with a zero-copy NBT reader, palette-level block resolution, and one tile per worker thread.
-- **Small tiles.** Meshes are quantized to 16 bytes per vertex with no index buffer, gzipped once at render time, and served as-is.
+- **Small tiles.** Each quad is 8 bytes: a block anchor plus indices into small per-tile tables of quad shapes and colors. Quads are column-coded so gzip gets them to about 1 byte each, and the GPU draws them straight from those records.
+- **Full detail at any distance.** Past the hires tiles, a voxel LOD pyramid takes over: each level halves the resolution by picking the most common visible block in every 2×2×2, and meshes that with the same mesher at a larger scale. The viewer switches levels only where a voxel would be about a pixel on screen, so distant terrain keeps its real shapes, textures and water.
 - **A light viewer.** The viewer is three.js on WebGL2. Tiles load in a worker, all block textures share one texture array, and frames render on demand.
 - **Live updates.** tealmap watches region files and hashes each chunk's compressed bytes to find real changes. It re-renders only the tiles affected and pushes them to open viewers over SSE.
 
@@ -12,9 +13,9 @@ A 3D web map for Minecraft worlds, in the spirit of [BlueMap](https://github.com
 
 ```
 world/region/*.mca ──► tealmap render ──► data/maps/<id>/
-  (read-only)          (Rust, rayon)        hires/<rx>_<rz>/<tx>_<tz>.tmh   64×64-block meshes (gzip)
-                                            lowres/1/<rx>_<rz>.png          1 px per block: color + 16-bit height
-                                            lowres/2/<qx>_<qz>.png          1 px per 8×8 blocks
+  (read-only)          (Rust, rayon)        hires/<rx>_<rz>/<tx>_<tz>.tmh   64×64-block tiles (gzip)
+                                            lod/<k>/<x>_<z>.tmh             LOD tiles, voxels of 2^k blocks
+                                            lod/src<k>/<x>_<z>.bin          the grids each LOD level is built from
                                             textures.bin, map.json
                        tealmap serve ───► HTTP + SSE, viewer embedded in the binary
 ```

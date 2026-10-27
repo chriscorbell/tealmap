@@ -104,6 +104,8 @@ pub const F_LEAVES: u8 = 64;
 
 pub struct BlockInfo {
     pub name: String,
+    /// The registry key: name, then `|prop=value` for each sorted property.
+    pub key: String,
     pub variants: Vec<Variant>,
     pub total_weight: u32,
     /// Bit `d` set: the block fully covers its `d` face with opaque texture.
@@ -111,9 +113,6 @@ pub struct BlockInfo {
     pub tint: Tint,
     pub flags: u8,
     pub fluid_level: u8,
-    /// Untinted average color seen from above, for the lowres layer.
-    pub top_color: [u8; 3],
-    pub top_tinted: bool,
 }
 
 impl BlockInfo {
@@ -559,17 +558,15 @@ impl Baker {
             flags |= F_CULL_SAME;
         }
 
-        let (top_color, top_tinted) = self.top_color(&variants, flags);
         BlockInfo {
             name: name.to_owned(),
+            key: String::new(),
             variants,
             total_weight,
             occludes,
             tint: tint_for(short, props),
             flags,
             fluid_level,
-            top_color,
-            top_tinted,
         }
     }
 
@@ -645,41 +642,6 @@ impl Baker {
                 )
             })
             .collect()
-    }
-
-    fn top_color(&self, variants: &[Variant], flags: u8) -> ([u8; 3], bool) {
-        let info = &self.textures.info;
-        if flags & F_WATER != 0 {
-            return ([255, 255, 255], true);
-        }
-        if flags & F_LAVA != 0 {
-            let lava = self.textures.get("block/lava_still").unwrap_or(MISSING);
-            return (info[lava as usize].avg, false);
-        }
-        let Some(v) = variants.first() else {
-            return ([0; 3], false);
-        };
-        let ups: Vec<&Quad> = v.quads.iter().filter(|q| q.light_dir == UP).collect();
-        let qs: Vec<&Quad> = if ups.is_empty() {
-            v.quads.iter().collect()
-        } else {
-            ups
-        };
-        if qs.is_empty() {
-            return ([0; 3], false);
-        }
-        let mut sum = [0u32; 3];
-        for q in &qs {
-            let c = info[q.tex as usize].avg;
-            for i in 0..3 {
-                sum[i] += c[i] as u32;
-            }
-        }
-        let n = qs.len() as u32;
-        (
-            [(sum[0] / n) as u8, (sum[1] / n) as u8, (sum[2] / n) as u8],
-            qs.iter().any(|q| q.tinted),
-        )
     }
 
     pub fn fluid_texture(&self, lava: bool) -> u16 {
@@ -889,8 +851,9 @@ impl Registry {
         if let Some(id) = self.ids.get(&key) {
             return *id;
         }
-        *self.ids.entry(key).or_insert_with(|| {
-            let info = self.baker.bake_state(name, props);
+        *self.ids.entry(key.clone()).or_insert_with(|| {
+            let mut info = self.baker.bake_state(name, props);
+            info.key = key;
             let id = self.blocks.push(info);
             if id > u16::MAX as usize {
                 tracing::warn!("more than 65535 block states; extra states render as air");
@@ -898,6 +861,20 @@ impl Registry {
             }
             id as u16
         })
+    }
+
+    /// The id for a registry key, as produced by [`BlockInfo::key`].
+    pub fn id_for_key(&self, key: &str) -> u16 {
+        if let Some(id) = self.ids.get(key) {
+            return *id;
+        }
+        let mut parts = key.split('|');
+        let name = parts.next().unwrap_or("minecraft:air");
+        let mut props: Vec<(String, String)> = parts
+            .filter_map(|kv| kv.split_once('='))
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect();
+        self.id(name, &mut props)
     }
 
     #[inline]

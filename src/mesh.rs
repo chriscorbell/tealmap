@@ -46,7 +46,14 @@ const LEAF_INTERIOR: usize = 2;
 pub struct Settings {
     pub min_y: i32,
     pub remove_caves_below_y: i32,
+    /// Meshing a LOD tile: no halo faces, and the halo is a stand-in, not real blocks.
+    pub lod: bool,
 }
+
+/// Faces on a tile's outer edge within this many blocks (or voxels) of the
+/// column's top are always drawn. A neighbor drawn at another detail level
+/// can sit a little higher or lower, and these "skirts" close the gap.
+const SKIRT: i32 = 2;
 
 /// Dense block data for one tile plus a one-block halo.
 pub struct Volume {
@@ -191,9 +198,107 @@ impl Volume {
         true
     }
 
+    /// Fills the volume from a LOD voxel grid of 64×64 columns whose min corner
+    /// is (x0, z0) in voxel units. The halo is a solid stand-in (`skirt`) since
+    /// LOD tiles don't read their neighbors; skirts close the borders instead.
+    /// Fills the volume from a LOD voxel grid of 66×66 columns: the tile's
+    /// 64×64 plus a one-column ring from its neighbors. (x0, z0) is the tile's
+    /// min corner in voxel units.
+    pub fn fill_grid(
+        &mut self,
+        g: &crate::lod::Grid,
+        x0: i32,
+        z0: i32,
+        reg: &Registry,
+        scale: i32,
+    ) -> bool {
+        debug_assert_eq!(g.w, W);
+        let Some((ylo, yhi)) = g.y_range() else {
+            return false;
+        };
+        self.x0 = x0;
+        self.z0 = z0;
+        self.y0 = g.y0 + ylo as i32 - 1;
+        self.h = yhi - ylo + 3;
+        let n = W * W * self.h;
+        self.blocks.clear();
+        self.blocks.resize(n, 0);
+        self.light.clear();
+        self.light.resize(n, 0xf0);
+        self.biomes.clear();
+        self.biomes.resize(n, 0);
+        self.floor.clear();
+        self.floor.resize(W * W, i32::MIN);
+        for vz in 0..W {
+            for vx in 0..W {
+                let c = vz * W + vx;
+                // Sky light fades through water, a level per block, so seabeds
+                // darken with depth the way they do at hires.
+                let mut sky = 15i32;
+                for vy in (0..self.h).rev() {
+                    let i = self.idx(vx, vy, vz);
+                    let gy = (vy + ylo) as isize - 1;
+                    let id = if gy < 0 || gy as usize >= g.h {
+                        0
+                    } else {
+                        g.states[c * g.h + gy as usize]
+                    };
+                    self.blocks[i] = id;
+                    self.biomes[i] = g.biomes[c];
+                    if id != 0 && reg.get(id).has_water() {
+                        sky = (sky - scale).max(0);
+                    }
+                    self.light[i] = (sky as u8) << 4;
+                }
+            }
+        }
+        true
+    }
+
     #[inline]
-    fn idx(&self, vx: usize, vy: usize, vz: usize) -> usize {
+    pub fn block(&self, vx: usize, vy: usize, vz: usize) -> u16 {
+        self.blocks[self.idx(vx, vy, vz)]
+    }
+
+    #[inline]
+    pub fn biome(&self, vx: usize, vy: usize, vz: usize) -> u16 {
+        self.biomes[self.idx(vx, vy, vz)]
+    }
+
+    #[inline]
+    pub fn idx(&self, vx: usize, vy: usize, vz: usize) -> usize {
         (vy * W + vz) * W + vx
+    }
+
+    /// BlueMap-style cave removal: below a y threshold and the ocean floor,
+    /// blocks with no sky light around them are skipped.
+    #[inline]
+    pub fn cave(&self, vx: usize, vy: usize, vz: usize, s: &Settings) -> bool {
+        let v = self;
+        let wy = v.y0 + vy as i32;
+        if wy >= s.remove_caves_below_y {
+            return false;
+        }
+        let floor = v.floor[vz * W + vx];
+        if floor == i32::MIN || wy >= floor - 1 {
+            return false;
+        }
+        let i = v.idx(vx, vy, vz);
+        if v.light[i] >> 4 != 0 {
+            return false;
+        }
+        for d in 0..6u8 {
+            // Halo blocks have no neighbor outside the volume; skip that side.
+            let o = DIR_VEC[d as usize];
+            let (nx, nz) = (vx as i32 + o[0], vz as i32 + o[2]);
+            if nx < 0 || nz < 0 || nx >= W as i32 || nz >= W as i32 {
+                continue;
+            }
+            if v.light[neighbor(v, vx, vy, vz, d)] >> 4 != 0 {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -208,19 +313,10 @@ struct Rec {
     color: u32,
 }
 
-/// Lowres sample for one column: color and top surface height (absolute y + 1).
-#[derive(Clone, Copy, Default)]
-pub struct Column {
-    pub color: [u8; 3],
-    /// 0 = no data, else top surface y - min_y + 1.
-    pub height: u16,
-}
-
 pub struct Mesher {
     groups: [Vec<Rec>; GROUPS],
     min_qy: u16,
     max_qy: u16,
-    pub columns: Vec<Column>,
 }
 
 const BRIGHT: [f32; 16] = {
@@ -251,7 +347,6 @@ impl Mesher {
             groups: Default::default(),
             min_qy: u16::MAX,
             max_qy: 0,
-            columns: vec![Column::default(); (TILE * TILE) as usize],
         }
     }
 
@@ -262,7 +357,6 @@ impl Mesher {
         }
         self.min_qy = u16::MAX;
         self.max_qy = 0;
-        self.columns.fill(Column::default());
 
         let origin = [v.x0 - 1, s.min_y - 1, v.z0 - 1];
         let biomes = &reg.baker.biomes;
@@ -271,9 +365,12 @@ impl Mesher {
 
         for vz in 1..=TILE as usize {
             for vx in 1..=TILE as usize {
-                let mut col_done = false;
-                let mut water_top: Option<(u16, [u8; 3])> = None;
+                // Top of the current solid run, found on the way down: ground
+                // under a roof or canopy starts a run of its own.
+                let mut top = i32::MAX;
+                let mut open_above = true;
                 for vy in (1..v.h - 1).rev() {
+                    let was_open = std::mem::replace(&mut open_above, true);
                     let i = v.idx(vx, vy, vz);
                     let id = v.blocks[i];
                     if id == 0 {
@@ -286,43 +383,13 @@ impl Mesher {
                     let wx = v.x0 + vx as i32 - 1;
                     let wy = v.y0 + vy as i32;
                     let wz = v.z0 + vz as i32 - 1;
-                    if self.is_cave(v, vx, vy, vz, wy, s) {
+                    if v.cave(vx, vy, vz, s) {
                         continue;
                     }
                     let base = [wx - origin[0], wy - origin[1], wz - origin[2]];
-
-                    // Lowres column: first visible block from the top.
-                    if !col_done {
-                        let bc = biomes.colors(v.biomes[i]);
-                        let h = (wy + 1 - s.min_y + 1).clamp(0, u16::MAX as i32) as u16;
-                        if info.has_water() && info.variants.iter().all(|x| x.quads.is_empty())
-                            || info.flags & crate::model::F_WATER != 0
-                        {
-                            if water_top.is_none() {
-                                water_top = Some((h, bc.water));
-                            }
-                        } else {
-                            let mut c = info.top_color;
-                            if info.top_tinted {
-                                let t = tint_color(info, bc);
-                                c = [mul(c[0], t[0]), mul(c[1], t[1]), mul(c[2], t[2])];
-                            }
-                            let col = &mut self.columns[(vz - 1) * TILE as usize + (vx - 1)];
-                            match water_top {
-                                Some((wh, wc)) => {
-                                    let depth = (wh as i32 - h as i32).clamp(0, 24) as f32 / 24.0;
-                                    let k = 0.55 + 0.4 * depth;
-                                    let wcol = [mul(wc[0], 180), mul(wc[1], 180), mul(wc[2], 180)];
-                                    col.color = lerp3(c, wcol, k);
-                                    col.height = wh;
-                                }
-                                None => {
-                                    col.color = c;
-                                    col.height = h;
-                                }
-                            }
-                            col_done = true;
-                        }
+                    open_above = false;
+                    if was_open {
+                        top = wy;
                     }
 
                     let quads = info.variant(wx, wy, wz);
@@ -336,6 +403,15 @@ impl Mesher {
                             let nid = v.blocks[n];
                             let ninfo = reg.get(nid);
                             if ninfo.occludes & (1 << opposite(d)) != 0 {
+                                if wy >= top - (SKIRT - 1) && outward(vx, vz, d) {
+                                    // Skirt: kept against a solid neighbor, lit as if open.
+                                    let color = if q.tinted {
+                                        tint_color(info, biomes.colors(v.biomes[i]))
+                                    } else {
+                                        [255, 255, 255]
+                                    };
+                                    self.emit(q, base, color, 0xf0, group_of(q.layer));
+                                }
                                 continue;
                             }
                             if info.flags & F_CULL_SAME != 0
@@ -376,15 +452,12 @@ impl Mesher {
                         self.fluid(v, reg, vx, vy, vz, lava, tex, base, color);
                     }
                 }
-                if !col_done && let Some((wh, wc)) = water_top {
-                    let col = &mut self.columns[(vz - 1) * TILE as usize + (vx - 1)];
-                    col.color = wc;
-                    col.height = wh;
-                }
             }
         }
 
-        self.halo_faces(v, reg, s, origin);
+        if !s.lod {
+            self.halo_faces(v, reg, s, origin);
+        }
 
         if self.groups.iter().all(|g| g.is_empty()) {
             return None;
@@ -417,7 +490,7 @@ impl Mesher {
                     }
                     let info = reg.get(id);
                     let wy = v.y0 + vy as i32;
-                    if info.is_air() || self.is_cave(v, vx, vy, vz, wy, s) {
+                    if info.is_air() || v.cave(vx, vy, vz, s) {
                         continue;
                     }
                     let n = neighbor(v, vx, vy, vz, d);
@@ -455,35 +528,6 @@ impl Mesher {
                 }
             }
         }
-    }
-
-    /// BlueMap-style cave removal: below a y threshold and the ocean floor,
-    /// blocks with no sky light around them are skipped.
-    #[inline]
-    fn is_cave(&self, v: &Volume, vx: usize, vy: usize, vz: usize, wy: i32, s: &Settings) -> bool {
-        if wy >= s.remove_caves_below_y {
-            return false;
-        }
-        let floor = v.floor[vz * W + vx];
-        if floor == i32::MIN || wy >= floor - 1 {
-            return false;
-        }
-        let i = v.idx(vx, vy, vz);
-        if v.light[i] >> 4 != 0 {
-            return false;
-        }
-        for d in 0..6u8 {
-            // Halo blocks have no neighbor outside the volume; skip that side.
-            let o = DIR_VEC[d as usize];
-            let (nx, nz) = (vx as i32 + o[0], vz as i32 + o[2]);
-            if nx < 0 || nz < 0 || nx >= W as i32 || nz >= W as i32 {
-                continue;
-            }
-            if v.light[neighbor(v, vx, vy, vz, d)] >> 4 != 0 {
-                return false;
-            }
-        }
-        true
     }
 
     #[inline]
@@ -724,6 +768,18 @@ fn offset(p: f32) -> u16 {
     ((p * 64.0).round() + 64.0).clamp(0.0, 65535.0) as u16
 }
 
+/// True if face direction `d` points out of the tile from border column (vx, vz).
+#[inline]
+fn outward(vx: usize, vz: usize, d: u8) -> bool {
+    match d {
+        WEST => vx == 1,
+        EAST => vx == W - 2,
+        NORTH => vz == 1,
+        SOUTH => vz == W - 2,
+        _ => false,
+    }
+}
+
 #[inline]
 fn neighbor(v: &Volume, vx: usize, vy: usize, vz: usize, d: u8) -> usize {
     let o = DIR_VEC[d as usize];
@@ -732,16 +788,6 @@ fn neighbor(v: &Volume, vx: usize, vy: usize, vz: usize, d: u8) -> usize {
         (vy as i32 + o[1]) as usize,
         (vz as i32 + o[2]) as usize,
     )
-}
-
-#[inline]
-fn mul(a: u8, b: u8) -> u8 {
-    ((a as u16 * b as u16 + 127) / 255) as u8
-}
-
-fn lerp3(a: [u8; 3], b: [u8; 3], t: f32) -> [u8; 3] {
-    let f = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t) as u8;
-    [f(a[0], b[0]), f(a[1], b[1]), f(a[2], b[2])]
 }
 
 #[cfg(test)]
@@ -813,6 +859,44 @@ mod tests {
             tinted: false,
             shade: 1.0,
         }
+    }
+
+    #[test]
+    fn skirts_cover_ground_under_a_roof() {
+        use crate::assets::AssetFiles;
+        use crate::model::Baker;
+        let reg = Registry::new(Baker::new(AssetFiles::new()));
+        let stone = reg.id("minecraft:stone", &mut []);
+        // A 66×66 LOD grid (tile plus ring). The tile's east border column has
+        // ground up to y=5 and a roof at y=20; the ring next to it is solid up
+        // to y=8, like a neighbor drawn at another level.
+        let h = 32;
+        let mut g = crate::lod::Grid::empty(W, h, 0);
+        let col = |x: usize, z: usize| z * W + x;
+        for z in 0..W {
+            let c = col(W - 2, z);
+            g.states[c * h..c * h + 6].fill(stone);
+            g.states[c * h + 20] = stone;
+            let ring = col(W - 1, z);
+            g.states[ring * h..ring * h + 9].fill(stone);
+        }
+        let mut v = Volume::new();
+        assert!(v.fill_grid(&g, 0, 0, &reg, 2));
+        let s = Settings {
+            min_y: 0,
+            remove_caves_below_y: i32::MIN,
+            lod: true,
+        };
+        let tile = Mesher::new().mesh(&v, &reg, &s).unwrap();
+        // East faces have all four corners at x = 1 block, stored as 64 + 64.
+        let east_at = |y: u16| {
+            decode(&tile)
+                .iter()
+                .any(|q| q.1 == 64 && q.2 == y + 1 && (0..4).all(|k| q.4[k * 3] == 128))
+        };
+        assert!(east_at(5), "ground under the roof has no skirt at its top");
+        assert!(east_at(4), "the skirt covers two voxels");
+        assert!(!east_at(3), "faces below the skirt still cull");
     }
 
     #[test]

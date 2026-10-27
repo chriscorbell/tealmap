@@ -2,6 +2,10 @@ import { Activity, ChevronDown, Layers, SlidersHorizontal } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 import { type CameraState, type MapInfo, MapEngine, type Stats } from './map/engine'
 
+/** Detail steps: the largest on-screen voxel size, in CSS pixels, before switching to finer tiles. */
+const DETAIL_PX = [4, 2.5, 1.5, 1, 0.75]
+const DEFAULT_DETAIL = 3
+
 function parseHash() {
   const [id, ...nums] = location.hash.slice(1).split('/')
   const v = nums.map(Number)
@@ -19,7 +23,7 @@ export default function App() {
   const [bench] = useState(() => new URLSearchParams(location.search).has('bench'))
   const [panel, setPanel] = useState<'stats' | 'settings' | null>(bench ? 'stats' : null)
   const [menu, setMenu] = useState(false)
-  const [distance, setDistance] = useState(192)
+  const [detail, setDetail] = useState(DEFAULT_DETAIL)
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
@@ -128,10 +132,8 @@ export default function App() {
             <dd>{stats.calls}</dd>
             <dt>triangles</dt>
             <dd>{(stats.triangles / 1e6).toFixed(2)} M</dd>
-            <dt>tiles</dt>
-            <dd>
-              {stats.hires} hi · {stats.lowres} lo
-            </dd>
+            <dt>tiles by level</dt>
+            <dd>{stats.levels.join(' · ')}</dd>
             <dt>downloaded</dt>
             <dd>{stats.downloadedMB.toFixed(1)} MB</dd>
             <dt>gpu memory</dt>
@@ -143,18 +145,18 @@ export default function App() {
       <section className={`panel ${panel === 'settings' ? 'open' : ''}`} aria-hidden={panel !== 'settings'}>
         <label className="slider">
           <span>
-            Detail distance <em>{distance}</em>
+            Detail <em>{detail + 1} / {DETAIL_PX.length}</em>
           </span>
           <input
             type="range"
-            min={64}
-            max={1024}
-            step={32}
-            value={distance}
+            min={0}
+            max={DETAIL_PX.length - 1}
+            step={1}
+            value={detail}
             onChange={(e) => {
               const d = Number(e.target.value)
-              setDistance(d)
-              engineRef.current?.setHiresDistance(d)
+              setDetail(d)
+              engineRef.current?.setDetail(DETAIL_PX[d])
             }}
           />
         </label>

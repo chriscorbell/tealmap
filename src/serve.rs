@@ -61,7 +61,7 @@ pub fn run(cfg: Config, pool: rayon::ThreadPool) -> Result<()> {
                 for ctx in &ctxs {
                     match ctx.render(&pool, false) {
                         Ok(up) => {
-                            if !up.hires.is_empty() || !up.lowres.is_empty() {
+                            if !up.hires.is_empty() || !up.lod.is_empty() {
                                 let s = &up.stats;
                                 tracing::info!(
                                     "{}: {} changed chunks → {} tiles in {:.2}s",
@@ -128,7 +128,7 @@ fn allowed(rel: &Path) -> bool {
     s == "map.json"
         || s == "textures.bin"
         || (s.starts_with("hires/") && s.ends_with(".tmh"))
-        || (s.starts_with("lowres/") && s.ends_with(".png"))
+        || (s.starts_with("lod/") && s.ends_with(".tmh"))
 }
 
 async fn map_file(
@@ -169,9 +169,7 @@ async fn map_file(
         return StatusCode::NOT_FOUND.into_response();
     };
     let gz = path.ends_with(".tmh") || path == "textures.bin";
-    let ctype = if path.ends_with(".png") {
-        "image/png"
-    } else if path.ends_with(".json") {
+    let ctype = if path.ends_with(".json") {
         "application/json"
     } else {
         "application/octet-stream"
@@ -216,7 +214,8 @@ mod tests {
     fn path_allowlist() {
         assert!(allowed(Path::new("map.json")));
         assert!(allowed(Path::new("hires/0_0/1_2.tmh")));
-        assert!(allowed(Path::new("lowres/1/-1_0.png")));
+        assert!(allowed(Path::new("lod/3/-1_0.tmh")));
+        assert!(!allowed(Path::new("lod/src1/0_0.bin")));
         assert!(!allowed(Path::new("../config.toml")));
         assert!(!allowed(Path::new("hires/../../x.tmh")));
         assert!(!allowed(Path::new("state/0_0.bin")));

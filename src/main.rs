@@ -4,7 +4,7 @@
 mod assets;
 mod biome;
 mod config;
-mod lowres;
+mod lod;
 mod mesh;
 mod model;
 mod nbt;
