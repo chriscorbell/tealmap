@@ -17,7 +17,7 @@ use std::sync::Mutex;
 use std::time::{Instant, UNIX_EPOCH};
 
 /// Bump when output for the same input changes; forces a full re-render.
-pub const RENDER_VERSION: u32 = 1;
+pub const RENDER_VERSION: u32 = 2;
 const STATE_MAGIC: &[u8; 4] = b"TMS1";
 
 pub struct MapCtx {
@@ -511,8 +511,8 @@ fn tiles_touching(cx: i32, cz: i32) -> impl Iterator<Item = (i32, i32)> {
 }
 
 fn vertex_count(tile: &[u8]) -> u64 {
-    (0..3)
-        .map(|g| u32::from_le_bytes(tile[20 + g * 4..24 + g * 4].try_into().unwrap()) as u64)
+    (0..4)
+        .map(|g| u32::from_le_bytes(tile[20 + g * 4..24 + g * 4].try_into().unwrap()) as u64 * 4)
         .sum()
 }
 

@@ -3,28 +3,45 @@
 //! A tile covers 64×64 columns. Blocks are copied into a dense volume with a
 //! one-block halo so faces on tile and chunk borders cull correctly.
 //!
-//! Tile format (little-endian, gzip on disk):
+//! Tile format (little-endian, gzip on disk). A tile is a list of quads, and
+//! each quad is an integer block anchor plus a shape ("template": four corner
+//! offsets, UVs and a texture layer) and a color from small per-tile tables.
+//! Quads are grouped by column and stored as byte planes, which gzip squeezes
+//! to about one byte per quad. The viewer draws them straight from these
+//! records by vertex pulling.
 //!
 //! ```text
-//! 0   magic "TMH1"
-//! 4   i32 origin x, i32 origin y, i32 origin z   (block coords of quantized 0)
-//! 16  u16 min qy, u16 max qy                     (bounds, 1/64 block)
-//! 20  3 × u32 vertex count                       (opaque, cutout, translucent)
-//! 32  per group: pos u16×3, uvl u16×3 (u, v in 1/4096 texture, layer),
-//!     color u8×4 (rgb, sky<<4|block); each array padded to 4 bytes
-//!
-//! Every 4 vertices form a quad (triangles 0-1-2, 0-2-3), so there are no
-//! indices on disk; the viewer shares one index buffer across tiles.
+//! 0   magic "TMH2"
+//! 4   i32 origin x, y, z            block coords of anchor (0, 0, 0)
+//! 16  u16 min qy, u16 max qy        bounds, 1/64 block from origin y
+//! 20  4 × u32 quad count            opaque, cutout, leaf interior, translucent
+//! 36  u32 templates T, u32 colors P
+//! 44  T × 21 u16 templates          4 × corner (x, y, z) in 1/64 block + 64,
+//!                                   4 × (u, v) in 1/4096 texture, layer
+//!     P × u32 colors                r, g, b, sky << 4 | block light
+//!     per group:
+//!       W × W column counts         u16 as a low-byte then a high-byte plane
+//!       n × y step                  u16 planes; y runs down from 511 per column
+//!       n × template index          u16 planes
+//!       n × color index             u16 planes
 //! ```
+//!
+//! Quads are ordered by column (z, then x) and descending y within a column.
+//! Leaf faces that touch other leaves form their own group, so the viewer can
+//! skip them at a distance, where they can't be seen.
 
 use crate::model::{
-    BlockInfo, DIR_VEC, DOWN, EAST, F_CULL_SAME, Layer, NORTH, Quad, Registry, SOUTH, Tint, UP,
-    WEST, opposite,
+    BlockInfo, DIR_VEC, DOWN, EAST, F_CULL_SAME, F_LEAVES, Layer, NORTH, Quad, Registry, SOUTH,
+    Tint, UP, WEST, opposite,
 };
 use crate::world::{Chunk, nibble};
+use std::collections::HashMap;
 
 pub const TILE: i32 = 64;
 const W: usize = TILE as usize + 2;
+const GROUPS: usize = 4;
+/// The group for leaf faces that touch other leaves.
+const LEAF_INTERIOR: usize = 2;
 
 pub struct Settings {
     pub min_y: i32,
@@ -180,17 +197,15 @@ impl Volume {
     }
 }
 
-#[derive(Default)]
-struct Group {
-    pos: Vec<u16>,
-    uvl: Vec<u16>,
-    color: Vec<u8>,
-}
+/// A template: 4 corner offsets (x, y, z), 4 UVs (u, v), and a texture layer.
+type Template = [u16; 21];
 
-impl Group {
-    fn verts(&self) -> usize {
-        self.pos.len() / 3
-    }
+struct Rec {
+    x: u8,
+    z: u8,
+    y: u16,
+    tpl: Template,
+    color: u32,
 }
 
 /// Lowres sample for one column: color and top surface height (absolute y + 1).
@@ -202,7 +217,7 @@ pub struct Column {
 }
 
 pub struct Mesher {
-    groups: [Group; 3],
+    groups: [Vec<Rec>; GROUPS],
     min_qy: u16,
     max_qy: u16,
     pub columns: Vec<Column>,
@@ -243,9 +258,7 @@ impl Mesher {
     /// Meshes the volume. Returns the encoded (uncompressed) tile, or None if empty.
     pub fn mesh(&mut self, v: &Volume, reg: &Registry, s: &Settings) -> Option<Vec<u8>> {
         for g in &mut self.groups {
-            g.pos.clear();
-            g.uvl.clear();
-            g.color.clear();
+            g.clear();
         }
         self.min_qy = u16::MAX;
         self.max_qy = 0;
@@ -338,7 +351,18 @@ impl Mesher {
                         } else {
                             [255, 255, 255]
                         };
-                        self.emit(q, base, color, light);
+                        let group = match q.cull {
+                            Some(d)
+                                if info.flags & F_LEAVES != 0
+                                    && reg.get(v.blocks[neighbor(v, vx, vy, vz, d)]).flags
+                                        & F_LEAVES
+                                        != 0 =>
+                            {
+                                LEAF_INTERIOR
+                            }
+                            _ => group_of(q.layer),
+                        };
+                        self.emit(q, base, color, light, group);
                     }
 
                     if info.is_fluid() || info.has_water() {
@@ -362,7 +386,7 @@ impl Mesher {
 
         self.halo_faces(v, reg, s, origin);
 
-        if self.groups.iter().all(|g| g.pos.is_empty()) {
+        if self.groups.iter().all(|g| g.is_empty()) {
             return None;
         }
         Some(self.encode(origin))
@@ -420,7 +444,7 @@ impl Mesher {
                         } else {
                             [255, 255, 255]
                         };
-                        self.emit(q, base, color, v.light[n]);
+                        self.emit(q, base, color, v.light[n], group_of(q.layer));
                     }
                 }
             }
@@ -468,29 +492,35 @@ impl Mesher {
         }
     }
 
-    fn emit(&mut self, q: &Quad, base: [i32; 3], color: [u8; 3], light: u8) {
+    fn emit(&mut self, q: &Quad, base: [i32; 3], color: [u8; 3], light: u8, group: usize) {
         let l = (light >> 4).max(light & 15) as usize;
         let f = q.shade * BRIGHT[l];
-        let c = [
+        let color = u32::from_le_bytes([
             (color[0] as f32 * f) as u8,
             (color[1] as f32 * f) as u8,
             (color[2] as f32 * f) as u8,
             light,
-        ];
-        let g = &mut self.groups[q.layer as usize];
+        ]);
+        let mut tpl = [0u16; 21];
         for k in 0..4 {
             let p = q.pos[k];
-            let qx = quant(base[0] as f32 + p[0]);
-            let qy = quant(base[1] as f32 + p[1]);
-            let qz = quant(base[2] as f32 + p[2]);
+            for a in 0..3 {
+                tpl[k * 3 + a] = offset(p[a]);
+            }
+            tpl[12 + k * 2] = (q.uv[k][0] * 4096.0).round().clamp(0.0, 65535.0) as u16;
+            tpl[13 + k * 2] = (q.uv[k][1] * 4096.0).round().clamp(0.0, 65535.0) as u16;
+            let qy = (base[1] * 64 + tpl[k * 3 + 1] as i32 - 64).clamp(0, 65535) as u16;
             self.min_qy = self.min_qy.min(qy);
             self.max_qy = self.max_qy.max(qy);
-            g.pos.extend_from_slice(&[qx, qy, qz]);
-            let u = (q.uv[k][0] * 4096.0).round().clamp(0.0, 65535.0) as u16;
-            let vv = (q.uv[k][1] * 4096.0).round().clamp(0.0, 65535.0) as u16;
-            g.uvl.extend_from_slice(&[u, vv, q.tex]);
-            g.color.extend_from_slice(&c);
         }
+        tpl[20] = q.tex;
+        self.groups[group].push(Rec {
+            x: base[0] as u8,
+            z: base[2] as u8,
+            y: base[1] as u16,
+            tpl,
+            color,
+        });
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -589,45 +619,103 @@ impl Mesher {
             } else {
                 v.light[n].max(v.light[i])
             };
-            self.emit(&q, base, color, light);
+            self.emit(&q, base, color, light, group_of(q.layer));
         }
     }
 
-    fn encode(&self, origin: [i32; 3]) -> Vec<u8> {
-        let mut out = Vec::with_capacity(
-            32 + self
-                .groups
-                .iter()
-                .map(|g| g.verts() * 16 + 8)
-                .sum::<usize>(),
-        );
-        out.extend_from_slice(b"TMH1");
+    fn encode(&mut self, origin: [i32; 3]) -> Vec<u8> {
+        // Canonical order: by column, then top down. Ties keep emit order,
+        // which is itself deterministic.
+        for g in &mut self.groups {
+            g.sort_by_key(|r| (r.z, r.x, std::cmp::Reverse(r.y)));
+        }
+        // Per-tile tables, numbered in order of first use.
+        let mut templates: Vec<&Template> = Vec::new();
+        let mut colors: Vec<u32> = Vec::new();
+        let mut tpl_ids: HashMap<&Template, u16> = HashMap::new();
+        let mut color_ids: HashMap<u32, u16> = HashMap::new();
+        let mut refs: Vec<Vec<(u16, u16)>> = Vec::with_capacity(GROUPS);
+        for g in &self.groups {
+            refs.push(
+                g.iter()
+                    .map(|r| {
+                        let t = *tpl_ids.entry(&r.tpl).or_insert_with(|| {
+                            templates.push(&r.tpl);
+                            (templates.len() - 1) as u16
+                        });
+                        let c = *color_ids.entry(r.color).or_insert_with(|| {
+                            colors.push(r.color);
+                            (colors.len() - 1) as u16
+                        });
+                        (t, c)
+                    })
+                    .collect(),
+            );
+        }
+
+        let quads: usize = self.groups.iter().map(|g| g.len()).sum();
+        let mut out = Vec::with_capacity(64 + templates.len() * 42 + quads * 6);
+        out.extend_from_slice(b"TMH2");
         for o in origin {
             out.extend_from_slice(&o.to_le_bytes());
         }
         out.extend_from_slice(&self.min_qy.to_le_bytes());
         out.extend_from_slice(&self.max_qy.to_le_bytes());
         for g in &self.groups {
-            out.extend_from_slice(&(g.verts() as u32).to_le_bytes());
+            out.extend_from_slice(&(g.len() as u32).to_le_bytes());
         }
-        let pad = |out: &mut Vec<u8>| {
-            while !out.len().is_multiple_of(4) {
-                out.push(0);
+        out.extend_from_slice(&(templates.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(colors.len() as u32).to_le_bytes());
+        for t in &templates {
+            for v in t.iter() {
+                out.extend_from_slice(&v.to_le_bytes());
             }
+        }
+        for c in &colors {
+            out.extend_from_slice(&c.to_le_bytes());
+        }
+        let planes = |out: &mut Vec<u8>, vals: &[u16]| {
+            out.extend(vals.iter().map(|v| *v as u8));
+            out.extend(vals.iter().map(|v| (*v >> 8) as u8));
         };
-        for g in &self.groups {
-            for v in &g.pos {
-                out.extend_from_slice(&v.to_le_bytes());
+        for (g, r) in self.groups.iter().zip(&refs) {
+            let mut counts = vec![0u16; W * W];
+            for q in g {
+                counts[q.z as usize * W + q.x as usize] += 1;
             }
-            pad(&mut out);
-            for v in &g.uvl {
-                out.extend_from_slice(&v.to_le_bytes());
+            planes(&mut out, &counts);
+            let mut steps = Vec::with_capacity(g.len());
+            let mut prev = (u8::MAX, u8::MAX, 511u16);
+            for q in g {
+                if (q.z, q.x) != (prev.0, prev.1) {
+                    prev = (q.z, q.x, 511);
+                }
+                steps.push(prev.2 - q.y);
+                prev.2 = q.y;
             }
-            pad(&mut out);
-            out.extend_from_slice(&g.color);
+            planes(&mut out, &steps);
+            planes(&mut out, &r.iter().map(|x| x.0).collect::<Vec<_>>());
+            planes(&mut out, &r.iter().map(|x| x.1).collect::<Vec<_>>());
         }
         out
     }
+}
+
+/// The tile group a render layer goes in (group 2 holds leaf interiors).
+#[inline]
+fn group_of(layer: Layer) -> usize {
+    match layer {
+        Layer::Opaque => 0,
+        Layer::Cutout => 1,
+        Layer::Translucent => 3,
+    }
+}
+
+/// A corner coordinate relative to its anchor block, in 1/64 block plus 64,
+/// so elements that reach a block past their own stay positive.
+#[inline]
+fn offset(p: f32) -> u16 {
+    ((p * 64.0).round() + 64.0).clamp(0.0, 65535.0) as u16
 }
 
 #[inline]
@@ -638,11 +726,6 @@ fn neighbor(v: &Volume, vx: usize, vy: usize, vz: usize, d: u8) -> usize {
         (vy as i32 + o[1]) as usize,
         (vz as i32 + o[2]) as usize,
     )
-}
-
-#[inline]
-fn quant(v: f32) -> u16 {
-    (v * 64.0).round().clamp(0.0, 65535.0) as u16
 }
 
 #[inline]
