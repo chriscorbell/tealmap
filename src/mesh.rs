@@ -365,9 +365,12 @@ impl Mesher {
 
         for vz in 1..=TILE as usize {
             for vx in 1..=TILE as usize {
-                // Top of the column, found on the way down.
+                // Top of the current solid run, found on the way down: ground
+                // under a roof or canopy starts a run of its own.
                 let mut top = i32::MAX;
+                let mut open_above = true;
                 for vy in (1..v.h - 1).rev() {
+                    let was_open = std::mem::replace(&mut open_above, true);
                     let i = v.idx(vx, vy, vz);
                     let id = v.blocks[i];
                     if id == 0 {
@@ -384,7 +387,8 @@ impl Mesher {
                         continue;
                     }
                     let base = [wx - origin[0], wy - origin[1], wz - origin[2]];
-                    if top == i32::MAX {
+                    open_above = false;
+                    if was_open {
                         top = wy;
                     }
 
@@ -855,6 +859,44 @@ mod tests {
             tinted: false,
             shade: 1.0,
         }
+    }
+
+    #[test]
+    fn skirts_cover_ground_under_a_roof() {
+        use crate::assets::AssetFiles;
+        use crate::model::Baker;
+        let reg = Registry::new(Baker::new(AssetFiles::new()));
+        let stone = reg.id("minecraft:stone", &mut []);
+        // A 66×66 LOD grid (tile plus ring). The tile's east border column has
+        // ground up to y=5 and a roof at y=20; the ring next to it is solid up
+        // to y=8, like a neighbor drawn at another level.
+        let h = 32;
+        let mut g = crate::lod::Grid::empty(W, h, 0);
+        let col = |x: usize, z: usize| z * W + x;
+        for z in 0..W {
+            let c = col(W - 2, z);
+            g.states[c * h..c * h + 6].fill(stone);
+            g.states[c * h + 20] = stone;
+            let ring = col(W - 1, z);
+            g.states[ring * h..ring * h + 9].fill(stone);
+        }
+        let mut v = Volume::new();
+        assert!(v.fill_grid(&g, 0, 0, &reg, 2));
+        let s = Settings {
+            min_y: 0,
+            remove_caves_below_y: i32::MIN,
+            lod: true,
+        };
+        let tile = Mesher::new().mesh(&v, &reg, &s).unwrap();
+        // East faces have all four corners at x = 1 block, stored as 64 + 64.
+        let east_at = |y: u16| {
+            decode(&tile)
+                .iter()
+                .any(|q| q.1 == 64 && q.2 == y + 1 && (0..4).all(|k| q.4[k * 3] == 128))
+        };
+        assert!(east_at(5), "ground under the roof has no skirt at its top");
+        assert!(east_at(4), "the skirt covers two voxels");
+        assert!(!east_at(3), "faces below the skirt still cull");
     }
 
     #[test]

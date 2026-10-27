@@ -101,6 +101,8 @@ impl MapCtx {
         let full = full || self.manifest_version() != Some(RENDER_VERSION);
         if full {
             self.seen.lock().unwrap().clear();
+            // Output from older versions that this one no longer writes.
+            let _ = std::fs::remove_dir_all(self.out.join("lowres"));
         }
         if !self.out.join("map.json").exists() {
             // Publish the map before the first render finishes so viewers can

@@ -19,9 +19,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 pub const LEVELS: u32 = 4;
-/// Minimum solid children (of 8) for a voxel to be solid, per level. Level 1
-/// takes a majority, which keeps thin gaps open; higher levels keep anything
-/// substantial, since a majority vote compounds and erodes trees.
+/// Minimum solid children (of 8) for a voxel to be solid, per level. A low
+/// bar keeps thin things (trunks, spikes, walls) from vanishing as levels
+/// compound; the screen-space test keeps the slight fattening under a pixel.
 const MIN_SOLID: [u8; LEVELS as usize + 1] = [0, 2, 2, 2, 2];
 /// Columns per LOD tile side.
 pub const N: usize = TILE as usize;
@@ -366,7 +366,7 @@ pub fn load_source(path: &Path, reg: &Registry) -> Result<Option<Grid>> {
         *o += 2;
         Ok(u16::from_le_bytes([v[0], v[1]]))
     };
-    if b.get(..4) != Some(SRC_MAGIC) {
+    if b.len() < 24 || b.get(..4) != Some(SRC_MAGIC) {
         bail!("bad LOD source {}", path.display());
     }
     let u32_at = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
@@ -393,16 +393,25 @@ pub fn load_source(path: &Path, reg: &Registry) -> Result<Option<Grid>> {
         .iter()
         .map(|n| reg.baker.biomes.id(n))
         .collect();
+    // Sizes come from the file; a corrupt one is an error, never a panic.
+    if w > 4 * N || h > 4096 {
+        bail!("bad LOD source size in {}", path.display());
+    }
+    let bad = || anyhow::anyhow!("corrupt LOD source {}", path.display());
     let mut g = Grid::empty(w, h, y0);
     for col in 0..w * w {
-        g.biomes[col] = biomes[u16_(&mut o)? as usize];
+        g.biomes[col] = *biomes.get(u16_(&mut o)? as usize).ok_or_else(bad)?;
         for _ in 0..u16_(&mut o)? {
             let (start, len, k) = (
                 u16_(&mut o)? as usize,
                 u16_(&mut o)? as usize,
                 u16_(&mut o)? as usize,
             );
-            g.states[col * h + start..col * h + start + len].fill(states[k]);
+            let state = *states.get(k).ok_or_else(bad)?;
+            if start + len > h {
+                return Err(bad());
+            }
+            g.states[col * h + start..col * h + start + len].fill(state);
         }
     }
     Ok(Some(g))

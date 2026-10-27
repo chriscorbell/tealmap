@@ -279,25 +279,34 @@ export class MapEngine {
     this.lastPlan = 0
   }
 
-  /** Starts over the middle of the coarsest LOD tiles. */
+  /** Starts over the mapped tile closest to the middle of everything mapped. */
   private placeDefault() {
     const m = this.manifest
-    const top = m?.lod.filter(([l]) => l === m.lodLevels) ?? []
-    if (!m || !top.length) return this.placeCamera(0, 0, 520, 35, 50)
-    const size = TILE << m.lodLevels
-    const cx = top.reduce((a, [, x]) => a + x + 0.5, 0) / top.length
-    const cz = top.reduce((a, [, , z]) => a + z + 0.5, 0) / top.length
-    this.placeCamera(cx * size, cz * size, 900, 35, 50)
+    // Hires tiles always exist where anything is mapped; LOD meshes may not.
+    const tiles: [number, number][] = []
+    for (const [rx, rz, lo, hi] of m?.hires ?? []) {
+      for (let bit = 0; bit < 64; bit++) {
+        if (((bit < 32 ? lo : hi) >>> (bit & 31)) & 1) tiles.push([rx * 8 + (bit & 7), rz * 8 + (bit >> 3)])
+      }
+    }
+    if (!tiles.length) return this.placeCamera(0, 0, 520, 35, 50)
+    const cx = tiles.reduce((a, [x]) => a + x, 0) / tiles.length
+    const cz = tiles.reduce((a, [, z]) => a + z, 0) / tiles.length
+    let best = tiles[0]
+    for (const t of tiles) {
+      if ((t[0] - cx) ** 2 + (t[1] - cz) ** 2 < (best[0] - cx) ** 2 + (best[1] - cz) ** 2) best = t
+    }
+    this.placeCamera((best[0] + 0.5) * TILE, (best[1] + 0.5) * TILE, 900, 35, 50)
   }
 
   private async refreshManifest(gen: number) {
     this.pendingUpdate = false
     const m: Manifest = await (await fetch(`/maps/${this.map!.id}/map.json`, { cache: 'no-cache' })).json()
     if (gen !== this.generation || !this.manifest) return
-    const wasEmpty = this.lodSet.size === 0
+    const wasEmpty = this.masks.size === 0
     this.setManifest(m)
     // A map opened before its first render finished: frame it once tiles exist.
-    if (wasEmpty && this.lodSet.size && this.autoView) this.placeDefault()
+    if (wasEmpty && this.masks.size && this.autoView) this.placeDefault()
     this.dirty = true
   }
 
@@ -502,11 +511,13 @@ export class MapEngine {
       const size = TILE << level
       box.min.set(x * size, m.minY, z * size)
       box.max.set((x + 1) * size, m.maxY, (z + 1) * size)
+      const tile = this.tiles.get(key(level, x, z))
+      // Off-screen siblings of drawn tiles stay loaded: dropping one would make
+      // its parent unsettled and swap the whole group back to coarse.
+      if (tile) tile.lastWanted = now
       if (!frustum.intersectsBox(box)) return
       const d = Math.max(box.distanceToPoint(cam), 1)
-      const tile = this.tiles.get(key(level, x, z))
       if (meshed(level, x, z) && needs(tile)) want.push({ level, x, z, d })
-      if (tile) tile.lastWanted = now
       const kids = level > 0 && ((1 << level) * k) / d > this.detail ? this.children(level, x, z) : []
       if (kids.length) {
         if (kids.every(([l, kx, kz]) => settled(l, kx, kz))) {
