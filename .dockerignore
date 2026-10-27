@@ -1,0 +1,5 @@
+target
+data
+viewer/node_modules
+viewer/dist
+.git
