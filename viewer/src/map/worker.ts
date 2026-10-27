@@ -2,7 +2,7 @@
 //
 // Hires tiles arrive gzip-encoded over HTTP, so the browser inflates them;
 // the worker only checks the header. Lowres PNGs are decoded to raw RGBA
-// here, along with a hires-tile mask and a coarse height grid.
+// here, along with a coarse height grid.
 
 export type Request =
   | { kind: 'hires'; id: number; url: string }
@@ -15,7 +15,6 @@ export type Response =
       kind: 'lowres'
       id: number
       rgba: Uint8Array | null
-      mask: [number, number]
       coarse: Uint16Array | null
       bytes: number
     }
@@ -62,7 +61,7 @@ self.onmessage = async (e: MessageEvent<Request>) => {
 
 function empty(req: Request): Response {
   if (req.kind === 'hires') return { kind: 'hires', id: req.id, buf: null, bytes: 0 }
-  return { kind: 'lowres', id: req.id, rgba: null, mask: [0, 0], coarse: null, bytes: 0 }
+  return { kind: 'lowres', id: req.id, rgba: null, coarse: null, bytes: 0 }
 }
 
 function post(msg: Response, transfer: Transferable[] = []) {
@@ -76,8 +75,7 @@ async function decodeLowres(blob: Blob) {
   ctx.drawImage(bmp, 0, 0)
   bmp.close()
   const rgba = new Uint8Array(ctx.getImageData(0, 0, SIZE, SIZE * 2).data.buffer)
-  // Mask: which 64×64 blocks have data. Coarse: max height per 8×8 pixels.
-  const mask: [number, number] = [0, 0]
+  // Max height per 8×8 pixels.
   const coarse = new Uint16Array(64 * 64)
   const base = SIZE * SIZE * 4
   for (let z = 0; z < SIZE; z++) {
@@ -85,13 +83,9 @@ async function decodeLowres(blob: Blob) {
       const i = base + (z * SIZE + x) * 4
       const h = (rgba[i] << 8) | rgba[i + 1]
       if (h === 0) continue
-      const bit = (z >> 6) * 8 + (x >> 6)
-      mask[bit >> 5] |= 1 << (bit & 31)
       const c = (z >> 3) * 64 + (x >> 3)
       if (h > coarse[c]) coarse[c] = h
     }
   }
-  mask[0] >>>= 0
-  mask[1] >>>= 0
-  return { rgba, mask, coarse }
+  return { rgba, coarse }
 }

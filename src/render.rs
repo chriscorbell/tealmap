@@ -424,12 +424,58 @@ impl MapCtx {
             "textures": self.reg.baker.textures.count(),
             "lowres": lowres,
             "lowres2": lowres2,
+            "hires": hires_masks(&self.out.join("hires")),
         });
         write_atomic(
             &self.out.join("map.json"),
             serde_json::to_string(&manifest)?.as_bytes(),
         )
     }
+}
+
+/// Which hires tiles exist, per region: `[rx, rz, low 32 bits, high 32 bits]`
+/// of a 64-bit mask with bit `(tz % 8) * 8 + tx % 8`. Lets the viewer request
+/// hires tiles without waiting for lowres data.
+fn hires_masks(dir: &Path) -> Vec<[i64; 4]> {
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for region in rd.flatten() {
+        let name = region.file_name();
+        let Some((rx, rz)) = name.to_str().and_then(parse_pair) else {
+            continue;
+        };
+        let mut mask = 0u64;
+        for tile in std::fs::read_dir(region.path())
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            let name = tile.file_name();
+            let Some(stem) = name.to_str().and_then(|n| n.strip_suffix(".tmh")) else {
+                continue;
+            };
+            if let Some((tx, tz)) = parse_pair(stem) {
+                mask |= 1 << (tz.rem_euclid(8) * 8 + tx.rem_euclid(8));
+            }
+        }
+        if mask != 0 {
+            out.push([
+                rx as i64,
+                rz as i64,
+                (mask & 0xffff_ffff) as i64,
+                (mask >> 32) as i64,
+            ]);
+        }
+    }
+    out.sort_unstable();
+    out
+}
+
+fn parse_pair(s: &str) -> Option<(i32, i32)> {
+    let (a, b) = s.split_once('_')?;
+    Some((a.parse().ok()?, b.parse().ok()?))
 }
 
 struct RegionScan {
@@ -685,6 +731,31 @@ mod tests {
         );
         assert!(first.keys().any(|k| k.starts_with("hires/0_0/")));
         assert_eq!(first, render("b", true), "two full renders differ");
+
+        // The manifest's hires masks list exactly the hires tiles on disk.
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(base.join("a/maps/test/map.json")).unwrap())
+                .unwrap();
+        let mut listed = BTreeSet::new();
+        for e in manifest["hires"].as_array().unwrap() {
+            let v: Vec<i64> = e
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|n| n.as_i64().unwrap())
+                .collect();
+            let mask = v[2] as u64 | (v[3] as u64) << 32;
+            for bit in (0..64).filter(|b| mask >> b & 1 == 1) {
+                let (tx, tz) = (v[0] * 8 + bit % 8, v[1] * 8 + bit / 8);
+                listed.insert(format!("hires/{}_{}/{tx}_{tz}.tmh", v[0], v[1]));
+            }
+        }
+        let on_disk: BTreeSet<String> = first
+            .keys()
+            .filter(|k| k.starts_with("hires/"))
+            .cloned()
+            .collect();
+        assert_eq!(listed, on_disk);
 
         // Chunk (1,1) of region 0,0 is inside tile (0,0); chunk (0,0) sits on a
         // tile corner and also touches tiles in three other regions.

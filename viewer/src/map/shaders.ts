@@ -38,8 +38,13 @@ export const hiresFragment = /* glsl */ `
     #ifdef CUTOUT
       if (t.a < 0.4) discard;
     #endif
+    // Dissolve in: a stable per-pixel threshold, so no transparency sorting.
+    if (uAppear < 1.0) {
+      float n = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+      if (n >= uAppear) discard;
+    }
     vec3 c = t.rgb * vColor;
-    c = mix(c, uFogColor, max(fogFactor(vDist), 1.0 - uAppear));
+    c = mix(c, uFogColor, fogFactor(vDist));
     #ifdef TRANSLUCENT
       fragColor = vec4(c, t.a);
     #else

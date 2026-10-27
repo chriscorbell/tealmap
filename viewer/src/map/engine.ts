@@ -17,6 +17,8 @@ interface Manifest {
   textures: number
   lowres: [number, number][]
   lowres2: [number, number][]
+  /** Per region: [rx, rz, low 32 bits, high 32 bits] of the 8×8 hires tile mask. */
+  hires: [number, number, number, number][]
 }
 
 export interface Stats {
@@ -48,6 +50,9 @@ const REGION = 512
 const MAX_HIRES_INFLIGHT = 6
 const MAX_LOWRES_INFLIGHT = 4
 const FADE_MS = 450
+/** Hires tiles dissolve in over the lowres, which stays drawn until they finish. */
+const HIRES_FADE_MS = 200
+const UPLOAD_BYTES_PER_FRAME = 12e6
 
 interface HiresTile {
   tx: number
@@ -68,8 +73,6 @@ interface LowresTile {
   mesh: THREE.Mesh | null
   material: THREE.ShaderMaterial | null
   texture: THREE.DataTexture | null
-  /** Which 64×64 hires tiles have data (level 1 only). */
-  dataMask: [number, number]
   /** Max height per 8×8 pixels, raw encoded heights. */
   coarse: Uint16Array | null
   /** Bits of finer tiles currently drawn over this tile. */
@@ -139,6 +142,9 @@ export class MapEngine {
   private fadeStart = new Map<THREE.Mesh, number>()
 
   hiresDistance = 192
+  /** Tiles waiting for their GPU upload, closest first. Each returns the bytes it uploads. */
+  private uploads: (() => number)[] = []
+  private justAdded: THREE.Group[] = []
   private pendingUpdate = false
   private autoView = true
   private dirty = true
@@ -266,6 +272,7 @@ export class MapEngine {
     const wasEmpty = this.manifest.lowres.length === 0
     this.manifest.lowres = m.lowres
     this.manifest.lowres2 = m.lowres2
+    this.manifest.hires = m.hires
     // A map opened before its first render finished: frame it once tiles exist.
     if (wasEmpty && m.lowres.length && this.autoView) this.placeDefault()
     this.lastPlan = 0
@@ -406,8 +413,8 @@ export class MapEngine {
       this.pendingUpdate = true
       return
     }
-    const known = new Set(this.manifest.lowres.map(([x, z]) => `${x},${z}`))
-    if (up.lowres.some(([x, z]) => !known.has(`${x},${z}`)) || up.lowres2.length) {
+    // Hires tiles can appear or vanish, which changes the masks in the manifest.
+    if (up.hires.length || up.lowres.length || up.lowres2.length) {
       await this.refreshManifest(this.generation)
     }
     for (const [x, z] of up.hires) {
@@ -451,16 +458,15 @@ export class MapEngine {
       if (d <= l1R) wantLow.set(`1:${x},${z}`, { x, z, level: 1, d })
     }
 
-    // Hires tiles that the loaded level 1 data says exist.
+    // Hires tiles the manifest says exist; no need to wait for lowres data.
     const wantHi = new Map<string, { tx: number; tz: number; d: number }>()
     if (hiresR > 0) {
-      for (const lt of this.lowres.values()) {
-        if (lt.level !== 1 || lt.state !== 'ready') continue
-        if (rectDist(lt.x * REGION, lt.z * REGION, REGION) > hiresR) continue
+      for (const [rx, rz, lo, hi] of m.hires ?? []) {
+        if (rectDist(rx * REGION, rz * REGION, REGION) > hiresR) continue
         for (let bit = 0; bit < 64; bit++) {
-          if (!((lt.dataMask[bit >> 5] >>> (bit & 31)) & 1)) continue
-          const tx = lt.x * 8 + (bit & 7)
-          const tz = lt.z * 8 + (bit >> 3)
+          if (!(((bit < 32 ? lo : hi) >>> (bit & 31)) & 1)) continue
+          const tx = rx * 8 + (bit & 7)
+          const tz = rz * 8 + (bit >> 3)
           const d = rectDist(tx * TILE, tz * TILE, TILE)
           if (d <= hiresR) wantHi.set(`${tx},${tz}`, { tx, tz, d })
         }
@@ -470,8 +476,13 @@ export class MapEngine {
     // Unload what's no longer wanted (with some slack to avoid thrashing),
     // and anything in a region the manifest no longer lists.
     const regions = new Set(m.lowres.map(([x, z]) => `${x},${z}`))
+    const masks = new Map((m.hires ?? []).map(([rx, rz, lo, hi]) => [`${rx},${rz}`, [lo, hi]]))
     for (const [key, tile] of this.hires) {
-      const listed = regions.has(`${Math.floor(tile.tx / 8)},${Math.floor(tile.tz / 8)}`)
+      const rx = Math.floor(tile.tx / 8)
+      const rz = Math.floor(tile.tz / 8)
+      const bit = (tile.tz - rz * 8) * 8 + (tile.tx - rx * 8)
+      const mask = masks.get(`${rx},${rz}`)
+      const listed = !!mask && ((mask[bit >> 5] >>> (bit & 31)) & 1) === 1
       const near = wantHi.has(key) || rectDist(tile.tx * TILE, tile.tz * TILE, TILE) <= hiresR * 1.2 + 32
       if (!listed || !near) this.dropHires(key, tile)
     }
@@ -537,6 +548,8 @@ export class MapEngine {
     tile.state = 'loading'
     done.then((res) => {
       if (gen !== this.generation || this.hires.get(key) !== tile || tile.req !== id) return
+      // Refill the request slot on the next frame instead of the next plan tick.
+      this.lastPlan = 0
       if (res.kind === 'error') {
         console.warn(`tile ${key}: ${res.message}`)
         tile.state = wasReady ? 'ready' : 'empty'
@@ -544,22 +557,44 @@ export class MapEngine {
       }
       if (res.kind !== 'hires') return
       this.downloaded += res.bytes
-      const old = tile.group
-      if (res.buf) {
-        const { group, bytes } = this.buildHires(res.buf)
+      if (!res.buf) {
+        if (tile.group) this.disposeGroup(tile.group)
+        tile.group = null
+        tile.gpuBytes = 0
+        tile.state = 'empty'
+        this.setCover(tx, tz, false)
+        this.dirty = true
+        return
+      }
+      const { group, bytes } = this.buildHires(res.buf)
+      // Three uploads geometry the first time it's drawn. Queue the tile so each
+      // frame uploads only a bounded amount; it counts as loading until then.
+      this.uploads.push(() => {
+        if (gen !== this.generation || this.hires.get(key) !== tile || tile.req !== id) {
+          this.disposeGroup(group)
+          return 0
+        }
+        const old = tile.group
         tile.group = group
         tile.gpuBytes = bytes
         tile.state = 'ready'
         this.scene.add(group)
-        if (!old) group.children.forEach((c) => this.fadeIn(c as THREE.Mesh))
-      } else {
-        tile.group = null
-        tile.gpuBytes = 0
-        tile.state = 'empty'
-      }
-      if (old) this.disposeGroup(old)
-      this.setCover(tx, tz, tile.state === 'ready')
-      this.dirty = true
+        // Three uploads geometry only for meshes it draws, so draw this one
+        // once regardless of the frustum to keep its upload in this frame's budget.
+        for (const c of group.children) c.frustumCulled = false
+        this.justAdded.push(group)
+        if (old) {
+          // Reloads swap in place.
+          this.disposeGroup(old)
+          this.setCover(tx, tz, true)
+        } else {
+          // A first load dissolves in over the lowres, which stays until the fade ends.
+          group.children.forEach((c) => this.fadeIn(c as THREE.Mesh, tile))
+        }
+        this.lastPlan = 0
+        this.dirty = true
+        return bytes
+      })
     })
   }
 
@@ -661,7 +696,6 @@ export class MapEngine {
       mesh: null,
       material: null,
       texture: null,
-      dataMask: [0, 0],
       coarse: null,
       cover: [0, 0],
       born: now,
@@ -731,7 +765,6 @@ export class MapEngine {
         this.recomputeCover(tile)
         this.scene.add(mesh)
       }
-      tile.dataMask = res.mask
       tile.coarse = res.coarse
       tile.state = 'ready'
       if (level === 1) this.setCoverLevel2(x, z, true)
@@ -779,7 +812,9 @@ export class MapEngine {
     tile.cover = [0, 0]
     if (tile.level === 1) {
       for (const h of this.hires.values()) {
-        if (h.state === 'ready' && Math.floor(h.tx / 8) === tile.x && Math.floor(h.tz / 8) === tile.z) {
+        // Tiles still dissolving in don't cover yet; their fade sets the bit when it ends.
+        const fading = h.group?.children.some((c) => this.fading.has(c as THREE.Mesh))
+        if (h.state === 'ready' && !fading && Math.floor(h.tx / 8) === tile.x && Math.floor(h.tz / 8) === tile.z) {
           setBit(tile, (h.tz - tile.z * 8) * 8 + (h.tx - tile.x * 8), true)
         }
       }
@@ -806,7 +841,7 @@ export class MapEngine {
 
   // ---------------------------------------------------------------- frame
 
-  private fadeIn(mesh: THREE.Mesh) {
+  private fadeIn(mesh: THREE.Mesh, tile: HiresTile) {
     const base = mesh.material as THREE.ShaderMaterial
     const m = base.clone()
     m.uniforms = { ...base.uniforms, uAppear: { value: 0 } }
@@ -814,14 +849,18 @@ export class MapEngine {
     this.fading.add(mesh)
     this.fadeStart.set(mesh, performance.now())
     mesh.userData.base = base
+    mesh.userData.tile = tile
   }
 
-  private endFade(mesh: THREE.Mesh) {
+  /** Ends a fade; `done` means it ran to completion, so the lowres under it can go. */
+  private endFade(mesh: THREE.Mesh, done = false) {
     if (!this.fading.has(mesh)) return
     ;(mesh.material as THREE.Material).dispose()
     mesh.material = mesh.userData.base
     this.fading.delete(mesh)
     this.fadeStart.delete(mesh)
+    const tile = mesh.userData.tile as HiresTile
+    if (done && tile.state === 'ready') this.setCover(tile.tx, tile.tz, true)
   }
 
   private frame = (now: number) => {
@@ -838,6 +877,11 @@ export class MapEngine {
       this.dirty = true
     }
 
+    // Bounded GPU uploads per frame, so a burst of arrivals doesn't stall a frame.
+    for (let budget = UPLOAD_BYTES_PER_FRAME; budget > 0 && this.uploads.length; ) {
+      budget -= this.uploads.shift()!()
+    }
+
     if (now - this.lastPlan > 150) {
       this.lastPlan = now
       this.plan(now)
@@ -845,9 +889,9 @@ export class MapEngine {
 
     // Fades.
     for (const mesh of this.fading) {
-      const k = Math.min(1, (now - this.fadeStart.get(mesh)!) / FADE_MS)
-      ;(mesh.material as THREE.ShaderMaterial).uniforms.uAppear.value = easeOut(k)
-      if (k >= 1) this.endFade(mesh)
+      const k = Math.min(1, (now - this.fadeStart.get(mesh)!) / HIRES_FADE_MS)
+      ;(mesh.material as THREE.ShaderMaterial).uniforms.uAppear.value = k
+      if (k >= 1) this.endFade(mesh, true)
       this.dirty = true
     }
     for (const lt of this.lowres.values()) {
@@ -874,6 +918,8 @@ export class MapEngine {
       const t0 = performance.now()
       const q = this.gpuTimer?.begin()
       this.renderer.render(this.scene, this.camera)
+      for (const g of this.justAdded) for (const c of g.children) c.frustumCulled = true
+      this.justAdded = []
       if (q) this.gpuTimer!.end(q)
       this.frameMsAcc += performance.now() - t0
       this.frames++
