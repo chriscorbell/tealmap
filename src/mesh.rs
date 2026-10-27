@@ -18,7 +18,8 @@
 //! ```
 
 use crate::model::{
-    BlockInfo, DIR_VEC, DOWN, F_CULL_SAME, Layer, Quad, Registry, Tint, UP, opposite,
+    BlockInfo, DIR_VEC, DOWN, EAST, F_CULL_SAME, Layer, NORTH, Quad, Registry, SOUTH, Tint, UP,
+    WEST, opposite,
 };
 use crate::world::{Chunk, nibble};
 
@@ -342,7 +343,7 @@ impl Mesher {
                         } else {
                             biomes.colors(v.biomes[i]).water
                         };
-                        self.fluid(v, reg, vx, vy, vz, info, lava, tex, base, color);
+                        self.fluid(v, reg, vx, vy, vz, lava, tex, base, color);
                     }
                 }
                 if !col_done && let Some((wh, wc)) = water_top {
@@ -353,10 +354,70 @@ impl Mesher {
             }
         }
 
+        self.halo_faces(v, reg, s, origin);
+
         if self.groups.iter().all(|g| g.pos.is_empty()) {
             return None;
         }
         Some(self.encode(origin))
+    }
+
+    /// Faces of the halo blocks that point into the tile, such as a cliff that
+    /// belongs to the neighboring tile. They close the gap where this tile meets
+    /// a neighbor drawn at lowres; when the neighbor is drawn at hires too, its
+    /// identical face covers the same pixels.
+    fn halo_faces(&mut self, v: &Volume, reg: &Registry, s: &Settings, origin: [i32; 3]) {
+        let biomes = &reg.baker.biomes;
+        let last = W - 1;
+        // (halo strip x or z, whether it's an x strip, face direction into the tile)
+        let strips = [
+            (0, true, EAST),
+            (last, true, WEST),
+            (0, false, SOUTH),
+            (last, false, NORTH),
+        ];
+        for (fixed, is_x, d) in strips {
+            for t in 1..=TILE as usize {
+                let (vx, vz) = if is_x { (fixed, t) } else { (t, fixed) };
+                for vy in 1..v.h - 1 {
+                    let i = v.idx(vx, vy, vz);
+                    let id = v.blocks[i];
+                    if id == 0 {
+                        continue;
+                    }
+                    let info = reg.get(id);
+                    let wy = v.y0 + vy as i32;
+                    if info.is_air() || self.is_cave(v, vx, vy, vz, wy, s) {
+                        continue;
+                    }
+                    let n = neighbor(v, vx, vy, vz, d);
+                    let ninfo = reg.get(v.blocks[n]);
+                    if ninfo.occludes & (1 << opposite(d)) != 0 {
+                        continue;
+                    }
+                    if info.flags & F_CULL_SAME != 0
+                        && (v.blocks[n] == id || ninfo.name == info.name)
+                    {
+                        continue;
+                    }
+                    let wx = v.x0 + vx as i32 - 1;
+                    let wz = v.z0 + vz as i32 - 1;
+                    let base = [wx - origin[0], wy - origin[1], wz - origin[2]];
+                    for q in info
+                        .variant(wx, wy, wz)
+                        .iter()
+                        .filter(|q| q.cull == Some(d))
+                    {
+                        let color = if q.tinted {
+                            tint_color(info, biomes.colors(v.biomes[i]))
+                        } else {
+                            [255, 255, 255]
+                        };
+                        self.emit(q, base, color, v.light[n]);
+                    }
+                }
+            }
+        }
     }
 
     /// BlueMap-style cave removal: below a y threshold and the ocean floor,
@@ -375,6 +436,12 @@ impl Mesher {
             return false;
         }
         for d in 0..6u8 {
+            // Halo blocks have no neighbor outside the volume; skip that side.
+            let o = DIR_VEC[d as usize];
+            let (nx, nz) = (vx as i32 + o[0], vz as i32 + o[2]);
+            if nx < 0 || nz < 0 || nx >= W as i32 || nz >= W as i32 {
+                continue;
+            }
             if v.light[neighbor(v, vx, vy, vz, d)] >> 4 != 0 {
                 return false;
             }
@@ -427,7 +494,6 @@ impl Mesher {
         vx: usize,
         vy: usize,
         vz: usize,
-        info: &BlockInfo,
         lava: bool,
         tex: u16,
         base: [i32; 3],
@@ -441,14 +507,21 @@ impl Mesher {
                 b.has_water()
             }
         };
-        let up = neighbor(v, vx, vy, vz, UP);
-        let height = if same(up) {
-            1.0
-        } else if info.fluid_level == 0 || info.fluid_level >= 8 {
-            8.0 / 9.0
-        } else {
-            (8 - info.fluid_level.min(7)) as f32 / 9.0
+        // Surface height of the fluid at a volume position: full under more fluid,
+        // else from its level (sources and falling fluid sit at 8/9).
+        let height_at = |x: usize, y: usize, z: usize| {
+            if same(v.idx(x, y + 1, z)) {
+                return 1.0;
+            }
+            let level = reg.get(v.blocks[v.idx(x, y, z)]).fluid_level;
+            if level == 0 || level >= 8 {
+                8.0 / 9.0
+            } else {
+                (8 - level.min(7)) as f32 / 9.0
+            }
         };
+        let up = neighbor(v, vx, vy, vz, UP);
+        let height = height_at(vx, vy, vz);
         let layer = if lava {
             Layer::Opaque
         } else {
@@ -457,8 +530,17 @@ impl Mesher {
         let i = v.idx(vx, vy, vz);
         for d in 0..6u8 {
             let n = neighbor(v, vx, vy, vz, d);
+            // Beside lower fluid of the same kind, only the strip above it shows.
+            let mut lo = 0.0;
             if same(n) {
-                continue;
+                if d < 2 {
+                    continue;
+                }
+                let o = DIR_VEC[d as usize];
+                lo = height_at((vx as i32 + o[0]) as usize, vy, (vz as i32 + o[2]) as usize);
+                if lo >= height {
+                    continue;
+                }
             }
             let ninfo = reg.get(v.blocks[n]);
             if ninfo.occludes & (1 << opposite(d)) != 0 {
@@ -473,35 +555,19 @@ impl Mesher {
                     [1.0, 0.0, 1.0],
                 ],
                 1 => [[0.0, h, 0.0], [0.0, h, 1.0], [1.0, h, 1.0], [1.0, h, 0.0]],
-                2 => [
-                    [1.0, h, 0.0],
-                    [1.0, 0.0, 0.0],
-                    [0.0, 0.0, 0.0],
-                    [0.0, h, 0.0],
-                ],
-                3 => [
-                    [0.0, h, 1.0],
-                    [0.0, 0.0, 1.0],
-                    [1.0, 0.0, 1.0],
-                    [1.0, h, 1.0],
-                ],
-                4 => [
-                    [0.0, h, 0.0],
-                    [0.0, 0.0, 0.0],
-                    [0.0, 0.0, 1.0],
-                    [0.0, h, 1.0],
-                ],
-                _ => [
-                    [1.0, h, 1.0],
-                    [1.0, 0.0, 1.0],
-                    [1.0, 0.0, 0.0],
-                    [1.0, h, 0.0],
-                ],
+                2 => [[1.0, h, 0.0], [1.0, lo, 0.0], [0.0, lo, 0.0], [0.0, h, 0.0]],
+                3 => [[0.0, h, 1.0], [0.0, lo, 1.0], [1.0, lo, 1.0], [1.0, h, 1.0]],
+                4 => [[0.0, h, 0.0], [0.0, lo, 0.0], [0.0, lo, 1.0], [0.0, h, 1.0]],
+                _ => [[1.0, h, 1.0], [1.0, lo, 1.0], [1.0, lo, 0.0], [1.0, h, 0.0]],
             };
-            let top_v = if d < 2 { 0.0 } else { 1.0 - h };
+            let (top_v, bottom_v) = if d < 2 {
+                (0.0, 1.0)
+            } else {
+                (1.0 - h, 1.0 - lo)
+            };
             let q = Quad {
                 pos,
-                uv: [[0.0, top_v], [0.0, 1.0], [1.0, 1.0], [1.0, top_v]],
+                uv: [[0.0, top_v], [0.0, bottom_v], [1.0, bottom_v], [1.0, top_v]],
                 tex,
                 layer,
                 cull: Some(d),

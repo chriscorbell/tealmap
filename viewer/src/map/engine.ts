@@ -137,6 +137,8 @@ export class MapEngine {
   private fadeStart = new Map<THREE.Mesh, number>()
 
   hiresDistance = 320
+  private pendingUpdate = false
+  private autoView = true
   private dirty = true
   private lastPlan = 0
   private raf = 0
@@ -176,6 +178,9 @@ export class MapEngine {
     this.controls.maxDistance = 12000
     this.controls.zoomSpeed = 1.3
     this.controls.zoomToCursor = true
+    this.controls.addEventListener('start', () => {
+      this.autoView = false
+    })
     this.controls.addEventListener('change', () => {
       this.dirty = true
       this.scheduleHash()
@@ -210,25 +215,56 @@ export class MapEngine {
     const gen = ++this.generation
     this.clearTiles()
     this.map = map
-    const manifest: Manifest = await (await fetch(`/maps/${map.id}/map.json`, { cache: 'no-cache' })).json()
+    // Nothing plans against the old map's manifest or textures while loading.
+    this.manifest = null
+    this.pendingUpdate = false
+    this.autoView = !view
+    // Subscribe first so an update published while loading isn't missed.
+    this.listen()
+    let manifest: Manifest
+    for (;;) {
+      const res = await fetch(`/maps/${map.id}/map.json`, { cache: 'no-cache' })
+      if (gen !== this.generation) return
+      if (res.ok) {
+        manifest = await res.json()
+        break
+      }
+      // A fresh server publishes each map once its first render starts.
+      await new Promise((r) => setTimeout(r, 3000))
+    }
     const texRes = await fetch(`/maps/${map.id}/textures.bin`)
     const texData = new Uint8Array(await texRes.arrayBuffer())
     if (gen !== this.generation) return
     this.manifest = manifest
     this.setupMaterials(texData, manifest.textures)
 
-    if (view) {
-      this.placeCamera(view.x, view.z, view.dist, view.az, view.polar)
-    } else {
-      // Start over the region closest to the middle of the mapped area.
-      const n = Math.max(manifest.lowres.length, 1)
-      const cx = manifest.lowres.reduce((a, [x]) => a + x, 0) / n
-      const cz = manifest.lowres.reduce((a, [, z]) => a + z, 0) / n
-      const mid = [...manifest.lowres].sort((a, b) => (a[0] - cx) ** 2 + (a[1] - cz) ** 2 - ((b[0] - cx) ** 2 + (b[1] - cz) ** 2))[0]
-      const [x, z] = mid ? [mid[0] * REGION + REGION / 2, mid[1] * REGION + REGION / 2] : [0, 0]
-      this.placeCamera(x, z, 520, 35, 50)
-    }
-    this.listen()
+    if (view) this.placeCamera(view.x, view.z, view.dist, view.az, view.polar)
+    else this.placeDefault()
+    if (this.pendingUpdate) this.refreshManifest(gen)
+    this.dirty = true
+  }
+
+  /** Starts over the region closest to the middle of the mapped area. */
+  private placeDefault() {
+    const tiles = this.manifest?.lowres ?? []
+    const n = Math.max(tiles.length, 1)
+    const cx = tiles.reduce((a, [x]) => a + x, 0) / n
+    const cz = tiles.reduce((a, [, z]) => a + z, 0) / n
+    const mid = [...tiles].sort((a, b) => (a[0] - cx) ** 2 + (a[1] - cz) ** 2 - ((b[0] - cx) ** 2 + (b[1] - cz) ** 2))[0]
+    const [x, z] = mid ? [mid[0] * REGION + REGION / 2, mid[1] * REGION + REGION / 2] : [0, 0]
+    this.placeCamera(x, z, 520, 35, 50)
+  }
+
+  private async refreshManifest(gen: number) {
+    this.pendingUpdate = false
+    const m: Manifest = await (await fetch(`/maps/${this.map!.id}/map.json`, { cache: 'no-cache' })).json()
+    if (gen !== this.generation || !this.manifest) return
+    const wasEmpty = this.manifest.lowres.length === 0
+    this.manifest.lowres = m.lowres
+    this.manifest.lowres2 = m.lowres2
+    // A map opened before its first render finished: frame it once tiles exist.
+    if (wasEmpty && m.lowres.length && this.autoView) this.placeDefault()
+    this.lastPlan = 0
     this.dirty = true
   }
 
@@ -349,13 +385,14 @@ export class MapEngine {
   }
 
   private async applyUpdate(up: { hires: [number, number][]; lowres: [number, number][]; lowres2: [number, number][] }) {
-    const known = new Set(this.manifest?.lowres.map(([x, z]) => `${x},${z}`))
+    if (!this.manifest) {
+      // Still loading: refresh the manifest once it's in.
+      this.pendingUpdate = true
+      return
+    }
+    const known = new Set(this.manifest.lowres.map(([x, z]) => `${x},${z}`))
     if (up.lowres.some(([x, z]) => !known.has(`${x},${z}`)) || up.lowres2.length) {
-      const m: Manifest = await (await fetch(`/maps/${this.map!.id}/map.json`, { cache: 'no-cache' })).json()
-      if (this.manifest) {
-        this.manifest.lowres = m.lowres
-        this.manifest.lowres2 = m.lowres2
-      }
+      await this.refreshManifest(this.generation)
     }
     for (const [x, z] of up.hires) {
       const t = this.hires.get(`${x},${z}`)

@@ -101,6 +101,12 @@ impl MapCtx {
         if full {
             self.seen.lock().unwrap().clear();
         }
+        if !self.out.join("map.json").exists() {
+            // Publish the map before the first render finishes so viewers can
+            // open it; tiles arrive with the update at the end of the pass.
+            self.write_textures(true)?;
+            self.write_manifest()?;
+        }
         let regions = list_regions(&self.region_dir())?;
         let present: BTreeSet<(i32, i32)> = regions.iter().map(|&(x, z, _)| (x, z)).collect();
 
@@ -113,19 +119,17 @@ impl MapCtx {
         })?;
         // Regions whose files disappeared: every chunk they had is now gone.
         let mut scans = scans;
-        if !full {
-            for (rx, rz) in self.stored_regions()? {
-                if !present.contains(&(rx, rz)) {
-                    let old = self.load_state(rx, rz);
-                    let dirty = (0..1024).filter(|&i| old[i] != 0).collect();
-                    scans.push(RegionScan {
-                        rx,
-                        rz,
-                        hashes: vec![0; 1024],
-                        dirty,
-                        stamp: None,
-                    });
-                }
+        for (rx, rz) in self.stored_regions()? {
+            if !present.contains(&(rx, rz)) {
+                let old = self.load_state(rx, rz);
+                let dirty = (0..1024).filter(|&i| old[i] != 0).collect();
+                scans.push(RegionScan {
+                    rx,
+                    rz,
+                    hashes: vec![0; 1024],
+                    dirty,
+                    stamp: None,
+                });
             }
         }
 
@@ -224,11 +228,9 @@ impl MapCtx {
         if !full && self.seen.lock().unwrap().get(&(rx, rz)) == Some(&stamp) {
             return Ok(None);
         }
-        let old = if full {
-            vec![0; 1024]
-        } else {
-            self.load_state(rx, rz)
-        };
+        // Full renders still compare against saved state, so chunks that have
+        // since disappeared get their stale tiles cleared too.
+        let old = self.load_state(rx, rz);
         let region = Region::open(path, rx, rz)?;
         let mut raw = Vec::new();
         let mut hashes = vec![0u64; 1024];
@@ -241,7 +243,11 @@ impl MapCtx {
                 Err(_) => u64::MAX,
             };
             hashes[i] = h;
-            if h != old[i] {
+            if if full {
+                h != 0 || old[i] != 0
+            } else {
+                h != old[i]
+            } {
                 dirty.push(i);
             }
         }
@@ -700,6 +706,22 @@ mod tests {
             incremental,
             render("c", true),
             "incremental render differs from a full one"
+        );
+
+        // A full render after a region disappears must not keep its old tiles.
+        // The copy sits far from the others so no neighbor's halo reaches it.
+        let far = world.join("region/r.5.5.mca");
+        std::fs::copy(world.join("region/r.-1.-1.mca"), &far).unwrap();
+        assert!(
+            render("a", true)
+                .keys()
+                .any(|k| k.starts_with("hires/5_5/"))
+        );
+        std::fs::remove_file(&far).unwrap();
+        assert_eq!(
+            render("a", true),
+            render("d", true),
+            "full render kept stale tiles"
         );
 
         let _ = std::fs::remove_dir_all(&base);
