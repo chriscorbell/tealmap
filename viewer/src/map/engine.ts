@@ -271,6 +271,11 @@ export class MapEngine {
         for (let l = 1; l <= m.lodLevels; l++) this.nodes.add(key(l, tx >> l, tz >> l))
       }
     }
+    // Drop resident tiles whose mesh the manifest no longer lists.
+    for (const [k2, t] of this.tiles) {
+      const listed = t.level > 0 ? this.lodSet.has(k2) : this.exists(0, t.x, t.z)
+      if (!listed) this.dropTile(k2, t)
+    }
     this.lastPlan = 0
   }
 
