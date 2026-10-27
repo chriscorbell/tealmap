@@ -69,10 +69,19 @@ impl Volume {
         chunk: &dyn Fn(i32, i32) -> Option<&'c Chunk>,
     ) -> bool {
         let (cx0, cz0) = (x0 >> 4, z0 >> 4);
-        // Vertical range from the tile's own chunks.
+        // An empty tile has nothing to draw.
+        let core = (cz0..cz0 + 4).flat_map(|cz| (cx0..cx0 + 4).map(move |cx| (cx, cz)));
+        if !core
+            .filter_map(|(cx, cz)| chunk(cx, cz))
+            .any(|c| c.sections.iter().any(|s| !s.is_empty()))
+        {
+            return false;
+        }
+        // Vertical range from the tile and its neighbors, so the halo faces of a
+        // taller neighbor are complete.
         let (mut ylo, mut yhi) = (i32::MAX, i32::MIN);
-        for cz in cz0..cz0 + 4 {
-            for cx in cx0..cx0 + 4 {
+        for cz in cz0 - 1..cz0 + 5 {
+            for cx in cx0 - 1..cx0 + 5 {
                 if let Some(c) = chunk(cx, cz) {
                     for s in c.sections.iter().filter(|s| !s.is_empty()) {
                         ylo = ylo.min(s.y * 16);
@@ -80,9 +89,6 @@ impl Volume {
                     }
                 }
             }
-        }
-        if ylo > yhi {
-            return false;
         }
         self.x0 = x0;
         self.z0 = z0;
@@ -406,7 +412,8 @@ impl Mesher {
                     for q in info
                         .variant(wx, wy, wz)
                         .iter()
-                        .filter(|q| q.cull == Some(d))
+                        // Translucent copies would blend twice where the neighbor is drawn too.
+                        .filter(|q| q.cull == Some(d) && q.layer != Layer::Translucent)
                     {
                         let color = if q.tinted {
                             tint_color(info, biomes.colors(v.biomes[i]))

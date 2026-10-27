@@ -381,6 +381,12 @@ export class MapEngine {
       if (msg.map !== this.map?.id) return
       this.applyUpdate(msg.update)
     })
+    // On connect and every reconnect, catch up on anything published while
+    // the stream was down; the server doesn't replay events.
+    es.onopen = () => {
+      if (this.manifest) this.refreshManifest(this.generation)
+      else this.pendingUpdate = true
+    }
     this.events = es
   }
 
@@ -857,7 +863,7 @@ export class MapEngine {
 
     if (now - this.lastStats > 1000) {
       const info = this.renderer.info.render
-      let gpu = (this.blockTex ? this.manifest!.textures * 1024 * 1.34 : 0)
+      let gpu = this.blockTex && this.manifest ? this.manifest.textures * 1024 * 1.34 : 0
       let hi = 0
       for (const h of this.hires.values()) {
         gpu += h.gpuBytes
