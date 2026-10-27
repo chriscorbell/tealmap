@@ -132,7 +132,7 @@ fn write_or_remove(p: &Path, color: &[[u8; 3]], height: &[u16]) -> Result<()> {
         let mut enc = png::Encoder::new(&mut png_bytes, SIZE as u32, (SIZE * 2) as u32);
         enc.set_color(png::ColorType::Rgb);
         enc.set_depth(png::BitDepth::Eight);
-        enc.set_compression(png::Compression::Balanced);
+        enc.set_compression(png::Compression::High);
         let mut w = enc.write_header()?;
         w.write_image_data(&rgb)?;
     }
