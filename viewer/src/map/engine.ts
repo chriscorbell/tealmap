@@ -49,7 +49,7 @@ const TILE = 64
 const REGION = 512
 const MAX_HIRES_INFLIGHT = 6
 const MAX_LOWRES_INFLIGHT = 4
-const FADE_MS = 250
+const FADE_MS = 450
 /** Hires tiles dissolve in over the lowres, which stays drawn until they finish. */
 const HIRES_FADE_MS = 200
 const UPLOAD_BYTES_PER_FRAME = 12e6
@@ -144,6 +144,7 @@ export class MapEngine {
   hiresDistance = 192
   /** Tiles waiting for their GPU upload, closest first. Each returns the bytes it uploads. */
   private uploads: (() => number)[] = []
+  private justAdded: THREE.Group[] = []
   private pendingUpdate = false
   private autoView = true
   private dirty = true
@@ -475,8 +476,13 @@ export class MapEngine {
     // Unload what's no longer wanted (with some slack to avoid thrashing),
     // and anything in a region the manifest no longer lists.
     const regions = new Set(m.lowres.map(([x, z]) => `${x},${z}`))
+    const masks = new Map((m.hires ?? []).map(([rx, rz, lo, hi]) => [`${rx},${rz}`, [lo, hi]]))
     for (const [key, tile] of this.hires) {
-      const listed = regions.has(`${Math.floor(tile.tx / 8)},${Math.floor(tile.tz / 8)}`)
+      const rx = Math.floor(tile.tx / 8)
+      const rz = Math.floor(tile.tz / 8)
+      const bit = (tile.tz - rz * 8) * 8 + (tile.tx - rx * 8)
+      const mask = masks.get(`${rx},${rz}`)
+      const listed = !!mask && ((mask[bit >> 5] >>> (bit & 31)) & 1) === 1
       const near = wantHi.has(key) || rectDist(tile.tx * TILE, tile.tz * TILE, TILE) <= hiresR * 1.2 + 32
       if (!listed || !near) this.dropHires(key, tile)
     }
@@ -573,6 +579,10 @@ export class MapEngine {
         tile.gpuBytes = bytes
         tile.state = 'ready'
         this.scene.add(group)
+        // Three uploads geometry only for meshes it draws, so draw this one
+        // once regardless of the frustum to keep its upload in this frame's budget.
+        for (const c of group.children) c.frustumCulled = false
+        this.justAdded.push(group)
         if (old) {
           // Reloads swap in place.
           this.disposeGroup(old)
@@ -802,7 +812,9 @@ export class MapEngine {
     tile.cover = [0, 0]
     if (tile.level === 1) {
       for (const h of this.hires.values()) {
-        if (h.state === 'ready' && Math.floor(h.tx / 8) === tile.x && Math.floor(h.tz / 8) === tile.z) {
+        // Tiles still dissolving in don't cover yet; their fade sets the bit when it ends.
+        const fading = h.group?.children.some((c) => this.fading.has(c as THREE.Mesh))
+        if (h.state === 'ready' && !fading && Math.floor(h.tx / 8) === tile.x && Math.floor(h.tz / 8) === tile.z) {
           setBit(tile, (h.tz - tile.z * 8) * 8 + (h.tx - tile.x * 8), true)
         }
       }
@@ -906,6 +918,8 @@ export class MapEngine {
       const t0 = performance.now()
       const q = this.gpuTimer?.begin()
       this.renderer.render(this.scene, this.camera)
+      for (const g of this.justAdded) for (const c of g.children) c.frustumCulled = true
+      this.justAdded = []
       if (q) this.gpuTimer!.end(q)
       this.frameMsAcc += performance.now() - t0
       this.frames++
