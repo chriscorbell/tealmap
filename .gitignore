@@ -1,0 +1,6 @@
+/target
+/viewer/node_modules
+/viewer/dist
+/data
+*.tmp
+.DS_Store
