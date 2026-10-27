@@ -832,8 +832,7 @@ export class MapEngine {
     if (tile.level === 1) {
       for (const h of this.hires.values()) {
         // Tiles still dissolving in don't cover yet; their fade sets the bit when it ends.
-        const fading = h.group?.children.some((c) => this.fading.has(c as THREE.Mesh))
-        if (h.state === 'ready' && !fading && Math.floor(h.tx / 8) === tile.x && Math.floor(h.tz / 8) === tile.z) {
+        if (h.state === 'ready' && !this.fading.has(h) && Math.floor(h.tx / 8) === tile.x && Math.floor(h.tz / 8) === tile.z) {
           setBit(tile, (h.tz - tile.z * 8) * 8 + (h.tx - tile.x * 8), true)
         }
       }
