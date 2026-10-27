@@ -1,6 +1,6 @@
 # Pull requests check the Rust core and the viewer and build the image without pushing. A push to
-# main publishes ghcr.io/chriscorbell/tealmap tagged :latest and :<sha>; Watchtower on minicore
-# picks up :latest. Roll back by pinning a :<sha> tag in the compose file.
+# main publishes ghcr.io/chriscorbell/tealmap tagged :latest and :<sha>. Roll back a deployment by
+# pinning a :<sha> tag in its compose file.
 name: CI
 
 on:
