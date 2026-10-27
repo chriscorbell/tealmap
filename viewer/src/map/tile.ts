@@ -77,7 +77,7 @@ export function decodeTile(buf: ArrayBuffer): DecodedTile {
     for (let z = 0; z < W; z++) {
       for (let x = 0; x < W; x++) {
         const cnt = b[cLo + z * W + x] | (b[cHi + z * W + x] << 8)
-        let y = 511
+        let y = 1023
         for (let j = 0; j < cnt; j++, q++) {
           y -= b[sLo + q] | (b[sHi + q] << 8)
           quads[w++] = x | (z << 7) | (y << 14)

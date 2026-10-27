@@ -21,7 +21,7 @@
 //!     P × u32 colors                r, g, b, sky << 4 | block light
 //!     per group:
 //!       W × W column counts         u16 as a low-byte then a high-byte plane
-//!       n × y step                  u16 planes; y runs down from 511 per column
+//!       n × y step                  u16 planes; y runs down from 1023 per column
 //!       n × template index          u16 planes
 //!       n × color index             u16 planes
 //! ```
@@ -444,7 +444,13 @@ impl Mesher {
                         } else {
                             [255, 255, 255]
                         };
-                        self.emit(q, base, color, v.light[n], group_of(q.layer));
+                        // Leaf against leaf goes with the other leaf interiors.
+                        let group = if info.flags & F_LEAVES != 0 && ninfo.flags & F_LEAVES != 0 {
+                            LEAF_INTERIOR
+                        } else {
+                            group_of(q.layer)
+                        };
+                        self.emit(q, base, color, v.light[n], group);
                     }
                 }
             }
@@ -685,10 +691,10 @@ impl Mesher {
             }
             planes(&mut out, &counts);
             let mut steps = Vec::with_capacity(g.len());
-            let mut prev = (u8::MAX, u8::MAX, 511u16);
+            let mut prev = (u8::MAX, u8::MAX, 1023u16);
             for q in g {
                 if (q.z, q.x) != (prev.0, prev.1) {
-                    prev = (q.z, q.x, 511);
+                    prev = (q.z, q.x, 1023);
                 }
                 steps.push(prev.2 - q.y);
                 prev.2 = q.y;
@@ -769,7 +775,7 @@ mod tests {
             let mut q = 0;
             for z in 0..W {
                 for x in 0..W {
-                    let mut y = 511u16;
+                    let mut y = 1023u16;
                     for _ in 0..plane(cols, W * W, z * W + x) {
                         y -= plane(steps, n, q);
                         let tpl = templates[plane(tpls, n, q) as usize];
@@ -822,6 +828,8 @@ mod tests {
             ([10, 90, 20], 0.0, Layer::Translucent, 7, 3),
             ([10, 70, 20], 0.0, Layer::Cutout, 5, LEAF_INTERIOR),
             ([10, 71, 20], 0.0, Layer::Opaque, 3, 0),
+            // Worlds can be up to 1000 blocks tall.
+            ([3, 1001, 4], 0.0, Layer::Opaque, 3, 0),
         ];
         for (i, (base, dx, layer, tex, group)) in cases.into_iter().enumerate() {
             let q = quad(dx, layer, tex);

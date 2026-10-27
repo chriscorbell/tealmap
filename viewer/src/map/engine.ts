@@ -560,6 +560,7 @@ export class MapEngine {
       if (res.kind !== 'hires') return
       this.downloaded += res.bytes
       if (!res.tile) {
+        this.fading.delete(tile)
         if (tile.group) this.disposeGroup(tile.group)
         tile.group = null
         tile.gpuBytes = 0
