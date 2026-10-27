@@ -22,6 +22,8 @@ interface Manifest {
 export interface Stats {
   fps: number
   frameMs: number
+  /** GPU time per frame (p95), when the timer extension is available in bench mode. */
+  gpuMs: number | null
   calls: number
   triangles: number
   hires: number
@@ -150,6 +152,7 @@ export class MapEngine {
   private onStats: (s: Stats) => void
   private onCamera: (c: CameraState) => void
   private hashTimer = 0
+  private gpuTimer: GpuTimer | null = null
 
   private canvas: HTMLCanvasElement
 
@@ -186,6 +189,7 @@ export class MapEngine {
       this.scheduleHash()
     })
 
+    if (this.bench) this.gpuTimer = GpuTimer.create(this.renderer.getContext() as WebGL2RenderingContext)
     this.lowresGrid = makeGrid(128, REGION)
     this.resize()
     window.addEventListener('resize', this.resize)
@@ -462,12 +466,19 @@ export class MapEngine {
       }
     }
 
-    // Unload what's no longer wanted (with some slack to avoid thrashing).
+    // Unload what's no longer wanted (with some slack to avoid thrashing),
+    // and anything in a region the manifest no longer lists.
+    const regions = new Set(m.lowres.map(([x, z]) => `${x},${z}`))
     for (const [key, tile] of this.hires) {
-      if (!wantHi.has(key) && rectDist(tile.tx * TILE, tile.tz * TILE, TILE) > hiresR * 1.2 + 32) this.dropHires(key, tile)
+      const listed = regions.has(`${Math.floor(tile.tx / 8)},${Math.floor(tile.tz / 8)}`)
+      const near = wantHi.has(key) || rectDist(tile.tx * TILE, tile.tz * TILE, TILE) <= hiresR * 1.2 + 32
+      if (!listed || !near) this.dropHires(key, tile)
     }
     for (const [key, tile] of this.lowres) {
-      const keep = tile.level === 2 ? wantLow.has(key) : rectDist(tile.x * REGION, tile.z * REGION, REGION) <= l1R * 1.25
+      const keep =
+        tile.level === 2
+          ? wantLow.has(key)
+          : regions.has(`${tile.x},${tile.z}`) && rectDist(tile.x * REGION, tile.z * REGION, REGION) <= l1R * 1.25
       if (!keep) this.dropLowres(key, tile)
     }
 
@@ -860,7 +871,9 @@ export class MapEngine {
       for (const mesh of this.fading) ((mesh.material as THREE.ShaderMaterial).uniforms.uFogRange.value as THREE.Vector2).copy(fog)
       for (const lt of this.lowres.values()) lt.material?.uniforms.uFogRange.value.copy(fog)
       const t0 = performance.now()
+      const q = this.gpuTimer?.begin()
       this.renderer.render(this.scene, this.camera)
+      if (q) this.gpuTimer!.end(q)
       this.frameMsAcc += performance.now() - t0
       this.frames++
       this.dirty = false
@@ -888,6 +901,7 @@ export class MapEngine {
       this.onStats({
         fps: (this.frames * 1000) / (now - this.lastStats),
         frameMs: this.frames ? this.frameMsAcc / this.frames : 0,
+        gpuMs: this.gpuTimer?.p95() ?? null,
         calls: info.calls,
         triangles: info.triangles,
         hires: hi,
@@ -907,6 +921,55 @@ export class MapEngine {
     for (const [k, t] of this.lowres) this.dropLowres(k, t)
     this.hires.clear()
     this.lowres.clear()
+  }
+}
+
+/** GPU frame timing with EXT_disjoint_timer_query_webgl2; results arrive a few frames late. */
+class GpuTimer {
+  private pending: WebGLQuery[] = []
+  private samples: number[] = []
+
+  private gl: WebGL2RenderingContext
+  private ext: { TIME_ELAPSED_EXT: number; GPU_DISJOINT_EXT: number }
+
+  private constructor(gl: WebGL2RenderingContext, ext: { TIME_ELAPSED_EXT: number; GPU_DISJOINT_EXT: number }) {
+    this.gl = gl
+    this.ext = ext
+  }
+
+  static create(gl: WebGL2RenderingContext): GpuTimer | null {
+    const ext = gl.getExtension('EXT_disjoint_timer_query_webgl2')
+    return ext ? new GpuTimer(gl, ext) : null
+  }
+
+  begin(): WebGLQuery | null {
+    this.collect()
+    const q = this.gl.createQuery()
+    if (q) this.gl.beginQuery(this.ext.TIME_ELAPSED_EXT, q)
+    return q
+  }
+
+  end(q: WebGLQuery) {
+    this.gl.endQuery(this.ext.TIME_ELAPSED_EXT)
+    this.pending.push(q)
+  }
+
+  private collect() {
+    const gl = this.gl
+    while (this.pending.length && gl.getQueryParameter(this.pending[0], gl.QUERY_RESULT_AVAILABLE)) {
+      const q = this.pending.shift()!
+      if (!gl.getParameter(this.ext.GPU_DISJOINT_EXT)) this.samples.push(gl.getQueryParameter(q, gl.QUERY_RESULT) / 1e6)
+      gl.deleteQuery(q)
+    }
+  }
+
+  /** p95 of the samples since the last call, in ms. */
+  p95(): number | null {
+    if (!this.samples.length) return null
+    const s = this.samples.sort((a, b) => a - b)
+    const v = s[Math.min(s.length - 1, Math.floor(s.length * 0.95))]
+    this.samples = []
+    return v
   }
 }
 

@@ -118,6 +118,12 @@ export default function App() {
             <dd>{stats.fps.toFixed(0)}</dd>
             <dt>frame</dt>
             <dd>{stats.frameMs.toFixed(2)} ms</dd>
+            {stats.gpuMs !== null && (
+              <>
+                <dt>gpu p95</dt>
+                <dd>{stats.gpuMs.toFixed(2)} ms</dd>
+              </>
+            )}
             <dt>draw calls</dt>
             <dd>{stats.calls}</dd>
             <dt>triangles</dt>
