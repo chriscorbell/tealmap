@@ -1,0 +1,20 @@
+# Tiles, change-detection state and the downloaded client jar go here.
+data_dir = "/data"
+listen = "0.0.0.0:8200"
+# Render threads. Defaults to half the CPUs.
+threads = 3
+# How often to check region files for changes, in seconds.
+poll_seconds = 10
+
+[[maps]]
+id = "overworld"
+name = "Overworld"
+# The dimension directory that contains region/. In 26.x worlds that's
+# world/dimensions/minecraft/overworld; in 1.21 and older it's world.
+world = "/worlds/main/world/dimensions/minecraft/overworld"
+# Used to download the matching client jar from Mojang for block models and textures.
+version = "26.2"
+# Optional: mod jars to read biome definitions from (e.g. Terralith).
+# mods = "/worlds/main/mods"
+# Optional: unlit blocks below this y and below the ocean floor aren't rendered.
+# remove_caves_below_y = 55
