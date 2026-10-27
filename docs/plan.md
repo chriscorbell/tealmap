@@ -14,7 +14,7 @@ Agreed by the design council (Claude Opus 5.5, GPT-6.1 Sol) on 2026-10-26.
   - React handles the UI chrome only, never the render loop.
   - A worker does fetch and decode, then transfers buffers. Textures live in a `DataArrayTexture` with mipmaps, drawn by a custom ShaderMaterial.
   - Lucide icons, dark, restrained, light motion.
-- **CI/CD:** GitHub Actions runs cargo fmt/clippy/test and pnpm typecheck/build. A multi-stage Docker build pushes the image to GHCR. A Compose stack on minicore mounts the Crafty world dirs read-only, sets a `cpus:` limit, and listens on a new port behind Tailscale Serve, next to BlueMap.
+- **CI/CD:** GitHub Actions runs cargo fmt/clippy/test and pnpm typecheck/build. A multi-stage Docker build pushes the image to GHCR. The image runs with Docker Compose next to the Minecraft servers. It mounts their worlds read-only, sets a `cpus:` limit, and serves on its own port beside BlueMap.
 
 ## MVP scope
 - **Config:** TOML listing maps. Each has an id, a name, an explicit dimension dir (works for both the 26.x `dimensions/minecraft/<dim>` and the 1.21.1 `world/region` layouts), and a Minecraft version. Targets: VoidCraft (26.2) and Create (1.21.1) overworlds.
@@ -53,9 +53,9 @@ Agreed by the design council (Claude Opus 5.5, GPT-6.1 Sol) on 2026-10-26.
 1. Unit and fixture tests on real 26.2 and 1.21.1 region data: negative coords, negative section Y, single-entry palettes, tile boundaries, and padded palette longs.
 2. Determinism. The same input produces byte-identical tiles. After changing one chunk, only affected tiles change.
 3. Screenshots of both worlds at ground level and from overview, with no holes or seams at hires tile borders or at the hires/lowres handoff, plus BlueMap screenshots at similar cameras for comparison.
-4. A benchmark against BlueMap CLI (5.29 for VoidCraft, 5.7 for Create) on identical world snapshot copies on minicore with the same thread count. It records wall time, CPU-seconds, peak RSS, and output bytes, and reports fidelity differences honestly. The goal is faster and smaller, without claiming quality parity.
+4. A benchmark against BlueMap CLI (5.29 for VoidCraft, 5.7 for Create) on identical world snapshot copies on the deployment server with the same thread count. It records wall time, CPU-seconds, peak RSS, and output bytes, and reports fidelity differences honestly. The goal is faster and smaller, without claiming quality parity.
 5. Viewer: frame times from the stats overlay, gzipped bundle size, and bytes transferred for a standard view.
-6. CI green, image on GHCR, and the sidecar running on minicore at a new tailnet port.
+6. CI green, image on GHCR, and the sidecar running next to the servers on its own port.
 
 ## Build order
 
@@ -63,7 +63,7 @@ The order is set so that a cut at any point still leaves something usable. Deplo
 
 1. Render one world (VoidCraft): region/NBT reader, assets and models, hires mesher, lowres.
 2. Viewer.
-3. CI, image, and deploy to minicore.
+3. CI, image, and deploy next to the servers.
 4. Second world (Create, 1.21.1).
 5. Incremental updates and SSE.
 6. Benchmark against BlueMap CLI.
