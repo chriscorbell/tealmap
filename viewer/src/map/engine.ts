@@ -434,7 +434,8 @@ export class MapEngine {
     const t = this.controls.target
     const dist = this.camera.position.distanceTo(t)
     const hiresR = dist > 1400 ? 0 : this.hiresDistance
-    const l1R = THREE.MathUtils.clamp(dist * 3.2 + 1200, 1500, 7000)
+    // Level 2 covers the far field, so level 1 only needs to reach a little past the view center.
+    const l1R = THREE.MathUtils.clamp(dist * 2 + 500, 800, 4000)
 
     const rectDist = (x0: number, z0: number, size: number) => {
       const dx = Math.max(x0 - t.x, 0, t.x - (x0 + size))
