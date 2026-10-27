@@ -1,8 +1,8 @@
-//! Map rendering: change detection, region jobs, lowres layers and the map manifest.
+//! Map rendering: change detection, region jobs, the LOD pyramid and the map manifest.
 
 use crate::assets::{self, AssetFiles};
 use crate::config::MapConfig;
-use crate::lowres;
+use crate::lod;
 use crate::mesh::{Mesher, Settings, TILE, Volume};
 use crate::model::{Baker, Registry};
 use crate::region::{Region, list_regions};
@@ -32,8 +32,8 @@ pub struct MapCtx {
 #[derive(Default, Debug, Serialize, Clone)]
 pub struct Update {
     pub hires: Vec<[i32; 2]>,
-    pub lowres: Vec<[i32; 2]>,
-    pub lowres2: Vec<[i32; 2]>,
+    /// Changed LOD tiles as [level, x, z].
+    pub lod: Vec<[i32; 3]>,
     #[serde(skip)]
     pub stats: Stats,
 }
@@ -80,6 +80,7 @@ impl MapCtx {
         let settings = Settings {
             min_y: cfg.min_y,
             remove_caves_below_y: cfg.remove_caves_below_y,
+            lod: false,
         };
         Ok(MapCtx {
             cfg,
@@ -154,9 +155,7 @@ impl MapCtx {
         let results: Vec<RegionResult> = pool.install(|| {
             tiles
                 .par_iter()
-                .map(|(&(rx, rz), set)| {
-                    self.render_region(rx, rz, set, present.contains(&(rx, rz)))
-                })
+                .map(|(&(rx, rz), set)| self.render_region(rx, rz, set))
                 .collect::<Result<Vec<_>>>()
         })?;
 
@@ -181,21 +180,38 @@ impl MapCtx {
             }
         }
 
-        // 5. Lowres level 2 from the level 1 tiles that changed.
-        let changed_l1: BTreeSet<(i32, i32)> = results
+        // 5. LOD pyramid: rebuild the ancestors of every hires tile that changed,
+        // one level at a time, since each level reads the sources of the one below.
+        let mut dirty: BTreeSet<(i32, i32)> = results
             .iter()
-            .filter(|r| r.lowres_changed)
-            .map(|r| (r.rx, r.rz))
+            .flat_map(|r| {
+                r.sources
+                    .iter()
+                    .map(|&(x, z)| (x.div_euclid(2), z.div_euclid(2)))
+            })
             .collect();
-        let l2: BTreeSet<(i32, i32)> = changed_l1
-            .iter()
-            .map(|&(x, z)| (x.div_euclid(8), z.div_euclid(8)))
-            .collect();
-        let l2_written: Vec<(i32, i32)> = pool.install(|| {
-            l2.par_iter()
-                .map(|&(qx, qz)| lowres::build_level2(&self.out, qx, qz).map(|_| (qx, qz)))
-                .collect::<Result<Vec<_>>>()
-        })?;
+        let mut lod_changed = Vec::new();
+        for level in 1..=lod::LEVELS {
+            let built: Vec<(i32, i32, bool)> = pool.install(|| {
+                dirty
+                    .par_iter()
+                    .map_init(
+                        || (Volume::new(), Mesher::new()),
+                        |(volume, mesher), &(x, z)| self.build_lod(level, x, z, volume, mesher),
+                    )
+                    .collect::<Result<Vec<_>>>()
+            })?;
+            lod_changed.extend(
+                built
+                    .iter()
+                    .filter(|b| b.2)
+                    .map(|&(x, z, _)| [level as i32, x, z]),
+            );
+            dirty = built
+                .iter()
+                .map(|&(x, z, _)| (x.div_euclid(2), z.div_euclid(2)))
+                .collect();
+        }
 
         self.write_textures(full)?;
         self.write_manifest()?;
@@ -209,8 +225,7 @@ impl MapCtx {
             up.stats.bytes += r.bytes;
             up.stats.vertices += r.vertices;
         }
-        up.lowres = changed_l1.iter().map(|&(x, z)| [x, z]).collect();
-        up.lowres2 = l2_written.iter().map(|&(x, z)| [x, z]).collect();
+        up.lod = lod_changed;
         up.stats.regions = regions.len();
         up.stats.chunks = chunks;
         up.stats.seconds = t0.elapsed().as_secs_f64();
@@ -265,19 +280,9 @@ impl MapCtx {
         rx: i32,
         rz: i32,
         tiles: &BTreeSet<(i32, i32)>,
-        exists: bool,
     ) -> Result<RegionResult> {
-        let mut res = RegionResult {
-            rx,
-            rz,
-            ..Default::default()
-        };
+        let mut res = RegionResult::default();
         let mut src = ChunkSource::new(self);
-        let mut lowres = if exists {
-            lowres::Level1::load(&self.out, rx, rz)
-        } else {
-            lowres::Level1::empty()
-        };
         let mut volume = Volume::new();
         let mut mesher = Mesher::new();
         let mut gz = Vec::new();
@@ -312,13 +317,25 @@ impl MapCtx {
             } else {
                 None
             };
-            let lx = (tx.rem_euclid(8) * TILE) as usize;
-            let lz = (tz.rem_euclid(8) * TILE) as usize;
-            if filled {
-                lowres.put(lx, lz, &mesher.columns);
-            } else {
-                lowres.clear(lx, lz);
+            // The level 1 LOD source this tile leaves for its parent.
+            let source = filled
+                .then(|| {
+                    lod::hires_source(
+                        &volume,
+                        &self.reg,
+                        &self.settings,
+                        self.cfg.min_y,
+                        self.cfg.max_y,
+                    )
+                })
+                .flatten();
+            let source_path = lod::source_path(&self.out, 1, tx, tz);
+            match &source {
+                Some(g) => lod::save_source(&source_path, g, &self.reg)?,
+                None if source_path.exists() => std::fs::remove_file(&source_path)?,
+                None => {}
             }
+            res.sources.push((tx, tz));
             match encoded {
                 Some(data) => {
                     res.vertices += vertex_count(&data);
@@ -340,8 +357,53 @@ impl MapCtx {
                 }
             }
         }
-        res.lowres_changed = lowres.save(&self.out, rx, rz)?;
         Ok(res)
+    }
+
+    /// Builds LOD tile (x, z) at `level`, writing its mesh and its source for
+    /// the level above. Returns whether the mesh changed.
+    fn build_lod(
+        &self,
+        level: u32,
+        x: i32,
+        z: i32,
+        volume: &mut Volume,
+        mesher: &mut Mesher,
+    ) -> Result<(i32, i32, bool)> {
+        let (tile, parent) = lod::build_tile(
+            &self.out,
+            &self.reg,
+            level,
+            x,
+            z,
+            self.cfg.min_y,
+            self.cfg.max_y,
+            volume,
+            mesher,
+        )?;
+        let path = lod::tile_path(&self.out, level, x, z);
+        let changed = match tile {
+            Some(data) => {
+                let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(6));
+                gz.write_all(&data)?;
+                write_atomic(&path, &gz.finish()?)?;
+                true
+            }
+            None if path.exists() => {
+                std::fs::remove_file(&path)?;
+                true
+            }
+            None => false,
+        };
+        if level < lod::LEVELS {
+            let src = lod::source_path(&self.out, level + 1, x, z);
+            match parent {
+                Some(g) => lod::save_source(&src, &g, &self.reg)?,
+                None if src.exists() => std::fs::remove_file(&src)?,
+                None => {}
+            }
+        }
+        Ok((x, z, changed))
     }
 
     fn state_path(&self, rx: i32, rz: i32) -> PathBuf {
@@ -411,8 +473,6 @@ impl MapCtx {
     }
 
     fn write_manifest(&self) -> Result<()> {
-        let lowres = lowres::list(&self.out.join("lowres").join("1"));
-        let lowres2 = lowres::list(&self.out.join("lowres").join("2"));
         let manifest = serde_json::json!({
             "id": self.cfg.id,
             "name": self.cfg.display_name(),
@@ -422,9 +482,9 @@ impl MapCtx {
             "maxY": self.cfg.max_y,
             "tileSize": TILE,
             "textures": self.reg.baker.textures.count(),
-            "lowres": lowres,
-            "lowres2": lowres2,
             "hires": hires_masks(&self.out.join("hires")),
+            "lod": lod_tiles(&self.out.join("lod")),
+            "lodLevels": lod::LEVELS,
         });
         write_atomic(
             &self.out.join("map.json"),
@@ -473,6 +533,29 @@ fn hires_masks(dir: &Path) -> Vec<[i64; 4]> {
     out
 }
 
+/// LOD tiles on disk as [level, x, z], sorted.
+fn lod_tiles(dir: &Path) -> Vec<[i32; 3]> {
+    let mut out = Vec::new();
+    for level in 1..=lod::LEVELS {
+        for e in std::fs::read_dir(dir.join(level.to_string()))
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            let name = e.file_name();
+            if let Some((x, z)) = name
+                .to_str()
+                .and_then(|n| n.strip_suffix(".tmh"))
+                .and_then(parse_pair)
+            {
+                out.push([level as i32, x, z]);
+            }
+        }
+    }
+    out.sort_unstable();
+    out
+}
+
 fn parse_pair(s: &str) -> Option<(i32, i32)> {
     let (a, b) = s.split_once('_')?;
     Some((a.parse().ok()?, b.parse().ok()?))
@@ -488,14 +571,13 @@ struct RegionScan {
 
 #[derive(Default)]
 struct RegionResult {
-    rx: i32,
-    rz: i32,
     tiles: Vec<(i32, i32)>,
     empty: usize,
     failed: BTreeSet<(i32, i32)>,
+    /// Hires tiles whose LOD source was rewritten or removed.
+    sources: Vec<(i32, i32)>,
     bytes: u64,
     vertices: u64,
-    lowres_changed: bool,
 }
 
 /// Tiles whose volume (tile plus one-block halo) includes chunk (cx, cz).
@@ -641,7 +723,7 @@ mod tests {
             }
         }
         let mut out = BTreeMap::new();
-        for sub in ["hires", "lowres"] {
+        for sub in ["hires", "lod"] {
             if dir.join(sub).exists() {
                 walk(dir, &dir.join(sub), &mut out);
             }

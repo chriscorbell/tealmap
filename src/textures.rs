@@ -21,8 +21,6 @@ pub enum Alpha {
 
 pub struct TexInfo {
     pub alpha: Alpha,
-    /// Alpha-weighted average color.
-    pub avg: [u8; 3],
 }
 
 pub struct Textures {
@@ -99,9 +97,7 @@ impl Textures {
 
 fn analyze(rgba: &[u8]) -> TexInfo {
     let mut alpha = Alpha::Opaque;
-    let (mut r, mut g, mut b, mut w) = (0u64, 0u64, 0u64, 0u64);
     for px in rgba.chunks_exact(4) {
-        let a = px[3] as u64;
         match px[3] {
             255 => {}
             0 => {
@@ -111,17 +107,8 @@ fn analyze(rgba: &[u8]) -> TexInfo {
             }
             _ => alpha = Alpha::Translucent,
         }
-        r += px[0] as u64 * a;
-        g += px[1] as u64 * a;
-        b += px[2] as u64 * a;
-        w += a;
     }
-    let avg = if w == 0 {
-        [0, 0, 0]
-    } else {
-        [(r / w) as u8, (g / w) as u8, (b / w) as u8]
-    };
-    TexInfo { alpha, avg }
+    TexInfo { alpha }
 }
 
 /// Decodes a PNG to 16×16 RGBA. Animated strips use their first frame;

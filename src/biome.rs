@@ -18,7 +18,8 @@ pub struct Biomes {
     foliage_map: Option<Vec<[u8; 3]>>,
     dry_foliage_map: Option<Vec<[u8; 3]>>,
     ids: DashMap<String, u16>,
-    colors: boxcar::Vec<BiomeColors>,
+    /// Name and colors per id, pushed together so concurrent inserts stay aligned.
+    entries: boxcar::Vec<(String, BiomeColors)>,
     json: std::collections::HashMap<String, Value>,
 }
 
@@ -75,7 +76,7 @@ impl Biomes {
             foliage_map: map("foliage"),
             dry_foliage_map: map("dry_foliage"),
             ids: DashMap::new(),
-            colors: boxcar::Vec::new(),
+            entries: boxcar::Vec::new(),
             json,
         }
     }
@@ -87,12 +88,16 @@ impl Biomes {
         }
         *self.ids.entry(name.to_owned()).or_insert_with(|| {
             let c = self.compute(name);
-            self.colors.push(c) as u16
+            self.entries.push((name.to_owned(), c)) as u16
         })
     }
 
+    pub fn name(&self, id: u16) -> &str {
+        &self.entries[id as usize].0
+    }
+
     pub fn colors(&self, id: u16) -> BiomeColors {
-        self.colors[id as usize]
+        self.entries[id as usize].1
     }
 
     fn compute(&self, name: &str) -> BiomeColors {

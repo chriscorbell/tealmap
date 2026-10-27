@@ -21,6 +21,8 @@ export interface DecodedTile {
   templateRows: number
   colors: Uint8Array
   colorRows: number
+  /** Top of each of the 64×64 columns, in the tile's own units (blocks or voxels), NaN if empty. */
+  tops: Float32Array
 }
 
 const rows = (texels: number, width: number) => Math.max(1, Math.ceil(texels / width))
@@ -62,6 +64,7 @@ export function decodeTile(buf: ArrayBuffer): DecodedTile {
   const quadRows = rows(total, QUAD_ROW)
   const quads = new Uint32Array(QUAD_ROW * quadRows * 2)
   let w = 0
+  const tops = new Float32Array(64 * 64).fill(Number.NaN)
   for (const n of counts) {
     const cLo = o
     const cHi = o + W * W
@@ -81,10 +84,15 @@ export function decodeTile(buf: ArrayBuffer): DecodedTile {
         for (let j = 0; j < cnt; j++, q++) {
           y -= b[sLo + q] | (b[sHi + q] << 8)
           quads[w++] = x | (z << 7) | (y << 14)
+          if (x >= 1 && x <= 64 && z >= 1 && z <= 64) {
+            const c = (z - 1) * 64 + (x - 1)
+            const top = origin[1] + y + 1
+            if (!(tops[c] >= top)) tops[c] = top
+          }
           quads[w++] = (b[tLo + q] | (b[tHi + q] << 8) | ((b[pLo + q] | (b[pHi + q] << 8)) << 16)) >>> 0
         }
       }
     }
   }
-  return { origin, minQ, maxQ, counts, quads, quadRows, templates, templateRows, colors, colorRows }
+  return { origin, minQ, maxQ, counts, quads, quadRows, templates, templateRows, colors, colorRows, tops }
 }
