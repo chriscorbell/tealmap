@@ -19,7 +19,7 @@ export default function App() {
   const [bench] = useState(() => new URLSearchParams(location.search).has('bench'))
   const [panel, setPanel] = useState<'stats' | 'settings' | null>(bench ? 'stats' : null)
   const [menu, setMenu] = useState(false)
-  const [distance, setDistance] = useState(320)
+  const [distance, setDistance] = useState(192)
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {

@@ -138,7 +138,7 @@ export class MapEngine {
   private fading = new Set<THREE.Mesh>()
   private fadeStart = new Map<THREE.Mesh, number>()
 
-  hiresDistance = 320
+  hiresDistance = 192
   private pendingUpdate = false
   private autoView = true
   private dirty = true
@@ -956,9 +956,16 @@ class GpuTimer {
 
   private collect() {
     const gl = this.gl
+    // Reading the disjoint flag clears it, so read it once: when set, every
+    // pending measurement is suspect and gets dropped.
+    if (gl.getParameter(this.ext.GPU_DISJOINT_EXT)) {
+      this.pending.forEach((q) => gl.deleteQuery(q))
+      this.pending = []
+      return
+    }
     while (this.pending.length && gl.getQueryParameter(this.pending[0], gl.QUERY_RESULT_AVAILABLE)) {
       const q = this.pending.shift()!
-      if (!gl.getParameter(this.ext.GPU_DISJOINT_EXT)) this.samples.push(gl.getQueryParameter(q, gl.QUERY_RESULT) / 1e6)
+      this.samples.push(gl.getQueryParameter(q, gl.QUERY_RESULT) / 1e6)
       gl.deleteQuery(q)
     }
   }
