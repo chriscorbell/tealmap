@@ -71,14 +71,18 @@ impl Biomes {
                 .get(&format!("assets/minecraft/textures/colormap/{n}.png"))
                 .and_then(decode_colormap)
         };
-        Biomes {
+        let biomes = Biomes {
             grass_map: map("grass"),
             foliage_map: map("foliage"),
             dry_foliage_map: map("dry_foliage"),
             ids: DashMap::new(),
             entries: boxcar::Vec::new(),
             json,
-        }
+        };
+        // Id 0 is the fallback for sections and columns with no biome, so it
+        // has to be the same biome in every run.
+        biomes.id("minecraft:plains");
+        biomes
     }
 
     /// Returns a dense id for a biome name, computing its colors on first use.

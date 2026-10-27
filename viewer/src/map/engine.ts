@@ -60,7 +60,9 @@ interface Tile {
   level: number
   x: number
   z: number
-  state: 'loading' | 'ready' | 'empty'
+  /** 'failed' is a load error with nothing to show; it's retried at `retryAt`. */
+  state: 'loading' | 'ready' | 'empty' | 'failed'
+  retryAt: number
   req: number
   group: THREE.Group | null
   gpuBytes: number
@@ -125,8 +127,14 @@ export class MapEngine {
 
   private map: MapInfo | null = null
   private manifest: Manifest | null = null
-  /** LOD tiles by key, rebuilt from the manifest. */
+  /** LOD tiles that have a mesh, by key. */
   private lodSet = new Set<string>()
+  /**
+   * Every LOD node over some hires tile, by key, mesh or not. A sparse area
+   * can downsample to nothing at a coarse level while its hires tiles still
+   * have geometry; those nodes have no mesh but still refine.
+   */
+  private nodes = new Set<string>()
   private masks = new Map<string, [number, number]>()
   private generation = 0
   private blockTex: THREE.DataArrayTexture | null = null
@@ -254,6 +262,15 @@ export class MapEngine {
     this.manifest = m
     this.lodSet = new Set((m.lod ?? []).map(([l, x, z]) => key(l, x, z)))
     this.masks = new Map((m.hires ?? []).map(([rx, rz, lo, hi]) => [`${rx},${rz}`, [lo, hi]]))
+    this.nodes = new Set(this.lodSet)
+    for (const [rx, rz, lo, hi] of m.hires ?? []) {
+      for (let bit = 0; bit < 64; bit++) {
+        if (!(((bit < 32 ? lo : hi) >>> (bit & 31)) & 1)) continue
+        const tx = rx * 8 + (bit & 7)
+        const tz = rz * 8 + (bit >> 3)
+        for (let l = 1; l <= m.lodLevels; l++) this.nodes.add(key(l, tx >> l, tz >> l))
+      }
+    }
     this.lastPlan = 0
   }
 
@@ -433,7 +450,7 @@ export class MapEngine {
   // ---------------------------------------------------------------- planning
 
   private exists(level: number, x: number, z: number): boolean {
-    if (level > 0) return this.lodSet.has(key(level, x, z))
+    if (level > 0) return this.nodes.has(key(level, x, z))
     const rx = Math.floor(x / 8)
     const rz = Math.floor(z / 8)
     const mask = this.masks.get(`${rx},${rz}`)
@@ -467,6 +484,15 @@ export class MapEngine {
     const draw = new Set<Tile>()
     const want: { level: number; x: number; z: number; d: number }[] = []
 
+    const meshed = (level: number, x: number, z: number) => level === 0 || this.lodSet.has(key(level, x, z))
+    const needs = (t: Tile | undefined) => !t || t.stale || (t.state === 'failed' && now >= t.retryAt)
+    // Settled: loaded at least once (an old mesh counts while it refreshes),
+    // confirmed empty, or a node with no mesh to load.
+    const settled = (l: number, x: number, z: number) => {
+      if (!meshed(l, x, z)) return true
+      const t = this.tiles.get(key(l, x, z))
+      return !!t && (!!t.group || t.state === 'empty')
+    }
     const visit = (level: number, x: number, z: number) => {
       const size = TILE << level
       box.min.set(x * size, m.minY, z * size)
@@ -474,27 +500,29 @@ export class MapEngine {
       if (!frustum.intersectsBox(box)) return
       const d = Math.max(box.distanceToPoint(cam), 1)
       const tile = this.tiles.get(key(level, x, z))
-      if (!tile || tile.stale) want.push({ level, x, z, d })
+      if (meshed(level, x, z) && needs(tile)) want.push({ level, x, z, d })
       if (tile) tile.lastWanted = now
       const kids = level > 0 && ((1 << level) * k) / d > this.detail ? this.children(level, x, z) : []
       if (kids.length) {
-        const settled = kids.every(([l, kx, kz]) => {
-          const t = this.tiles.get(key(l, kx, kz))
-          return t && t.state !== 'loading'
-        })
-        if (settled) {
+        if (kids.every(([l, kx, kz]) => settled(l, kx, kz))) {
           for (const [l, kx, kz] of kids) visit(l, kx, kz)
           return
         }
         for (const [l, kx, kz] of kids) {
           const t = this.tiles.get(key(l, kx, kz))
           if (t) t.lastWanted = now
-          else want.push({ level: l, x: kx, z: kz, d })
+          if (meshed(l, kx, kz) && needs(t)) want.push({ level: l, x: kx, z: kz, d })
         }
       }
-      if (tile?.state === 'ready') draw.add(tile)
+      // Anything with a mesh draws, including an old one while it refreshes.
+      if (tile?.group) draw.add(tile)
     }
-    for (const [l, x, z] of m.lod) if (l === m.lodLevels) visit(l, x, z)
+    for (const n of this.nodes) {
+      const [l, rest] = n.split(':')
+      if (Number(l) !== m.lodLevels) continue
+      const [x, z] = rest.split(',').map(Number)
+      visit(m.lodLevels, x, z)
+    }
 
     // Swap what's drawn, dissolving tiles in and out.
     for (const t of this.tiles.values()) {
@@ -541,6 +569,7 @@ export class MapEngine {
       x,
       z,
       state: 'loading',
+      retryAt: 0,
       req: id,
       group: null,
       gpuBytes: 0,
@@ -553,7 +582,6 @@ export class MapEngine {
     tile.req = id
     tile.stale = false
     if (!existing) this.tiles.set(k2, tile)
-    const wasReady = tile.state === 'ready'
     tile.state = 'loading'
     done.then((res) => {
       if (gen !== this.generation || this.tiles.get(k2) !== tile || tile.req !== id) return
@@ -561,7 +589,13 @@ export class MapEngine {
       this.lastPlan = 0
       if (res.kind === 'error') {
         console.warn(`tile ${k2}: ${res.message}`)
-        tile.state = wasReady ? 'ready' : 'empty'
+        // Keep an old mesh; with nothing to show, retry later instead of
+        // treating the tile as empty and leaving a hole.
+        if (tile.group) tile.state = 'ready'
+        else {
+          tile.state = 'failed'
+          tile.retryAt = performance.now() + 5000
+        }
         return
       }
       if (res.kind !== 'tile') return

@@ -17,7 +17,7 @@ use std::sync::Mutex;
 use std::time::{Instant, UNIX_EPOCH};
 
 /// Bump when output for the same input changes; forces a full re-render.
-pub const RENDER_VERSION: u32 = 2;
+pub const RENDER_VERSION: u32 = 3;
 const STATE_MAGIC: &[u8; 4] = b"TMS1";
 
 pub struct MapCtx {
@@ -180,14 +180,15 @@ impl MapCtx {
             }
         }
 
-        // 5. LOD pyramid: rebuild the ancestors of every hires tile that changed,
-        // one level at a time, since each level reads the sources of the one below.
+        // 5. LOD pyramid: rebuild every tile whose sources changed (its own, or
+        // a neighbor's along its border), one level at a time, since each level
+        // reads the sources of the one below.
         let mut dirty: BTreeSet<(i32, i32)> = results
             .iter()
             .flat_map(|r| {
                 r.sources
                     .iter()
-                    .map(|&(x, z)| (x.div_euclid(2), z.div_euclid(2)))
+                    .flat_map(|&(x, z)| lod::tiles_using_source(x, z))
             })
             .collect();
         let mut lod_changed = Vec::new();
@@ -209,7 +210,7 @@ impl MapCtx {
             );
             dirty = built
                 .iter()
-                .map(|&(x, z, _)| (x.div_euclid(2), z.div_euclid(2)))
+                .flat_map(|&(x, z, _)| lod::tiles_using_source(x, z))
                 .collect();
         }
 

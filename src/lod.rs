@@ -64,13 +64,16 @@ impl Grid {
         (lo <= hi).then_some((lo, hi))
     }
 
-    /// Copies a source of half this grid's width into one quadrant.
-    fn place(&mut self, src: &Grid, qx: usize, qz: usize) {
+    /// Copies `src` with its corner at column (ox, oz), clipped to this grid.
+    fn place_at(&mut self, src: &Grid, ox: isize, oz: isize) {
         debug_assert_eq!(src.h, self.h);
-        let half = self.w / 2;
         for z in 0..src.w {
             for x in 0..src.w {
-                let to = (qz * half + z) * self.w + qx * half + x;
+                let (tx, tz) = (ox + x as isize, oz + z as isize);
+                if tx < 0 || tz < 0 || tx >= self.w as isize || tz >= self.w as isize {
+                    continue;
+                }
+                let to = tz as usize * self.w + tx as usize;
                 let from = z * src.w + x;
                 self.states[to * self.h..(to + 1) * self.h]
                     .copy_from_slice(&src.states[from * src.h..(from + 1) * src.h]);
@@ -80,9 +83,40 @@ impl Grid {
     }
 }
 
+/// The world's vertical range padded to a multiple of the coarsest voxel, so
+/// every level divides it exactly.
+pub fn bounds(min_y: i32, max_y: i32) -> (i32, i32) {
+    let step = 1 << LEVELS;
+    (
+        min_y.div_euclid(step) * step,
+        (max_y + step - 1).div_euclid(step) * step,
+    )
+}
+
+/// The level-k tiles whose mesh reads level-k source (cx, cz): its parent,
+/// plus the neighbors whose one-voxel border ring reaches into it.
+pub fn tiles_using_source(cx: i32, cz: i32) -> impl Iterator<Item = (i32, i32)> {
+    let pair = |c: i32| {
+        let core = c.div_euclid(2);
+        [
+            core,
+            if c.rem_euclid(2) == 0 {
+                core - 1
+            } else {
+                core + 1
+            },
+        ]
+    };
+    let zs = pair(cz);
+    pair(cx)
+        .into_iter()
+        .flat_map(move |x| zs.map(move |z| (x, z)))
+}
+
 /// The block-level grid of a hires tile's own 64×64 columns, with removed
 /// caves turned to air. Blocks outside the volume's range are air.
 pub fn from_volume(v: &Volume, reg: &Registry, s: &Settings, min_y: i32, max_y: i32) -> Grid {
+    let (min_y, max_y) = bounds(min_y, max_y);
     let h = (max_y - min_y) as usize;
     let mut g = Grid::empty(N, h, min_y);
     for z in 0..N {
@@ -389,33 +423,51 @@ pub fn build_tile(
     mesher: &mut crate::mesh::Mesher,
 ) -> Result<(Option<Vec<u8>>, Option<Grid>)> {
     let s = 1i32 << level;
+    let (min_y, max_y) = bounds(min_y, max_y);
     let h = ((max_y - min_y) / s) as usize;
-    let mut grid = Grid::empty(N, h, min_y / s);
-    let mut any = false;
+    let half = (N / 2) as isize;
+    let load = |cx: i32, cz: i32| -> Result<Option<Grid>> {
+        let src = load_source(&source_path(out, level, cx, cz), reg)?;
+        if src.as_ref().is_some_and(|g| g.w != N / 2 || g.h != h) {
+            bail!("LOD source for level {level} has the wrong size");
+        }
+        Ok(src)
+    };
+    // The tile's own four quadrants.
+    let mut core = Grid::empty(N, h, min_y / s);
     for (qx, qz) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
-        if let Some(src) = load_source(&source_path(out, level, x * 2 + qx, z * 2 + qz), reg)? {
-            if src.w != N / 2 || src.h != h {
-                bail!("LOD source for level {level} has the wrong size");
-            }
-            grid.place(&src, qx as usize, qz as usize);
-            any = true;
+        if let Some(src) = load(x * 2 + qx, z * 2 + qz)? {
+            core.place_at(&src, qx as isize * half, qz as isize * half);
         }
     }
-    if !any || grid.is_empty() {
+    if core.is_empty() {
         return Ok((None, None));
+    }
+    // A one-voxel ring from the neighbors, so border faces cull against what's
+    // really there. Neighbors drawn at another level are covered by skirts.
+    let mut grid = Grid::empty(N + 2, h, min_y / s);
+    grid.place_at(&core, 1, 1);
+    for i in -1..=2 {
+        for j in -1..=2 {
+            if (0..=1).contains(&i) && (0..=1).contains(&j) {
+                continue;
+            }
+            if let Some(src) = load(x * 2 + i, z * 2 + j)? {
+                grid.place_at(&src, 1 + i as isize * half, 1 + j as isize * half);
+            }
+        }
     }
     let settings = Settings {
         min_y: min_y / s,
         remove_caves_below_y: i32::MIN,
         lod: true,
     };
-    let skirt = reg.id_for_key("tealmap:skirt");
-    let tile = if volume.fill_grid(&grid, x * N as i32, z * N as i32, skirt, reg, s) {
+    let tile = if volume.fill_grid(&grid, x * N as i32, z * N as i32, reg, s) {
         mesher.mesh(volume, reg, &settings)
     } else {
         None
     };
-    let parent = (level < LEVELS).then(|| downsample(&grid, reg, MIN_SOLID[level as usize + 1]));
+    let parent = (level < LEVELS).then(|| downsample(&core, reg, MIN_SOLID[level as usize + 1]));
     Ok((tile, parent.filter(|g| !g.is_empty())))
 }
 
@@ -457,6 +509,23 @@ mod tests {
         assert_eq!(d.states, vec![stone, grass]);
         // With a higher bar, the top voxel (6 of 8) still stays; 7 of 8 drops it.
         assert_eq!(downsample(&g, &reg, 7).states, vec![stone, AIR]);
+    }
+
+    #[test]
+    fn bounds_align_to_the_coarsest_voxel() {
+        assert_eq!(bounds(-64, 320), (-64, 320));
+        assert_eq!(bounds(-64, 319), (-64, 320));
+        assert_eq!(bounds(-60, 300), (-64, 304));
+    }
+
+    #[test]
+    fn sources_feed_their_parent_and_bordering_tiles() {
+        let mut t: Vec<_> = tiles_using_source(0, 0).collect();
+        t.sort();
+        assert_eq!(t, vec![(-1, -1), (-1, 0), (0, -1), (0, 0)]);
+        let mut t: Vec<_> = tiles_using_source(3, -1).collect();
+        t.sort();
+        assert_eq!(t, vec![(1, -1), (1, 0), (2, -1), (2, 0)]);
     }
 
     #[test]

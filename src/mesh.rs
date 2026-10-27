@@ -201,15 +201,18 @@ impl Volume {
     /// Fills the volume from a LOD voxel grid of 64×64 columns whose min corner
     /// is (x0, z0) in voxel units. The halo is a solid stand-in (`skirt`) since
     /// LOD tiles don't read their neighbors; skirts close the borders instead.
+    /// Fills the volume from a LOD voxel grid of 66×66 columns: the tile's
+    /// 64×64 plus a one-column ring from its neighbors. (x0, z0) is the tile's
+    /// min corner in voxel units.
     pub fn fill_grid(
         &mut self,
         g: &crate::lod::Grid,
         x0: i32,
         z0: i32,
-        skirt: u16,
         reg: &Registry,
         scale: i32,
     ) -> bool {
+        debug_assert_eq!(g.w, W);
         let Some((ylo, yhi)) = g.y_range() else {
             return false;
         };
@@ -219,7 +222,7 @@ impl Volume {
         self.h = yhi - ylo + 3;
         let n = W * W * self.h;
         self.blocks.clear();
-        self.blocks.resize(n, skirt);
+        self.blocks.resize(n, 0);
         self.light.clear();
         self.light.resize(n, 0xf0);
         self.biomes.clear();
@@ -228,32 +231,24 @@ impl Volume {
         self.floor.resize(W * W, i32::MIN);
         for vz in 0..W {
             for vx in 0..W {
-                let inside = (1..=TILE as usize).contains(&vx) && (1..=TILE as usize).contains(&vz);
-                let col = inside.then(|| (vz - 1) * g.w + (vx - 1));
+                let c = vz * W + vx;
                 // Sky light fades through water, a level per block, so seabeds
                 // darken with depth the way they do at hires.
                 let mut sky = 15i32;
                 for vy in (0..self.h).rev() {
                     let i = self.idx(vx, vy, vz);
-                    match col {
-                        Some(c) => {
-                            let gy = (vy + ylo) as isize - 1;
-                            let id = if gy < 0 || gy as usize >= g.h {
-                                0
-                            } else {
-                                g.states[c * g.h + gy as usize]
-                            };
-                            self.blocks[i] = id;
-                            self.biomes[i] = g.biomes[c];
-                            if id != 0 && reg.get(id).has_water() {
-                                sky = (sky - scale).max(0);
-                            }
-                            self.light[i] = (sky as u8) << 4;
-                        }
-                        // Above the halo's stand-in, leave air so tops stay open.
-                        None if vy + 1 == self.h => self.blocks[i] = 0,
-                        None => {}
+                    let gy = (vy + ylo) as isize - 1;
+                    let id = if gy < 0 || gy as usize >= g.h {
+                        0
+                    } else {
+                        g.states[c * g.h + gy as usize]
+                    };
+                    self.blocks[i] = id;
+                    self.biomes[i] = g.biomes[c];
+                    if id != 0 && reg.get(id).has_water() {
+                        sky = (sky - scale).max(0);
                     }
+                    self.light[i] = (sky as u8) << 4;
                 }
             }
         }

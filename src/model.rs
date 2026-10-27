@@ -886,8 +886,7 @@ impl Registry {
     pub fn unknown(&self) -> Vec<(String, usize)> {
         let mut m: HashMap<&str, usize> = HashMap::new();
         for (_, b) in self.blocks.iter() {
-            // tealmap's own stand-in blocks aren't world content.
-            if b.flags & F_UNKNOWN != 0 && !b.name.starts_with("tealmap:") {
+            if b.flags & F_UNKNOWN != 0 {
                 *m.entry(b.name.as_str()).or_default() += 1;
             }
         }
