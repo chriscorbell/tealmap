@@ -329,10 +329,14 @@ impl Baker {
         let Some(m) = self.resolve(id) else { return };
         let Some(holder) = &m.elements else { return };
         for el in holder.elements.as_ref().unwrap() {
-            for (face_name, face) in &el.faces {
-                let Some(dir) = parse_dir(face_name) else {
-                    continue;
-                };
+            // Fixed face order keeps output byte-identical between runs.
+            let mut faces: Vec<(u8, &RawFace)> = el
+                .faces
+                .iter()
+                .filter_map(|(name, f)| parse_dir(name).map(|d| (d, f)))
+                .collect();
+            faces.sort_by_key(|&(d, _)| d);
+            for (dir, face) in faces {
                 if let Some(q) = self.bake_face(&m.textures, el, dir, face, rx, ry, uvlock) {
                     out.push(q);
                 }

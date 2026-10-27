@@ -71,7 +71,10 @@ impl MapCtx {
                 }
             }
         }
-        let baker = Baker::new(files);
+        Self::with_baker(cfg, data_dir, Baker::new(files))
+    }
+
+    pub fn with_baker(cfg: MapConfig, data_dir: &Path, baker: Baker) -> Result<Self> {
         let out = data_dir.join("maps").join(&cfg.id);
         std::fs::create_dir_all(&out)?;
         let settings = Settings {
@@ -535,6 +538,172 @@ impl<'a> ChunkSource<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::config::MapConfig;
+    use crate::model::Registry;
+    use crate::world::decode_chunk;
+
+    fn fixture(version: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(version)
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("tealmap-test-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// A registry with no assets: every block bakes to a fallback cube.
+    fn bare_registry() -> Registry {
+        Registry::new(Baker::new(AssetFiles::new()))
+    }
+
+    fn map_config(world: &Path) -> MapConfig {
+        MapConfig {
+            id: "test".into(),
+            name: None,
+            world: world.to_owned(),
+            version: "test".into(),
+            client_jar: None,
+            mods: None,
+            min_y: -64,
+            max_y: 320,
+            remove_caves_below_y: 55,
+        }
+    }
+
+    /// Every file under the map directory except state, keyed by relative path.
+    fn snapshot(dir: &Path) -> BTreeMap<String, Vec<u8>> {
+        fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<String, Vec<u8>>) {
+            for e in std::fs::read_dir(dir).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(root, &p, out);
+                } else {
+                    let rel = p.strip_prefix(root).unwrap().to_string_lossy().into_owned();
+                    out.insert(rel, std::fs::read(&p).unwrap());
+                }
+            }
+        }
+        let mut out = BTreeMap::new();
+        for sub in ["hires", "lowres"] {
+            if dir.join(sub).exists() {
+                walk(dir, &dir.join(sub), &mut out);
+            }
+        }
+        out
+    }
+
+    fn copy_dir(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for e in std::fs::read_dir(from).unwrap().flatten() {
+            std::fs::copy(e.path(), to.join(e.file_name())).unwrap();
+        }
+    }
+
+    /// Points chunk `a`'s header entry at chunk `b`'s data, like a save that
+    /// changed chunk `a`.
+    fn swap_chunk(region: &Path, a: usize, b: usize) {
+        let mut d = std::fs::read(region).unwrap();
+        let (src, ts) = (d[b * 4..b * 4 + 4].to_vec(), 4096 + a * 4);
+        d[a * 4..a * 4 + 4].copy_from_slice(&src);
+        d[ts..ts + 4].copy_from_slice(&u32::MAX.to_be_bytes());
+        std::fs::write(region, d).unwrap();
+    }
+
+    #[test]
+    fn fixture_chunks_decode() {
+        for (version, min_full) in [("26.2", 64), ("1.21.1", 16)] {
+            let reg = bare_registry();
+            let bedrock = reg.id("minecraft:bedrock", &mut []);
+            let (mut full, mut single, mut min_section) = (0, 0, i32::MAX);
+            let dir = fixture(version).join("region");
+            for (rx, rz, path) in list_regions(&dir).unwrap() {
+                let region = Region::open(&path, rx, rz).unwrap();
+                let (mut raw, mut buf) = (Vec::new(), Vec::new());
+                for i in 0..1024 {
+                    if !region
+                        .read_chunk(i % 32, i / 32, &mut raw, &mut buf)
+                        .unwrap()
+                    {
+                        continue;
+                    }
+                    let Some(c) = decode_chunk(&buf, &reg, -64).unwrap() else {
+                        continue;
+                    };
+                    full += 1;
+                    min_section = min_section.min(c.sections[0].y);
+                    single += c.sections.iter().filter(|s| s.blocks.is_none()).count();
+                    // The bottom layer of the overworld is bedrock in every column.
+                    let s = c.sections.iter().find(|s| s.y == -4).unwrap();
+                    assert!(
+                        (0..256).all(|i| s.block(i) == bedrock),
+                        "{version}: y=-64 isn't all bedrock"
+                    );
+                }
+            }
+            assert!(full >= min_full, "{version}: only {full} full chunks");
+            assert_eq!(min_section, -4, "{version}");
+            assert!(single > 0, "{version}: no single-state sections");
+        }
+    }
+
+    #[test]
+    fn renders_are_deterministic_and_incremental_matches_full() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let base = temp_dir("render");
+        let world = base.join("world");
+        copy_dir(&fixture("26.2").join("region"), &world.join("region"));
+
+        let render = |data: &str, full: bool| {
+            let ctx = MapCtx::with_baker(
+                map_config(&world),
+                &base.join(data),
+                Baker::new(AssetFiles::new()),
+            )
+            .unwrap();
+            ctx.render(&pool, full).unwrap();
+            snapshot(&base.join(data).join("maps/test"))
+        };
+
+        let first = render("a", true);
+        assert!(
+            first.keys().any(|k| k.starts_with("hires/-1_-1/")),
+            "no tiles at negative coords"
+        );
+        assert!(first.keys().any(|k| k.starts_with("hires/0_0/")));
+        assert_eq!(first, render("b", true), "two full renders differ");
+
+        // Chunk (1,1) of region 0,0 is inside tile (0,0); chunk (0,0) sits on a
+        // tile corner and also touches tiles in three other regions.
+        let region = world.join("region/r.0.0.mca");
+        swap_chunk(&region, 32 + 1, 2 * 32 + 2);
+        swap_chunk(&region, 0, 3 * 32 + 3);
+        let ctx = MapCtx::with_baker(
+            map_config(&world),
+            &base.join("a"),
+            Baker::new(AssetFiles::new()),
+        )
+        .unwrap();
+        let up = ctx.render(&pool, false).unwrap();
+        assert_eq!(up.stats.chunks, 2);
+        assert!(up.hires.len() <= 4, "re-rendered {} tiles", up.hires.len());
+        let incremental = snapshot(&base.join("a/maps/test"));
+        assert_ne!(first, incremental);
+        assert_eq!(
+            incremental,
+            render("c", true),
+            "incremental render differs from a full one"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn halo_tiles() {
