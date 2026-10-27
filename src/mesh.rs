@@ -737,3 +737,111 @@ fn lerp3(a: [u8; 3], b: [u8; 3], t: f32) -> [u8; 3] {
     let f = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t) as u8;
     [f(a[0], b[0]), f(a[1], b[1]), f(a[2], b[2])]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Decodes a TMH2 tile back to (group, x, y, z, template, color) per quad.
+    fn decode(t: &[u8]) -> Vec<(usize, u8, u16, u8, Template, u32)> {
+        let u16_at = |o: usize| u16::from_le_bytes([t[o], t[o + 1]]);
+        let u32_at = |o: usize| u32::from_le_bytes(t[o..o + 4].try_into().unwrap());
+        assert_eq!(&t[..4], b"TMH2");
+        let counts: Vec<usize> = (0..4).map(|g| u32_at(20 + g * 4) as usize).collect();
+        let (nt, np) = (u32_at(36) as usize, u32_at(40) as usize);
+        let mut o = 44;
+        let templates: Vec<Template> = (0..nt)
+            .map(|i| std::array::from_fn(|k| u16_at(o + i * 42 + k * 2)))
+            .collect();
+        o += nt * 42;
+        let colors: Vec<u32> = (0..np).map(|i| u32_at(o + i * 4)).collect();
+        o += np * 4;
+        let mut out = Vec::new();
+        for (g, &n) in counts.iter().enumerate() {
+            let plane =
+                |o: usize, len: usize, i: usize| t[o + i] as u16 | (t[o + len + i] as u16) << 8;
+            let (cols, steps, tpls, cols_idx) = (
+                o,
+                o + 2 * W * W,
+                o + 2 * W * W + 2 * n,
+                o + 2 * W * W + 4 * n,
+            );
+            let mut q = 0;
+            for z in 0..W {
+                for x in 0..W {
+                    let mut y = 511u16;
+                    for _ in 0..plane(cols, W * W, z * W + x) {
+                        y -= plane(steps, n, q);
+                        let tpl = templates[plane(tpls, n, q) as usize];
+                        out.push((
+                            g,
+                            x as u8,
+                            y,
+                            z as u8,
+                            tpl,
+                            colors[plane(cols_idx, n, q) as usize],
+                        ));
+                        q += 1;
+                    }
+                }
+            }
+            o += 2 * W * W + 6 * n;
+        }
+        assert_eq!(o, t.len());
+        out
+    }
+
+    fn quad(dx: f32, layer: Layer, tex: u16) -> Quad {
+        Quad {
+            pos: [
+                [dx, 0.5, 0.0],
+                [dx, 0.0, 0.0],
+                [dx + 1.0, 0.0, 1.25],
+                [dx + 1.0, 0.5, 1.0],
+            ],
+            uv: [[0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.5]],
+            tex,
+            layer,
+            cull: None,
+            light_dir: UP,
+            tinted: false,
+            shade: 1.0,
+        }
+    }
+
+    #[test]
+    fn tmh2_round_trips() {
+        let mut m = Mesher::new();
+        let mut expected = Vec::new();
+        // Quads in several columns, stacked in one column, across all groups,
+        // and with offsets that reach past their block (negative and > 1).
+        let cases = [
+            ([0, 1, 0], -1.0, Layer::Opaque, 3, 0),
+            ([65, 385, 65], 0.0, Layer::Cutout, 4, 1),
+            ([10, 70, 20], 0.25, Layer::Opaque, 3, 0),
+            ([10, 90, 20], 0.0, Layer::Translucent, 7, 3),
+            ([10, 70, 20], 0.0, Layer::Cutout, 5, LEAF_INTERIOR),
+            ([10, 71, 20], 0.0, Layer::Opaque, 3, 0),
+        ];
+        for (i, (base, dx, layer, tex, group)) in cases.into_iter().enumerate() {
+            let q = quad(dx, layer, tex);
+            m.emit(&q, base, [i as u8 * 40, 200, 30], 0xf3, group);
+            let r = m.groups[group].last().unwrap();
+            expected.push((group, r.x, r.y, r.z, r.tpl, r.color));
+        }
+        let tile = m.encode([0, 0, 0]);
+        let mut got = decode(&tile);
+        got.sort();
+        expected.sort();
+        assert_eq!(got, expected);
+        // Offsets are stored with a +64 bias in 1/64 block.
+        assert_eq!(
+            expected
+                .iter()
+                .find(|e| e.4[20] == 3 && e.2 == 1)
+                .unwrap()
+                .4[0],
+            0
+        );
+    }
+}
