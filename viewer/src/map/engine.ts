@@ -507,21 +507,23 @@ export class MapEngine {
       const t = this.tiles.get(key(l, x, z))
       return !!t && (!!t.group || t.state === 'empty')
     }
-    const visit = (level: number, x: number, z: number) => {
+    const visit = (level: number, x: number, z: number, sibling: boolean) => {
       const size = TILE << level
       box.min.set(x * size, m.minY, z * size)
       box.max.set((x + 1) * size, m.maxY, (z + 1) * size)
       const tile = this.tiles.get(key(level, x, z))
+      const inView = frustum.intersectsBox(box)
       // Off-screen siblings of drawn tiles stay loaded: dropping one would make
-      // its parent unsettled and swap the whole group back to coarse.
-      if (tile) tile.lastWanted = now
-      if (!frustum.intersectsBox(box)) return
+      // its parent unsettled and swap the whole group back to coarse. Other
+      // off-screen tiles, roots included, expire.
+      if (tile && (inView || sibling)) tile.lastWanted = now
+      if (!inView) return
       const d = Math.max(box.distanceToPoint(cam), 1)
       if (meshed(level, x, z) && needs(tile)) want.push({ level, x, z, d })
       const kids = level > 0 && ((1 << level) * k) / d > this.detail ? this.children(level, x, z) : []
       if (kids.length) {
         if (kids.every(([l, kx, kz]) => settled(l, kx, kz))) {
-          for (const [l, kx, kz] of kids) visit(l, kx, kz)
+          for (const [l, kx, kz] of kids) visit(l, kx, kz, true)
           return
         }
         for (const [l, kx, kz] of kids) {
@@ -537,7 +539,7 @@ export class MapEngine {
       const [l, rest] = n.split(':')
       if (Number(l) !== m.lodLevels) continue
       const [x, z] = rest.split(',').map(Number)
-      visit(m.lodLevels, x, z)
+      visit(m.lodLevels, x, z, false)
     }
 
     // Swap what's drawn, dissolving tiles in and out.
