@@ -69,7 +69,7 @@ fn main() -> Result<()> {
             }
             for m in maps {
                 let ctx = render::MapCtx::new(m.clone(), &cfg.data_dir)?;
-                let up = ctx.render(&pool, full)?;
+                let up = ctx.render(&pool, full, |_| {})?;
                 let s = &up.stats;
                 tracing::info!(
                     "{}: {} regions, {} changed chunks, {} tiles ({} empty), {:.1} MB, {} vertices, {} failed chunks, {:.2}s",
