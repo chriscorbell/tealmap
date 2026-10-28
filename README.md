@@ -7,7 +7,7 @@ A 3D web map for Minecraft worlds, in the spirit of [BlueMap](https://github.com
 - **Small tiles.** Each quad is 8 bytes: a block anchor plus indices into small per-tile tables of quad shapes and colors. Quads are column-coded so gzip gets them to about 1 byte each, and the GPU draws them straight from those records.
 - **Full detail at any distance.** Past the hires tiles, a voxel LOD pyramid takes over: each level halves the resolution by picking the most common visible block in every 2×2×2, and meshes that with the same mesher at a larger scale. The viewer switches levels only where a voxel would be about a pixel on screen, so distant terrain keeps its real shapes, textures and water.
 - **A light viewer.** The viewer is three.js on WebGL2. Tiles load in a worker, all block textures share one texture array, and frames render on demand.
-- **Live updates.** tealmap watches region files and hashes each chunk's compressed bytes to find real changes. It re-renders only the tiles affected and pushes them to open viewers over SSE.
+- **Live updates.** tealmap watches region files and hashes each chunk's compressed bytes to find real changes. It re-renders only the tiles affected and pushes them to open viewers over SSE. A big pass renders in batches from the middle of the map outward, so the map fills in as it goes, and a restart picks up where the pass stopped.
 
 ## How it works
 

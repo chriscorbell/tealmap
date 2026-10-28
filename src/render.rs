@@ -19,6 +19,9 @@ use std::time::{Instant, UNIX_EPOCH};
 /// Bump when output for the same input changes; forces a full re-render.
 pub const RENDER_VERSION: u32 = 3;
 const STATE_MAGIC: &[u8; 4] = b"TMS1";
+/// Hires tiles per render thread in each batch of a pass, about 20 seconds
+/// of work.
+const BATCH_TILES_PER_THREAD: usize = 256;
 
 pub struct MapCtx {
     pub cfg: MapConfig,
@@ -27,6 +30,7 @@ pub struct MapCtx {
     pub settings: Settings,
     /// Region file (mtime, size) seen at the last successful scan.
     seen: Mutex<HashMap<(i32, i32), (u64, u64)>>,
+    batch_tiles: usize,
 }
 
 #[derive(Default, Debug, Serialize, Clone)]
@@ -36,6 +40,20 @@ pub struct Update {
     pub lod: Vec<[i32; 3]>,
     #[serde(skip)]
     pub stats: Stats,
+}
+
+impl Update {
+    fn add(&mut self, results: &[RegionResult], lod: &[[i32; 3]]) {
+        for r in results {
+            self.hires.extend(r.tiles.iter().map(|&(x, z)| [x, z]));
+            self.stats.tiles += r.tiles.len();
+            self.stats.empty_tiles += r.empty;
+            self.stats.failed_chunks += r.failed.len();
+            self.stats.bytes += r.bytes;
+            self.stats.vertices += r.vertices;
+        }
+        self.lod.extend_from_slice(lod);
+    }
 }
 
 #[derive(Default, Debug, Clone)]
@@ -88,6 +106,7 @@ impl MapCtx {
             out,
             settings,
             seen: Mutex::new(HashMap::new()),
+            batch_tiles: BATCH_TILES_PER_THREAD,
         })
     }
 
@@ -95,20 +114,34 @@ impl MapCtx {
         self.cfg.world.join("region")
     }
 
-    /// Renders everything that changed since the last pass (or everything, if `full`).
-    pub fn render(&self, pool: &rayon::ThreadPool, full: bool) -> Result<Update> {
+    /// Renders everything that changed since the last pass (or everything, if
+    /// `full`), and returns the whole pass.
+    ///
+    /// A big pass renders in batches, nearest the middle of the map first.
+    /// Each batch writes the manifest and goes to `publish`, so viewers fill
+    /// in as it renders, and saves the state of the regions it finished, so a
+    /// restart picks up where the pass stopped.
+    pub fn render(
+        &self,
+        pool: &rayon::ThreadPool,
+        full: bool,
+        mut publish: impl FnMut(&Update),
+    ) -> Result<Update> {
         let t0 = Instant::now();
-        let full = full || self.manifest_version() != Some(RENDER_VERSION);
+        // Batches keep this version in the manifest until the pass ends, so a
+        // forced full pass that stops early runs as a full pass again.
+        let prev = self.stored_version()?;
+        let full = full || prev != Some(RENDER_VERSION);
         if full {
             self.seen.lock().unwrap().clear();
             // Output from older versions that this one no longer writes.
             let _ = std::fs::remove_dir_all(self.out.join("lowres"));
         }
-        if !self.out.join("map.json").exists() {
-            // Publish the map before the first render finishes so viewers can
-            // open it; tiles arrive with the update at the end of the pass.
-            self.write_textures(true)?;
-            self.write_manifest()?;
+        let fresh = !self.out.join("map.json").exists();
+        self.write_textures(full || fresh)?;
+        if fresh {
+            // Publish the map before the first batch finishes so viewers can open it.
+            self.write_manifest(prev)?;
         }
         let regions = list_regions(&self.region_dir())?;
         let present: BTreeSet<(i32, i32)> = regions.iter().map(|&(x, z, _)| (x, z)).collect();
@@ -153,38 +186,91 @@ impl MapCtx {
             }
         }
 
-        // 3. Render region jobs in parallel.
-        let results: Vec<RegionResult> = pool.install(|| {
-            tiles
-                .par_iter()
-                .map(|(&(rx, rz), set)| self.render_region(rx, rz, set))
-                .collect::<Result<Vec<_>>>()
-        })?;
+        // 3. Render region jobs in batches, nearest the middle first, so the map
+        // grows outward from where viewers start.
+        let jobs = nearest_first(tiles);
+        let batches = batches(&jobs, self.batch_tiles * pool.current_num_threads());
+        let total: usize = jobs.iter().map(|j| j.1.len()).sum();
+        let queued: BTreeSet<(i32, i32)> = jobs.iter().map(|j| j.0).collect();
+        let mut finished = BTreeSet::new();
+        let mut failed = BTreeSet::new();
+        let mut saved = vec![false; scans.len()];
+        let mut pass = Update::default();
+        let mut rendered = 0;
+        for batch in &batches {
+            let results: Vec<RegionResult> = pool.install(|| {
+                batch
+                    .par_iter()
+                    .map(|((rx, rz), set)| self.render_region(*rx, *rz, set))
+                    .collect::<Result<Vec<_>>>()
+            })?;
+            let lod = self.build_lods(pool, &results)?;
+            let mut up = Update::default();
+            up.add(&results, &lod);
+            pass.add(&results, &lod);
+            failed.extend(results.iter().flat_map(|r| r.failed.iter().copied()));
+            finished.extend(batch.iter().map(|j| j.0));
+            rendered += batch.iter().map(|j| j.1.len()).sum::<usize>();
+            // List the tiles before saving state: a region with saved state
+            // won't render again, so nothing else would list them.
+            self.write_manifest(prev)?;
 
-        // 4. Persist state. Chunks that failed to read get a sentinel hash so the
-        // next pass retries them, and their region isn't marked as seen.
-        let failed: BTreeSet<(i32, i32)> = results
-            .iter()
-            .flat_map(|r| r.failed.iter().copied())
-            .collect();
-        for s in &scans {
-            let mut hashes = s.hashes.clone();
-            let mut ok = true;
-            for (i, h) in hashes.iter_mut().enumerate() {
-                if failed.contains(&(s.rx * 32 + (i % 32) as i32, s.rz * 32 + (i / 32) as i32)) {
-                    *h = u64::MAX;
-                    ok = false;
+            // 4. Persist state for regions that every job reading their chunks
+            // (their own and the eight around it) has finished.
+            let done = |j| !queued.contains(&j) || finished.contains(&j);
+            for (s, saved) in scans.iter().zip(&mut saved) {
+                if !*saved && (-1..=1).all(|dx| (-1..=1).all(|dz| done((s.rx + dx, s.rz + dz)))) {
+                    self.save_scan(s, &failed)?;
+                    *saved = true;
                 }
             }
-            self.save_state(s.rx, s.rz, &hashes)?;
-            if ok && let Some(st) = s.stamp {
-                self.seen.lock().unwrap().insert((s.rx, s.rz), st);
+            if rendered < total {
+                tracing::info!("{}: {rendered}/{total} tiles", self.cfg.id);
             }
+            publish(&up);
+        }
+        // With no jobs, no batch saved state.
+        for (s, _) in scans.iter().zip(&saved).filter(|(_, saved)| !**saved) {
+            self.save_scan(s, &failed)?;
+        }
+        if prev != Some(RENDER_VERSION) {
+            self.write_manifest(Some(RENDER_VERSION))?;
         }
 
-        // 5. LOD pyramid: rebuild every tile whose sources changed (its own, or
-        // a neighbor's along its border), one level at a time, since each level
-        // reads the sources of the one below.
+        pass.stats.regions = regions.len();
+        pass.stats.chunks = chunks;
+        pass.stats.seconds = t0.elapsed().as_secs_f64();
+        Ok(pass)
+    }
+
+    /// Saves a region's chunk hashes. Chunks that failed to read get a
+    /// sentinel hash so the next pass retries them, and the region isn't
+    /// marked as seen.
+    fn save_scan(&self, s: &RegionScan, failed: &BTreeSet<(i32, i32)>) -> Result<()> {
+        let mut hashes = s.hashes.clone();
+        let mut ok = true;
+        for (i, h) in hashes.iter_mut().enumerate() {
+            if failed.contains(&(s.rx * 32 + (i % 32) as i32, s.rz * 32 + (i / 32) as i32)) {
+                *h = u64::MAX;
+                ok = false;
+            }
+        }
+        self.save_state(s.rx, s.rz, &hashes)?;
+        if ok && let Some(st) = s.stamp {
+            self.seen.lock().unwrap().insert((s.rx, s.rz), st);
+        }
+        Ok(())
+    }
+
+    /// Rebuilds the LOD pyramid over these jobs: every tile whose sources they
+    /// changed (its own, or a neighbor's along its border), one level at a
+    /// time, since each level reads the sources of the one below. Returns the
+    /// LOD tiles whose mesh changed.
+    fn build_lods(
+        &self,
+        pool: &rayon::ThreadPool,
+        results: &[RegionResult],
+    ) -> Result<Vec<[i32; 3]>> {
         let mut dirty: BTreeSet<(i32, i32)> = results
             .iter()
             .flat_map(|r| {
@@ -215,24 +301,7 @@ impl MapCtx {
                 .flat_map(|&(x, z, _)| lod::tiles_using_source(x, z))
                 .collect();
         }
-
-        self.write_textures(full)?;
-        self.write_manifest()?;
-
-        let mut up = Update::default();
-        for r in &results {
-            up.hires.extend(r.tiles.iter().map(|&(x, z)| [x, z]));
-            up.stats.tiles += r.tiles.len();
-            up.stats.empty_tiles += r.empty;
-            up.stats.failed_chunks += r.failed.len();
-            up.stats.bytes += r.bytes;
-            up.stats.vertices += r.vertices;
-        }
-        up.lod = lod_changed;
-        up.stats.regions = regions.len();
-        up.stats.chunks = chunks;
-        up.stats.seconds = t0.elapsed().as_secs_f64();
-        Ok(up)
+        Ok(lod_changed)
     }
 
     fn scan_region(&self, rx: i32, rz: i32, path: &Path, full: bool) -> Result<Option<RegionScan>> {
@@ -459,10 +528,17 @@ impl MapCtx {
         Ok(out)
     }
 
-    fn manifest_version(&self) -> Option<u32> {
-        let b = std::fs::read(self.out.join("map.json")).ok()?;
-        let v: serde_json::Value = serde_json::from_slice(&b).ok()?;
-        Some(v["renderVersion"].as_u64()? as u32)
+    /// The render version of the map's tiles and state. A map with neither
+    /// is new, so it counts as current.
+    fn stored_version(&self) -> Result<Option<u32>> {
+        let listed = std::fs::read(self.out.join("map.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .and_then(|v| v["renderVersion"].as_u64());
+        Ok(match listed {
+            Some(v) => Some(v as u32),
+            None => self.stored_regions()?.is_empty().then_some(RENDER_VERSION),
+        })
     }
 
     fn write_textures(&self, force: bool) -> Result<()> {
@@ -475,12 +551,12 @@ impl MapCtx {
         write_atomic(&path, &gz.finish()?)
     }
 
-    fn write_manifest(&self) -> Result<()> {
+    fn write_manifest(&self, render_version: Option<u32>) -> Result<()> {
         let manifest = serde_json::json!({
             "id": self.cfg.id,
             "name": self.cfg.display_name(),
             "version": self.cfg.version,
-            "renderVersion": RENDER_VERSION,
+            "renderVersion": render_version,
             "minY": self.cfg.min_y,
             "maxY": self.cfg.max_y,
             "tileSize": TILE,
@@ -556,6 +632,39 @@ fn lod_tiles(dir: &Path) -> Vec<[i32; 3]> {
         }
     }
     out.sort_unstable();
+    out
+}
+
+/// A region job: the region and the tiles in it to render.
+type Job = ((i32, i32), BTreeSet<(i32, i32)>);
+
+/// Region jobs, nearest the middle of them all first.
+fn nearest_first(jobs: BTreeMap<(i32, i32), BTreeSet<(i32, i32)>>) -> Vec<Job> {
+    let n = jobs.len().max(1) as f64;
+    let (sx, sz) = jobs.keys().fold((0.0, 0.0), |(x, z), &(rx, rz)| {
+        (x + rx as f64, z + rz as f64)
+    });
+    let d = |&(rx, rz): &(i32, i32)| (rx as f64 - sx / n).powi(2) + (rz as f64 - sz / n).powi(2);
+    let mut jobs: Vec<Job> = jobs.into_iter().collect();
+    jobs.sort_by(|a, b| d(&a.0).total_cmp(&d(&b.0)));
+    jobs
+}
+
+/// Splits jobs into runs of at least `tiles` tiles. The last run may be shorter.
+fn batches(jobs: &[Job], tiles: usize) -> Vec<&[Job]> {
+    let mut out = Vec::new();
+    let mut rest = jobs;
+    while !rest.is_empty() {
+        let mut n = 0;
+        let mut sum = 0;
+        while n < rest.len() && (n == 0 || sum < tiles) {
+            sum += rest[n].1.len();
+            n += 1;
+        }
+        let (batch, tail) = rest.split_at(n);
+        out.push(batch);
+        rest = tail;
+    }
     out
 }
 
@@ -734,6 +843,35 @@ mod tests {
         out
     }
 
+    fn hires_paths(snapshot: &BTreeMap<String, Vec<u8>>) -> BTreeSet<String> {
+        snapshot
+            .keys()
+            .filter(|k| k.starts_with("hires/"))
+            .cloned()
+            .collect()
+    }
+
+    /// The hires tiles the map's manifest lists, as snapshot paths.
+    fn listed_hires(map: &Path) -> BTreeSet<String> {
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(map.join("map.json")).unwrap()).unwrap();
+        let mut listed = BTreeSet::new();
+        for e in manifest["hires"].as_array().unwrap() {
+            let v: Vec<i64> = e
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|n| n.as_i64().unwrap())
+                .collect();
+            let mask = v[2] as u64 | (v[3] as u64) << 32;
+            for bit in (0..64).filter(|b| mask >> b & 1 == 1) {
+                let (tx, tz) = (v[0] * 8 + bit % 8, v[1] * 8 + bit / 8);
+                listed.insert(format!("hires/{}_{}/{tx}_{tz}.tmh", v[0], v[1]));
+            }
+        }
+        listed
+    }
+
     fn copy_dir(from: &Path, to: &Path) {
         std::fs::create_dir_all(to).unwrap();
         for e in std::fs::read_dir(from).unwrap().flatten() {
@@ -805,7 +943,7 @@ mod tests {
                 Baker::new(AssetFiles::new()),
             )
             .unwrap();
-            ctx.render(&pool, full).unwrap();
+            ctx.render(&pool, full, |_| {}).unwrap();
             snapshot(&base.join(data).join("maps/test"))
         };
 
@@ -818,29 +956,7 @@ mod tests {
         assert_eq!(first, render("b", true), "two full renders differ");
 
         // The manifest's hires masks list exactly the hires tiles on disk.
-        let manifest: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(base.join("a/maps/test/map.json")).unwrap())
-                .unwrap();
-        let mut listed = BTreeSet::new();
-        for e in manifest["hires"].as_array().unwrap() {
-            let v: Vec<i64> = e
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|n| n.as_i64().unwrap())
-                .collect();
-            let mask = v[2] as u64 | (v[3] as u64) << 32;
-            for bit in (0..64).filter(|b| mask >> b & 1 == 1) {
-                let (tx, tz) = (v[0] * 8 + bit % 8, v[1] * 8 + bit / 8);
-                listed.insert(format!("hires/{}_{}/{tx}_{tz}.tmh", v[0], v[1]));
-            }
-        }
-        let on_disk: BTreeSet<String> = first
-            .keys()
-            .filter(|k| k.starts_with("hires/"))
-            .cloned()
-            .collect();
-        assert_eq!(listed, on_disk);
+        assert_eq!(listed_hires(&base.join("a/maps/test")), hires_paths(&first));
 
         // Chunk (1,1) of region 0,0 is inside tile (0,0); chunk (0,0) sits on a
         // tile corner and also touches tiles in three other regions.
@@ -853,7 +969,7 @@ mod tests {
             Baker::new(AssetFiles::new()),
         )
         .unwrap();
-        let up = ctx.render(&pool, false).unwrap();
+        let up = ctx.render(&pool, false, |_| {}).unwrap();
         assert_eq!(up.stats.chunks, 2);
         assert!(up.hires.len() <= 4, "re-rendered {} tiles", up.hires.len());
         let incremental = snapshot(&base.join("a/maps/test"));
@@ -878,6 +994,84 @@ mod tests {
             render("a", true),
             render("d", true),
             "full render kept stale tiles"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn batched_passes_fill_in_and_resume() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let base = temp_dir("batches");
+        let world = base.join("world");
+        copy_dir(&fixture("26.2").join("region"), &world.join("region"));
+        // A region far from the rest, so the ones near the middle finish (and
+        // save their state) before the pass reaches it.
+        std::fs::copy(
+            world.join("region/r.0.0.mca"),
+            world.join("region/r.5.5.mca"),
+        )
+        .unwrap();
+        let ctx = |data: &str, batch_tiles: usize| {
+            let mut ctx = MapCtx::with_baker(
+                map_config(&world),
+                &base.join(data),
+                Baker::new(AssetFiles::new()),
+            )
+            .unwrap();
+            ctx.batch_tiles = batch_tiles;
+            ctx
+        };
+        let whole_pass = ctx("a", BATCH_TILES_PER_THREAD)
+            .render(&pool, false, |_| {})
+            .unwrap();
+        let whole = snapshot(&base.join("a/maps/test"));
+
+        // One region job per batch. Each batch publishes its tiles, with a
+        // manifest that lists exactly the hires tiles on disk so far.
+        let map = base.join("b/maps/test");
+        let mut batches = 0;
+        let mut published = BTreeSet::new();
+        let pass = ctx("b", 1)
+            .render(&pool, false, |up| {
+                batches += 1;
+                published.extend(up.hires.iter().copied());
+                assert_eq!(listed_hires(&map), hires_paths(&snapshot(&map)));
+            })
+            .unwrap();
+        assert!(batches > 2, "only {batches} batches");
+        assert_eq!(published.len(), pass.hires.len());
+        assert_eq!(
+            snapshot(&map),
+            whole,
+            "batched render differs from a whole one"
+        );
+
+        // A pass that stops before its last batch resumes where it stopped.
+        let mut left = batches - 1;
+        let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ctx("c", 1).render(&pool, false, |_| {
+                left -= 1;
+                assert!(left > 0, "stopping the pass");
+            })
+        }));
+        assert!(stopped.is_err());
+        let resumed = ctx("c", BATCH_TILES_PER_THREAD)
+            .render(&pool, false, |_| {})
+            .unwrap();
+        assert!(
+            resumed.stats.chunks > 0 && resumed.stats.chunks < whole_pass.stats.chunks,
+            "resumed pass rendered {} of {} chunks",
+            resumed.stats.chunks,
+            whole_pass.stats.chunks
+        );
+        assert_eq!(
+            snapshot(&base.join("c/maps/test")),
+            whole,
+            "resumed render differs from a whole one"
         );
 
         let _ = std::fs::remove_dir_all(&base);

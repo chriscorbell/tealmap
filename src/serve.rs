@@ -1,7 +1,7 @@
 //! HTTP server: the embedded viewer, map files, and live updates over SSE.
 
 use crate::config::Config;
-use crate::render::MapCtx;
+use crate::render::{MapCtx, Update};
 use anyhow::Result;
 use axum::Router;
 use axum::extract::{Path as UrlPath, State};
@@ -59,7 +59,13 @@ pub fn run(cfg: Config, pool: rayon::ThreadPool) -> Result<()> {
                 .collect();
             loop {
                 for ctx in &ctxs {
-                    match ctx.render(&pool, false) {
+                    let publish = |up: &Update| {
+                        if !up.hires.is_empty() || !up.lod.is_empty() {
+                            let msg = serde_json::json!({ "map": ctx.cfg.id, "update": up });
+                            let _ = tx.send(msg.to_string());
+                        }
+                    };
+                    match ctx.render(&pool, false, publish) {
                         Ok(up) => {
                             if !up.hires.is_empty() || !up.lod.is_empty() {
                                 let s = &up.stats;
@@ -70,8 +76,6 @@ pub fn run(cfg: Config, pool: rayon::ThreadPool) -> Result<()> {
                                     s.tiles,
                                     s.seconds
                                 );
-                                let msg = serde_json::json!({ "map": ctx.cfg.id, "update": up });
-                                let _ = tx.send(msg.to_string());
                             }
                         }
                         Err(e) => tracing::error!("render {}: {e:#}", ctx.cfg.id),
