@@ -330,8 +330,19 @@ impl MapCtx {
             // Failed chunks can be one bad file, which the next pass retries.
             // If the whole world has gone, every batch left would fail too, and
             // this pass mustn't count as finished: stop here.
-            if results.iter().any(|r| !r.failed.is_empty()) {
-                self.source_regions(false)?;
+            if results.iter().any(|r| !r.failed.is_empty())
+                && let Err(e) = self.source_regions(false)
+            {
+                // Scans still waiting on a neighbor won't be saved now, and
+                // they're what would have retried their failed chunks.
+                let saved: BTreeSet<(i32, i32)> = scans
+                    .iter()
+                    .zip(&saved)
+                    .filter(|(_, saved)| **saved)
+                    .map(|(s, _)| (s.rx, s.rz))
+                    .collect();
+                self.mark_failed(failed.iter().copied(), &saved)?;
+                return Err(e);
             }
         }
         // With no jobs, no batch saved state.
@@ -369,17 +380,18 @@ impl MapCtx {
         Ok(())
     }
 
-    /// Records failed chunks in regions this pass didn't scan, which a neighbor's
-    /// tile read. Nothing else would make the next pass retry them.
+    /// Records failed chunks in regions whose scan won't record them (`handled`
+    /// has the ones that will), which a neighbor's tile read. Nothing else would
+    /// make the next pass retry them.
     fn mark_failed(
         &self,
         chunks: impl Iterator<Item = (i32, i32)>,
-        scanned: &BTreeSet<(i32, i32)>,
+        handled: &BTreeSet<(i32, i32)>,
     ) -> Result<()> {
         let mut regions: BTreeMap<(i32, i32), Vec<usize>> = BTreeMap::new();
         for (cx, cz) in chunks {
             let region = (cx.div_euclid(32), cz.div_euclid(32));
-            if !scanned.contains(&region) {
+            if !handled.contains(&region) {
                 let i = cz.rem_euclid(32) * 32 + cx.rem_euclid(32);
                 regions.entry(region).or_default().push(i as usize);
             }
@@ -466,6 +478,15 @@ impl MapCtx {
                 self.cfg.id,
                 path.display()
             );
+            // A full pass won't come back for it, and the same bytes returning
+            // would look unchanged, so its saved hashes have to ask for the render.
+            if full {
+                let hashes: Vec<u64> = old
+                    .iter()
+                    .map(|&h| if h == 0 { 0 } else { u64::MAX })
+                    .collect();
+                self.save_state(rx, rz, &hashes, None)?;
+            }
             self.seen.lock().unwrap().insert((rx, rz), stamp);
             return Ok(None);
         }
@@ -1462,6 +1483,29 @@ mod tests {
         assert_eq!(ctx.render(&pool, false, |_| {}).unwrap().stats.chunks, 0);
         assert_eq!(snapshot(&map), first);
 
+        // An upgrade pass that skips one finishes, and that region's tiles still
+        // get upgraded once the same bytes return.
+        let lone = world.join("region/r.5.5.mca");
+        std::fs::copy(world.join("region/r.0.0.mca"), &lone).unwrap();
+        ctx.render(&pool, false, |_| {}).unwrap();
+        let first = snapshot(&map);
+        let bytes = std::fs::read(&lone).unwrap();
+        let manifest_path = map.join("map.json");
+        let mut manifest = read_manifest(&manifest_path).unwrap();
+        manifest["renderVersion"] = (RENDER_VERSION - 1).into();
+        std::fs::write(&manifest_path, manifest.to_string()).unwrap();
+        let upgrading = MapCtx::with_baker(
+            map_config(&world),
+            &base.join("a"),
+            Baker::new(AssetFiles::new()),
+        )
+        .unwrap();
+        std::fs::File::create(&lone).unwrap();
+        upgrading.render(&pool, false, |_| {}).unwrap();
+        std::fs::write(&lone, bytes).unwrap();
+        assert!(upgrading.render(&pool, false, |_| {}).unwrap().stats.chunks > 0);
+        assert_eq!(snapshot(&map), first, "the region missed its upgrade");
+
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -1514,6 +1558,89 @@ mod tests {
                 snapshot(&base.join("clean/maps/test"))
             },
             "the failed chunks weren't retried"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A region scanned this pass, waiting on a neighbor's job, can fail when
+    /// another tile reads it. If the pass then stops, its scan is never saved.
+    #[cfg(unix)]
+    #[test]
+    fn stopping_a_pass_keeps_retries_for_unsaved_scans() {
+        use std::os::unix::fs::PermissionsExt;
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let base = temp_dir("early-stop");
+        let world = base.join("world");
+        let moved = base.join("moved");
+        let region = world.join("region");
+        copy_dir(&fixture("26.2").join("region"), &region);
+        std::fs::copy(region.join("r.0.0.mca"), region.join("r.-1.1.mca")).unwrap();
+        std::fs::copy(region.join("r.0.0.mca"), region.join("r.1.1.mca")).unwrap();
+        let ctx = |data: &str| {
+            let mut ctx = MapCtx::with_baker(
+                map_config(&world),
+                &base.join(data),
+                Baker::new(AssetFiles::new()),
+            )
+            .unwrap();
+            ctx.batch_tiles = 1;
+            ctx
+        };
+        let live = ctx("a");
+        live.render(&pool, false, |_| {}).unwrap();
+
+        // Three jobs, in the order -1,1 then -1,-1 then 1,1. The middle one's
+        // tile -1,-1 reads region 0,0 for its halo, and region 0,0's scan waits
+        // on the last job, since 1,1 is its neighbor.
+        swap_chunk(&region.join("r.-1.1.mca"), 32 + 1, 2 * 32 + 2);
+        swap_chunk(&region.join("r.1.1.mca"), 32 + 1, 2 * 32 + 2);
+        swap_chunk(&region.join("r.-1.-1.mca"), 29 * 32 + 29, 30 * 32 + 30);
+        let middle = region.join("r.0.0.mca");
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        std::fs::File::options()
+            .write(true)
+            .open(&middle)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        let chmod = |path: &Path, mode| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+
+        chmod(&middle, 0o000);
+        let root = std::fs::File::open(&middle).is_ok();
+        chmod(&middle, 0o644);
+        if root {
+            // Root reads anything, so there's nothing to test.
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+
+        let mut batches = 0;
+        let stopped = live.render(&pool, false, |_| {
+            batches += 1;
+            if batches == 1 {
+                chmod(&middle, 0o000);
+            }
+            if batches == 2 {
+                chmod(&middle, 0o644);
+                std::fs::rename(&world, &moved).unwrap();
+            }
+        });
+        stopped.unwrap_err();
+        assert_eq!(batches, 2);
+
+        std::fs::rename(&moved, &world).unwrap();
+        live.render(&pool, false, |_| {}).unwrap();
+        ctx("clean").render(&pool, true, |_| {}).unwrap();
+        assert_eq!(
+            snapshot(&base.join("a/maps/test")),
+            snapshot(&base.join("clean/maps/test")),
+            "a failed halo chunk was lost when the pass stopped"
         );
 
         let _ = std::fs::remove_dir_all(&base);
