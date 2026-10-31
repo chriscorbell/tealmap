@@ -100,8 +100,16 @@ impl Biomes {
         &self.entries[id as usize].0
     }
 
-    pub fn colors(&self, id: u16) -> BiomeColors {
-        self.entries[id as usize].1
+    /// Every biome's colors so far, indexed by id, for per-block lookups.
+    pub fn snapshot(&self) -> Vec<BiomeColors> {
+        let mut out = Vec::with_capacity(self.entries.count());
+        for (id, (_, c)) in self.entries.iter() {
+            if id >= out.len() {
+                out.resize(id + 1, *c);
+            }
+            out[id] = *c;
+        }
+        out
     }
 
     fn compute(&self, name: &str) -> BiomeColors {

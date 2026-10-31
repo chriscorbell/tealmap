@@ -13,7 +13,7 @@
 //! so on. A change only rebuilds the tile's ancestors.
 
 use crate::mesh::{Settings, TILE, Volume};
-use crate::model::{AIR, Registry};
+use crate::model::{AIR, BlockInfo, Registry};
 use anyhow::{Result, bail};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -115,28 +115,29 @@ pub fn tiles_using_source(cx: i32, cz: i32) -> impl Iterator<Item = (i32, i32)> 
 
 /// The block-level grid of a hires tile's own 64×64 columns, with removed
 /// caves turned to air. Blocks outside the volume's range are air.
-pub fn from_volume(v: &Volume, reg: &Registry, s: &Settings, min_y: i32, max_y: i32) -> Grid {
+pub fn from_volume(v: &Volume, reg: &Registry, min_y: i32, max_y: i32) -> Grid {
     let (min_y, max_y) = bounds(min_y, max_y);
     let h = (max_y - min_y) as usize;
     let mut g = Grid::empty(N, h, min_y);
-    for z in 0..N {
-        for x in 0..N {
-            let (vx, vz) = (x + 1, z + 1);
-            let col = z * N + x;
-            let mut biome = None;
-            for vy in 1..v.h - 1 {
-                let wy = v.y0 + vy as i32;
-                if wy < min_y || wy >= max_y {
-                    continue;
-                }
+    let infos = reg.snapshot();
+    // Bottom up, so each column ends with the biome of its top block.
+    for vy in 1..v.h.saturating_sub(1) {
+        let wy = v.y0 + vy as i32;
+        if wy < min_y || wy >= max_y {
+            continue;
+        }
+        let y = (wy - min_y) as usize;
+        for z in 0..N {
+            for x in 0..N {
+                let (vx, vz) = (x + 1, z + 1);
                 let id = v.block(vx, vy, vz);
-                if id == AIR || !counts(reg.get(id)) || v.cave(vx, vy, vz, s) {
+                if id == AIR || !infos[id as usize].lod_counts || v.cave(vx, vy, vz) {
                     continue;
                 }
-                g.states[col * h + (wy - min_y) as usize] = id;
-                biome = Some(v.biome(vx, vy, vz));
+                let col = z * N + x;
+                g.states[col * h + y] = id;
+                g.biomes[col] = v.biome(vx, vy, vz);
             }
-            g.biomes[col] = biome.unwrap_or(0);
         }
     }
     g
@@ -149,37 +150,44 @@ pub fn from_volume(v: &Volume, reg: &Registry, s: &Settings, min_y: i32, max_y: 
 pub fn downsample(src: &Grid, reg: &Registry, min_solid: u8) -> Grid {
     let (w, h) = (src.w / 2, src.h.div_ceil(2));
     let mut out = Grid::empty(w, h, src.y0.div_euclid(2));
-    let at = |x: usize, z: usize, y: usize| -> u16 {
-        if y >= src.h {
-            AIR
-        } else {
-            src.states[(z * src.w + x) * src.h + y]
-        }
-    };
+    let infos = reg.snapshot();
     let mut votes: Vec<(u16, u32)> = Vec::with_capacity(8);
     for z in 0..w {
         for x in 0..w {
             let col = z * w + x;
+            let columns = [(0, 0), (1, 0), (0, 1), (1, 1)].map(|(dx, dz)| {
+                let c = (z * 2 + dz) * src.w + x * 2 + dx;
+                &src.states[c * src.h..(c + 1) * src.h]
+            });
             for y in 0..h {
+                let (cy0, cy1) = (y * 2, y * 2 + 1);
+                // Most voxels are empty; settle those without voting.
+                let bottom = columns.map(|c| c[cy0]);
+                let top = columns.map(|c| c.get(cy1).copied().unwrap_or(AIR));
+                if bottom == [AIR; 4] && top == [AIR; 4] {
+                    continue;
+                }
                 votes.clear();
                 let mut solid = 0;
                 for (dx, dz, dy) in CHILDREN {
-                    let (cx, cz, cy) = (x * 2 + dx, z * 2 + dz, y * 2 + dy);
-                    let s = at(cx, cz, cy);
-                    if s == AIR || !counts(reg.get(s)) {
+                    let (column, cy) = (columns[dz * 2 + dx], y * 2 + dy);
+                    let s = column.get(cy).copied().unwrap_or(AIR);
+                    let info = infos[s as usize];
+                    if s == AIR || !info.lod_counts {
                         continue;
                     }
                     solid += 1;
                     // Votes count the space a block fills, doubled on the surface.
-                    let surface = if at(cx, cz, cy + 1) == AIR { 2 } else { 1 };
-                    let weight = volume(reg.get(s)) * surface;
+                    let above = column.get(cy + 1).copied().unwrap_or(AIR);
+                    let surface = if above == AIR { 2 } else { 1 };
+                    let weight = info.lod_volume as u32 * surface;
                     match votes.iter_mut().find(|v| v.0 == s) {
                         Some(v) => v.1 += weight,
                         None => votes.push((s, weight)),
                     }
                 }
                 if solid >= min_solid {
-                    out.states[col * h + y] = pick(&votes, reg);
+                    out.states[col * h + y] = pick(&votes, &infos, reg);
                 }
             }
             // The biome of the child column with the most solid voxels.
@@ -212,49 +220,25 @@ const CHILDREN: [(usize, usize, usize); 8] = [
     (1, 1, 1),
 ];
 
-/// Whether a block takes up space at LOD scale: it has a full face, or it's
-/// leaves, a fluid, or glass-like. Plants, torches and the like don't; at the
-/// distances LOD is drawn at they're a couple of pixels at most.
-fn counts(b: &crate::model::BlockInfo) -> bool {
-    use crate::model::{F_CULL_SAME, F_LEAVES};
-    b.visible() && (b.occludes != 0 || b.is_fluid() || b.flags & (F_LEAVES | F_CULL_SAME) != 0)
-}
-
-/// Roughly how much of its space a block fills, in eighths: a snow layer
-/// counts its layers, a slab half, a full cube all of it.
-fn volume(b: &crate::model::BlockInfo) -> u32 {
-    if b.occludes == 0x3f || b.is_fluid() {
-        return 8;
-    }
-    for part in b.key.split('|') {
-        if let Some(n) = part
-            .strip_prefix("layers=")
-            .and_then(|n| n.parse::<u32>().ok())
-        {
-            return n.clamp(1, 8);
-        }
-    }
-    4
-}
-
 /// Highest vote wins; ties go to the smaller registry key, which keeps output
 /// independent of the order states were first seen in. A slab is drawn as a
 /// double slab, since a voxel stands for the whole space.
-fn pick(votes: &[(u16, u32)], reg: &Registry) -> u16 {
+fn pick(votes: &[(u16, u32)], infos: &[&BlockInfo], reg: &Registry) -> u16 {
     let mut best = votes[0];
     for &v in &votes[1..] {
-        if v.1 > best.1 || (v.1 == best.1 && reg.get(v.0).key < reg.get(best.0).key) {
+        if v.1 > best.1 || (v.1 == best.1 && infos[v.0 as usize].key < infos[best.0 as usize].key) {
             best = v;
         }
     }
-    full_form(best.0, reg)
+    let info = infos[best.0 as usize];
+    if info.occludes == 0x3f {
+        return best.0;
+    }
+    *info.lod_full_form.get_or_init(|| full_form(best.0, reg))
 }
 
 fn full_form(id: u16, reg: &Registry) -> u16 {
     let b = reg.get(id);
-    if b.occludes == 0x3f {
-        return id;
-    }
     let key: String = b
         .key
         .split('|')
@@ -345,9 +329,9 @@ pub fn save_source(path: &Path, g: &Grid, reg: &Registry) -> Result<()> {
         out.extend_from_slice(s.as_bytes());
     }
     out.extend_from_slice(&body);
-    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(6));
-    std::io::Write::write_all(&mut gz, &out)?;
-    crate::render::write_atomic(path, &gz.finish()?)
+    let mut gz = Vec::new();
+    crate::render::gzip_into(&out, &mut gz);
+    crate::render::write_atomic(path, &gz)
 }
 
 pub fn load_source(path: &Path, reg: &Registry) -> Result<Option<Grid>> {
@@ -481,14 +465,8 @@ pub fn build_tile(
 }
 
 /// The level 1 source a hires tile leaves: its blocks, downsampled once.
-pub fn hires_source(
-    v: &Volume,
-    reg: &Registry,
-    s: &Settings,
-    min_y: i32,
-    max_y: i32,
-) -> Option<Grid> {
-    let g = downsample(&from_volume(v, reg, s, min_y, max_y), reg, MIN_SOLID[1]);
+pub fn hires_source(v: &Volume, reg: &Registry, min_y: i32, max_y: i32) -> Option<Grid> {
+    let g = downsample(&from_volume(v, reg, min_y, max_y), reg, MIN_SOLID[1]);
     (!g.is_empty()).then_some(g)
 }
 
