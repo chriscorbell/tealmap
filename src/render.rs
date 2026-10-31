@@ -1570,7 +1570,7 @@ mod tests {
     fn stopping_a_pass_keeps_retries_for_unsaved_scans() {
         use std::os::unix::fs::PermissionsExt;
         let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(2)
+            .num_threads(1)
             .build()
             .unwrap();
         let base = temp_dir("early-stop");
@@ -1593,6 +1593,7 @@ mod tests {
         let live = ctx("a");
         live.render(&pool, false, |_| {}).unwrap();
 
+        // Batches hold tiles per thread, so one thread makes each job its own batch.
         // Three jobs, in the order -1,1 then -1,0 then 1,1. The middle one's tile
         // -1,0 reads region 0,0 for its halo along a whole side, and region 0,0's
         // scan waits on the last job, since 1,1 is its neighbor.
