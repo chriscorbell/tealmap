@@ -123,6 +123,7 @@ pub fn from_volume(v: &Volume, reg: &Registry, min_y: i32, max_y: i32) -> Grid {
     let mut g = Grid::empty(N, h, min_y);
     let infos = reg.snapshot();
     let hidden = reg.id(HIDDEN_NAME, &mut []);
+    let water = reg.id("minecraft:water", &mut []);
     // Bottom up, so each column ends with the biome of its top block.
     for vy in 1..v.h.saturating_sub(1) {
         let wy = v.y0 + vy as i32;
@@ -134,9 +135,17 @@ pub fn from_volume(v: &Volume, reg: &Registry, min_y: i32, max_y: i32) -> Grid {
             for x in 0..N {
                 let (vx, vz) = (x + 1, z + 1);
                 let id = v.block(vx, vy, vz);
-                if id == AIR || !infos[id as usize].lod_counts {
+                if id == AIR {
                     continue;
                 }
+                // A plant under water is water at this scale. As air, it would
+                // leave a dark pocket in the sea.
+                let info = infos[id as usize];
+                let id = match (info.lod_counts, info.has_water()) {
+                    (true, _) => id,
+                    (false, true) => water,
+                    (false, false) => continue,
+                };
                 let col = z * N + x;
                 // Removed blocks stay solid here. As air, they'd expose the
                 // underside of everything above them.

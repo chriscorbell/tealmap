@@ -97,7 +97,11 @@ pub struct Volume {
     per_column_biomes: bool,
     /// Per column (W×W): ocean floor y, or i32::MIN when caves can't be detected.
     floor: Vec<i32>,
-    /// A voxel's light ORed with its six neighbors', for finding caves.
+    /// A voxel's "can be seen from" light: its own, or full sky if it's open water.
+    seen_from: Vec<u8>,
+    /// Voxels holding water, to find the open water in `seen_from`.
+    water_at: Vec<u32>,
+    /// `seen_from` ORed with the six neighbors', for finding caves.
     lit: Vec<u8>,
     caves_below: i32,
     /// Removes unlit faces under the surface; off when cave removal is off.
@@ -116,6 +120,8 @@ impl Volume {
             biomes: Vec::new(),
             per_column_biomes: false,
             floor: Vec::new(),
+            seen_from: Vec::new(),
+            water_at: Vec::new(),
             lit: Vec::new(),
             caves_below: i32::MIN,
             remove_dark: false,
@@ -129,6 +135,7 @@ impl Volume {
         x0: i32,
         z0: i32,
         settings: &Settings,
+        reg: &Registry,
         chunk: &dyn Fn(i32, i32) -> Option<&'c Chunk>,
     ) -> bool {
         let (cx0, cz0) = (x0 >> 4, z0 >> 4);
@@ -168,6 +175,7 @@ impl Volume {
         self.per_column_biomes = false;
         self.floor.clear();
         self.floor.resize(W * W, i32::MIN);
+        self.water_at.clear();
 
         for cz in cz0 - 1..cz0 + 5 {
             for cx in cx0 - 1..cx0 + 5 {
@@ -225,6 +233,13 @@ impl Volume {
                                     self.light[to..to + len].copy_from_slice(&l[from..from + len])
                                 }
                                 None => self.light[to..to + len].fill(s.uniform_light),
+                            }
+                            if s.has_water {
+                                for (i, &id) in self.blocks[to..to + len].iter().enumerate() {
+                                    if id != AIR && reg.get(id).has_water() {
+                                        self.water_at.push((to + i) as u32);
+                                    }
+                                }
                             }
                         }
                     }
@@ -294,6 +309,7 @@ impl Volume {
         self.floor.clear();
         self.floor.resize(W * W, i32::MIN);
         self.lit.clear();
+        self.seen_from.clear();
         self.caves_below = i32::MIN;
         self.remove_dark = false;
         let infos = reg.snapshot();
@@ -328,11 +344,25 @@ impl Volume {
 
     /// For each voxel, ORs its light with its neighbors', a row at a time so it
     /// vectorizes. Halo columns have no neighbor outside the volume on that side.
+    ///
+    /// Water in the open counts as full sky even where it's too deep for light:
+    /// you can see through it, so what's next to it is in view. Water under its
+    /// own column's surface, like an aquifer, doesn't.
     fn build_lit(&mut self) {
         let layers = self.h - 1;
+        self.seen_from.clear();
+        self.seen_from.extend_from_slice(&self.light);
+        for &i in &self.water_at {
+            let i = i as usize;
+            let (vy, column) = (i / STRIDE_Y, i % STRIDE_Y);
+            let floor = self.floor[column];
+            if floor == i32::MIN || self.y0 + vy as i32 >= floor {
+                self.seen_from[i] |= 0xf0;
+            }
+        }
         self.lit.clear();
         self.lit.resize(layers * W * W, 0);
-        let l = &self.light;
+        let l = &self.seen_from;
         for vy in 1..layers {
             for vz in 0..W {
                 let row = (vy * W + vz) * W;
@@ -398,11 +428,13 @@ impl Volume {
             && self.lit[self.idx(vx, vy, vz)] == 0
     }
 
-    /// Whether a face this dark is one nobody can see. A seabed's stays: water
-    /// doesn't block the view.
+    /// Whether a face looking out into voxel `facing` is one nobody can see:
+    /// under the surface with no light on it, and not looking into open water.
     #[inline]
-    fn dark_face(&self, light: u8, vx: usize, vy: usize, vz: usize) -> bool {
-        light == 0 && self.remove_dark && self.under_surface(vx, vz, self.y0 + vy as i32)
+    fn dark_face(&self, facing: usize, vx: usize, vy: usize, vz: usize) -> bool {
+        self.remove_dark
+            && self.seen_from[facing] == 0
+            && self.under_surface(vx, vz, self.y0 + vy as i32)
     }
 
     #[inline]
@@ -677,7 +709,8 @@ impl Mesher {
                             }
                         }
                         let light = face_light(v, i, q);
-                        if v.dark_face(light, vx, vy, vz) {
+                        let facing = neighbor(i, q.cull.unwrap_or(q.light_dir));
+                        if light == 0 && v.dark_face(facing, vx, vy, vz) {
                             continue;
                         }
                         let color = if q.tinted {
@@ -710,7 +743,7 @@ impl Mesher {
                         } else {
                             biomes[v.biome(vx, vy, vz) as usize].water
                         };
-                        let dark = |light| v.dark_face(light, vx, vy, vz);
+                        let dark = |facing| v.dark_face(facing, vx, vy, vz);
                         self.fluid(v, &infos, reg, i, lava, tex, base, color, &dark);
                     }
                 }
@@ -770,7 +803,7 @@ impl Mesher {
                     {
                         continue;
                     }
-                    if v.dark_face(v.light[n], vx, vy, vz) {
+                    if v.light[n] == 0 && v.dark_face(n, vx, vy, vz) {
                         continue;
                     }
                     let wx = v.x0 + vx as i32 - 1;
@@ -826,7 +859,7 @@ impl Mesher {
         tex: u16,
         base: [i32; 3],
         color: [u8; 3],
-        dark: &dyn Fn(u8) -> bool,
+        dark: &dyn Fn(usize) -> bool,
     ) {
         let same = |n: usize| {
             let b = infos[v.blocks[n] as usize];
@@ -875,7 +908,7 @@ impl Mesher {
             } else {
                 v.light[n].max(v.light[i])
             };
-            if dark(light) {
+            if light == 0 && dark(n) {
                 continue;
             }
             let slot = fluid_slot(lava, d, height, lo);

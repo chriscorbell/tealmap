@@ -17,6 +17,8 @@ pub struct Section {
     /// `uniform_light`.
     pub light: Option<Box<[u8; 4096]>>,
     pub uniform_light: u8,
+    /// Whether any block in it holds water.
+    pub has_water: bool,
 }
 
 impl Section {
@@ -47,6 +49,7 @@ struct RawSection<'a> {
     y: i32,
     blocks: Option<Box<[u16; 4096]>>,
     single: u16,
+    has_water: bool,
     biomes: [u16; 64],
     sky: Option<&'a [u8]>,
     block_light: Option<&'a [u8]>,
@@ -132,6 +135,7 @@ pub fn decode_chunk(
             biomes: s.biomes,
             light,
             uniform_light,
+            has_water: s.has_water,
         });
     }
     out.reverse();
@@ -192,13 +196,17 @@ fn read_section<'a>(
     cache: &mut DecodeCache,
 ) -> Result<Option<RawSection<'a>>> {
     let mut y = None;
-    let (mut blocks, mut single) = (None, AIR);
+    let (mut blocks, mut single, mut has_water) = (None, AIR, false);
     let mut biomes = [0u16; 64];
     let (mut sky, mut block_light) = (None, None);
     while let Some((tag, name)) = r.next_entry()? {
         match name {
             b"Y" => y = r.value(tag)?.as_i64(),
-            b"block_states" if tag == 10 => (blocks, single) = read_blocks(r, reg, cache)?,
+            b"block_states" if tag == 10 => {
+                (blocks, single) = read_blocks(r, reg, cache)?;
+                // What read_blocks left in the cache is this section's palette.
+                has_water = cache.ids.iter().any(|&id| reg.get(id).has_water());
+            }
             b"biomes" if tag == 10 => biomes = read_biomes(r, reg, cache)?,
             b"SkyLight" if tag == 7 => sky = Some(r.array(tag)?).filter(|a| a.len() == 2048),
             b"BlockLight" if tag == 7 => {
@@ -211,6 +219,7 @@ fn read_section<'a>(
         y: y as i32,
         blocks,
         single,
+        has_water,
         biomes,
         sky,
         block_light,

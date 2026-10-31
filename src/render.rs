@@ -455,7 +455,7 @@ impl MapCtx {
                 continue;
             }
             let path = dir.join(format!("{tx}_{tz}.tmh"));
-            let filled = volume.fill(x0, z0, &self.settings, &|cx, cz| src.get(cx, cz));
+            let filled = volume.fill(x0, z0, &self.settings, &self.reg, &|cx, cz| src.get(cx, cz));
             let encoded = if filled {
                 mesher.mesh(&volume, &self.reg, &self.settings)
             } else {
