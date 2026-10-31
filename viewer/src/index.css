@@ -233,28 +233,6 @@ button {
   font-variant-numeric: tabular-nums;
 }
 
-.slider {
-  display: grid;
-  gap: 10px;
-}
-
-.slider span {
-  display: flex;
-  justify-content: space-between;
-  color: var(--muted);
-}
-
-.slider em {
-  font-style: normal;
-  color: var(--text);
-  font-variant-numeric: tabular-nums;
-}
-
-.slider input {
-  width: 100%;
-  accent-color: var(--accent);
-}
-
 .coords {
   gap: 14px;
   padding: 7px 12px;

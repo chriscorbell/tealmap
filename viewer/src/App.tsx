@@ -1,10 +1,6 @@
-import { Activity, ChevronDown, Layers, SlidersHorizontal } from 'lucide-react'
+import { Activity, ChevronDown, Layers } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 import { type CameraState, type MapInfo, MapEngine, type Stats } from './map/engine'
-
-/** Detail steps: the largest on-screen voxel size, in CSS pixels, before switching to finer tiles. */
-const DETAIL_PX = [4, 2.5, 1.5, 1, 0.75]
-const DEFAULT_DETAIL = 3
 
 function parseHash() {
   const [id, ...nums] = location.hash.slice(1).split('/')
@@ -21,9 +17,8 @@ export default function App() {
   const [stats, setStats] = useState<Stats | null>(null)
   const [cam, setCam] = useState<CameraState>({ x: 0, y: 0, z: 0 })
   const [bench] = useState(() => new URLSearchParams(location.search).has('bench'))
-  const [panel, setPanel] = useState<'stats' | 'settings' | null>(bench ? 'stats' : null)
+  const [statsOpen, setStatsOpen] = useState(bench)
   const [menu, setMenu] = useState(false)
-  const [detail, setDetail] = useState(DEFAULT_DETAIL)
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
@@ -99,23 +94,12 @@ export default function App() {
       </header>
 
       <div className="bar top-right">
-        <button
-          className={`icon ${panel === 'settings' ? 'active' : ''}`}
-          onClick={() => setPanel((p) => (p === 'settings' ? null : 'settings'))}
-          aria-label="Settings"
-        >
-          <SlidersHorizontal size={16} />
-        </button>
-        <button
-          className={`icon ${panel === 'stats' ? 'active' : ''}`}
-          onClick={() => setPanel((p) => (p === 'stats' ? null : 'stats'))}
-          aria-label="Stats"
-        >
+        <button className={`icon ${statsOpen ? 'active' : ''}`} onClick={() => setStatsOpen((v) => !v)} aria-label="Stats">
           <Activity size={16} />
         </button>
       </div>
 
-      <section className={`panel ${panel === 'stats' ? 'open' : ''}`} aria-hidden={panel !== 'stats'}>
+      <section className={`panel ${statsOpen ? 'open' : ''}`} aria-hidden={!statsOpen}>
         {stats && (
           <dl className="stats">
             <dt>fps</dt>
@@ -140,26 +124,6 @@ export default function App() {
             <dd>{stats.gpuMB.toFixed(0)} MB</dd>
           </dl>
         )}
-      </section>
-
-      <section className={`panel ${panel === 'settings' ? 'open' : ''}`} aria-hidden={panel !== 'settings'}>
-        <label className="slider">
-          <span>
-            Detail <em>{detail + 1} / {DETAIL_PX.length}</em>
-          </span>
-          <input
-            type="range"
-            min={0}
-            max={DETAIL_PX.length - 1}
-            step={1}
-            value={detail}
-            onChange={(e) => {
-              const d = Number(e.target.value)
-              setDetail(d)
-              engineRef.current?.setDetail(DETAIL_PX[d])
-            }}
-          />
-        </label>
       </section>
 
       <footer className="bar bottom-left coords">
