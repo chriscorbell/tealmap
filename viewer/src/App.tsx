@@ -15,7 +15,7 @@ export default function App() {
   const [maps, setMaps] = useState<MapInfo[]>([])
   const [current, setCurrent] = useState<MapInfo | null>(null)
   const [stats, setStats] = useState<Stats | null>(null)
-  const [cam, setCam] = useState<CameraState>({ x: 0, y: 0, z: 0 })
+  const coordsRef = useRef<HTMLElement>(null)
   const [bench] = useState(() => new URLSearchParams(location.search).has('bench'))
   const [statsOpen, setStatsOpen] = useState(bench)
   const [menu, setMenu] = useState(false)
@@ -24,7 +24,11 @@ export default function App() {
   useEffect(() => {
     const engine = new MapEngine(canvasRef.current!, {
       onStats: setStats,
-      onCamera: (c) => setCam((p) => (Math.round(p.x) === Math.round(c.x) && Math.round(p.y) === Math.round(c.y) && Math.round(p.z) === Math.round(c.z) ? p : { ...c })),
+      // Straight to the DOM: this runs every frame the camera moves.
+      onCamera: (c: CameraState) => {
+        const values = coordsRef.current?.querySelectorAll('b')
+        if (values) [c.x, c.y, c.z].forEach((v, i) => (values[i].textContent = String(Math.round(v))))
+      },
       bench,
     })
     engineRef.current = engine
@@ -126,15 +130,15 @@ export default function App() {
         )}
       </section>
 
-      <footer className="bar bottom-left coords">
+      <footer ref={coordsRef} className="bar bottom-left coords">
         <span>
-          x <b>{Math.round(cam.x)}</b>
+          x <b>0</b>
         </span>
         <span>
-          y <b>{Math.round(cam.y)}</b>
+          y <b>0</b>
         </span>
         <span>
-          z <b>{Math.round(cam.z)}</b>
+          z <b>0</b>
         </span>
       </footer>
 

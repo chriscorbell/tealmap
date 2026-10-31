@@ -160,7 +160,14 @@ async fn map_file(
         .unwrap_or(0);
     let etag = format!("\"{:x}-{:x}\"", mtime, meta.len());
     let mut h = HeaderMap::new();
-    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    // Tiles can be used from the browser's cache for a while and revalidated in
+    // the background after that. Live updates ask for changed tiles past the cache.
+    let cache = if path.ends_with(".tmh") || path == "textures.bin" {
+        "max-age=300, stale-while-revalidate=604800"
+    } else {
+        "no-cache"
+    };
+    h.insert(header::CACHE_CONTROL, HeaderValue::from_static(cache));
     h.insert(header::ETAG, HeaderValue::from_str(&etag).unwrap());
     if req_headers
         .get(header::IF_NONE_MATCH)
@@ -172,7 +179,7 @@ async fn map_file(
     let Ok(body) = tokio::fs::read(&full).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let gz = path.ends_with(".tmh") || path == "textures.bin";
+    let gz = body.starts_with(&[0x1f, 0x8b]);
     let ctype = if path.ends_with(".json") {
         "application/json"
     } else {

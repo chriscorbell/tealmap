@@ -3,11 +3,11 @@
 A 3D web map for Minecraft worlds, in the spirit of [BlueMap](https://github.com/BlueMap-Minecraft/BlueMap), built to be fast and light.
 
 - **Zero server impact.** tealmap runs as its own process next to the server and reads region files directly from a read-only mount. Nothing runs inside the Minecraft JVM, so it can't slow ticks, grow the heap, or crash the server.
-- **Fast renders.** It's a Rust renderer with a zero-copy NBT reader, palette-level block resolution, and one tile per worker thread.
-- **Small tiles.** Each quad is 8 bytes: a block anchor plus indices into small per-tile tables of quad shapes and colors. Quads are column-coded so gzip gets them to about 1 byte each, and the GPU draws them straight from those records.
-- **Full detail at any distance.** Past the hires tiles, a voxel LOD pyramid takes over: each level halves the resolution by picking the most common visible block in every 2×2×2, and meshes that with the same mesher at a larger scale. The viewer switches to a finer level where a voxel would cover more than 4 pixels on screen, so distant terrain keeps its real shapes, textures and water.
-- **A light viewer.** The viewer is three.js on WebGL2. Tiles load in a worker, all block textures share one texture array, and frames render on demand.
-- **Live updates.** tealmap watches region files and hashes each chunk's compressed bytes to find real changes. It re-renders only the tiles affected and pushes them to open viewers over SSE. A big pass renders in batches from the middle of the map outward, so the map fills in as it goes, and a restart picks up where the pass stopped.
+- **Fast renders.** It's a Rust renderer with an allocation-free NBT walk, cached palette lookups, and masks that skip buried blocks before looking at them.
+- **Small tiles.** Equal neighboring faces merge into one quad, and each quad is 8 bytes: a block anchor and size plus indices into small per-tile tables of shapes and colors. Quads are stored plane by plane as differences, so gzip gets them to about 2 bytes each, and the GPU draws them straight from those records.
+- **Full detail at any distance.** Past the hires tiles, a voxel LOD pyramid takes over: each level halves the resolution by picking the most common visible block in every 2×2×2, and meshes that with the same mesher at a larger scale. The viewer switches to a finer level where a voxel would cover more than 4 pixels on screen, so distant terrain keeps its real shapes, textures and water. Rock nobody can see stays solid but draws nothing, and faces under the ground with no light on them aren't drawn at all.
+- **A light viewer.** The viewer draws with WebGL2 directly. All tile data lives in a few large textures, so a frame takes a handful of draw calls however many tiles it shows, and it skips faces that point away from the camera in bulk. Tiles load in workers, and frames only render when something changes, so an idle map uses no power.
+- **Live updates.** tealmap watches region files and hashes each chunk's compressed bytes to find real changes. It re-renders only the tiles affected, stops climbing the LOD pyramid as soon as a level comes out the same, and pushes what changed to open viewers over SSE. A big pass renders in batches from the middle of the map outward, so the map fills in as it goes, and a restart picks up where the pass stopped.
 
 ## How it works
 
@@ -47,6 +47,8 @@ cd viewer && pnpm install && pnpm dev           # viewer with hot reload, proxie
 ```
 
 Append `?bench` to the viewer URL to render every frame and show the stats panel. The URL hash (`#map/x/z/distance/azimuth/polar`) stores the camera.
+
+`bench/viewer.mjs` drives the viewer in headless Chrome on a real GPU and reports load, frame and GPU times. `bench/tilestats.py` breaks a rendered map down by level, group and face direction.
 
 ## Supported
 

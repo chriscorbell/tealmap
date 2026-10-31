@@ -4,7 +4,8 @@
 
 import { type DecodedTile, decodeTile } from './tile'
 
-export type Request = { kind: 'tile'; id: number; url: string } | { kind: 'abort'; id: number }
+/** `fresh` skips the browser's cache, for a tile known to have changed. */
+export type Request = { kind: 'tile'; id: number; url: string; fresh: boolean } | { kind: 'abort'; id: number }
 
 export type Response =
   | { kind: 'tile'; id: number; tile: DecodedTile | null; bytes: number }
@@ -22,7 +23,7 @@ self.onmessage = async (e: MessageEvent<Request>) => {
   const ctl = new AbortController()
   inflight.set(req.id, ctl)
   try {
-    const res = await fetch(req.url, { signal: ctl.signal })
+    const res = await fetch(req.url, { signal: ctl.signal, cache: req.fresh ? 'no-cache' : 'default' })
     if (res.status === 404) {
       post({ kind: 'tile', id: req.id, tile: null, bytes: 0 })
       return
@@ -32,7 +33,7 @@ self.onmessage = async (e: MessageEvent<Request>) => {
     const tile = decodeTile(buf)
     // Count bytes on the wire: Content-Length is the gzipped size.
     const wire = Number(res.headers.get('content-length')) || buf.byteLength
-    post({ kind: 'tile', id: req.id, tile, bytes: wire }, [tile.quads.buffer, tile.templates.buffer, tile.colors.buffer, tile.tops.buffer])
+    post({ kind: 'tile', id: req.id, tile, bytes: wire }, [tile.quads.buffer, tile.tables.buffer, tile.tops.buffer])
   } catch (err) {
     if ((err as Error).name === 'AbortError') return
     post({ kind: 'error', id: req.id, message: String(err) })

@@ -1,8 +1,8 @@
-import * as THREE from 'three'
+import { Box3, Frustum, MathUtils, Matrix4, PerspectiveCamera } from 'three'
 import { MapControls } from 'three/examples/jsm/controls/MapControls.js'
-import { type DecodedTile, GROUPS, LEAF_INTERIOR, QUAD_ROW, TABLE_ROW } from './tile'
+import { type Mesh, Pass, Renderer } from './renderer'
+import { NO_TOP } from './tile'
 import type { Request, Response } from './worker'
-import { hiresFragment, hiresVertex } from './shaders'
 
 export interface MapInfo {
   id: string
@@ -18,8 +18,10 @@ interface Manifest {
   textures: number
   /** Per region: [rx, rz, low 32 bits, high 32 bits] of the 8×8 hires tile mask. */
   hires: [number, number, number, number][]
-  /** LOD tiles as [level, x, z]; level k uses voxels of 2^k blocks. */
-  lod: [number, number, number][]
+  /** Nodes over mapped tiles that have no mesh, as [level, x, z]; level k uses voxels of 2^k blocks. */
+  lodMissing?: [number, number, number][]
+  /** Older manifests list the tiles that do have one. */
+  lod?: [number, number, number][]
   lodLevels: number
 }
 
@@ -43,22 +45,29 @@ export interface CameraState {
   z: number
 }
 
-// Colors pass through untouched: block textures and vertex shading are in
-// display space, as in Minecraft.
-THREE.ColorManagement.enabled = false
-const BG = new THREE.Color('#0b1416')
+const BG = [0x0b / 255, 0x14 / 255, 0x16 / 255]
 const TILE = 64
-const MAX_INFLIGHT = 8
+const MAX_INFLIGHT = 32
 /** Tiles swap with a dissolve: the incoming one draws the pixels the outgoing one drops. */
 const FADE_MS = 200
 const UPLOAD_BYTES_PER_FRAME = 12e6
 const LEAF_NEAR = 150
-/** Largest allowed on-screen size of a voxel, in CSS pixels, before refining. */
-const MAX_VOXEL_PX = 4
+/** Past this, plants' crossed faces are a pixel or less, and they stop drawing. */
+const PLANT_NEAR = 300
+/**
+ * Largest allowed on-screen size of a voxel per level, in CSS pixels, before
+ * refining. The coarsest levels only ever show the whole map, where a voxel of
+ * one color is all there is to see, so they get to be finer.
+ */
+const MAX_VOXEL_PX = [4, 4, 4, 4, 3]
 /** Tiles not wanted for this long are dropped. */
 const KEEP_MS = 10_000
+/** Idle frames before the loop sleeps, and how often it wakes to plan. */
+const IDLE_FRAMES = 30
+const SLEEP_MS = 1000
 
 interface Tile {
+  key: number
   level: number
   x: number
   z: number
@@ -66,18 +75,22 @@ interface Tile {
   state: 'loading' | 'ready' | 'empty' | 'failed'
   retryAt: number
   req: number
-  group: THREE.Group | null
-  gpuBytes: number
+  mesh: Mesh | null
   stale: boolean
-  /** Top surface y per column (64×64) in world blocks, NaN where empty. */
-  tops: Float32Array | null
+  /** Top surface per column (64×64) in the tile's own units, or NO_TOP where empty. */
+  tops: Int16Array | null
   lastWanted: number
   drawn: boolean
   /** Start of the current dissolve in or out, 0 when settled. */
   fadeStart: number
+  /** Camera distance, for drawing nearest first. */
+  distance: number
 }
 
-const key = (level: number, x: number, z: number) => `${level}:${x},${z}`
+/** A number per tile: coordinates of any map fit, and it hashes faster than a string. */
+const key = (level: number, x: number, z: number) => ((x + 0x200000) * 0x400000 + (z + 0x200000)) * 16 + level
+const CHILD_OFFSETS = [[0, 0], [1, 0], [0, 1], [1, 1]]
+const EMPTY_KIDS: [number, number, number][] = []
 
 class Workers {
   private workers: Worker[]
@@ -98,11 +111,11 @@ class Workers {
     })
   }
 
-  request(url: string): { id: number; done: Promise<Response> } {
+  request(url: string, fresh: boolean): { id: number; done: Promise<Response> } {
     const id = ++this.seq
     const worker = this.workers[this.next++ % this.workers.length]
     const done = new Promise<Response>((resolve) => this.pending.set(id, { resolve, worker }))
-    worker.postMessage({ kind: 'tile', id, url } satisfies Request)
+    worker.postMessage({ kind: 'tile', id, url, fresh } satisfies Request)
     return { id, done }
   }
 
@@ -120,36 +133,37 @@ class Workers {
 
 
 export class MapEngine {
-  readonly renderer: THREE.WebGLRenderer
-  readonly camera: THREE.PerspectiveCamera
+  readonly camera: PerspectiveCamera
   readonly controls: MapControls
-  private scene = new THREE.Scene()
+  private renderer: Renderer
+  private gl: WebGL2RenderingContext
   private workers = new Workers(2)
   private events: EventSource | null = null
 
   private map: MapInfo | null = null
   private manifest: Manifest | null = null
-  /** LOD tiles that have a mesh, by key. */
-  private lodSet = new Set<string>()
+  /** Hires tile masks by region, the same masks one level up per bit-grouping. */
+  private masks = new Map<number, [number, number]>()
+  /** Nodes above region size (level 4 and up), by key. */
+  private bigNodes = new Set<number>()
+  /** Top-level nodes as [x, z]. */
+  private roots: [number, number][] = []
   /**
-   * Every LOD node over some hires tile, by key, mesh or not. A sparse area
-   * can downsample to nothing at a coarse level while its hires tiles still
-   * have geometry; those nodes have no mesh but still refine.
+   * Nodes with no mesh. A sparse area can downsample to nothing at a coarse level
+   * while its hires tiles still have geometry; those nodes still refine.
    */
-  private nodes = new Set<string>()
-  private masks = new Map<string, [number, number]>()
+  private missing = new Set<number>()
   private generation = 0
-  private blockTex: THREE.DataArrayTexture | null = null
-  private materials: THREE.ShaderMaterial[] = []
-  private sharedIndex: THREE.BufferAttribute | null = null
+  private ready = false
 
-  private tiles = new Map<string, Tile>()
+  private tiles = new Map<number, Tile>()
   /** Tiles mid-dissolve. */
   private fading = new Set<Tile>()
+  /** Everything drawing or dissolving, nearest first. */
+  private visible: Tile[] = []
 
   /** Tiles waiting for their GPU upload. Each returns the bytes it uploads. */
   private uploads: (() => number)[] = []
-  private justAdded: THREE.Group[] = []
   private pendingUpdate = false
   private autoView = true
   private dirty = true
@@ -160,12 +174,27 @@ export class MapEngine {
   private frames = 0
   private frameMsAcc = 0
   private lastStats = performance.now()
+  private drawCalls = 0
+  private triangles = 0
   private onStats: (s: Stats) => void
   private onCamera: (c: CameraState) => void
   private hashTimer = 0
   private gpuTimer: GpuTimer | null = null
 
   private canvas: HTMLCanvasElement
+  private asleep = false
+  private sleepTimer = 0
+  private idleFrames = 0
+  /** Tiles the last plan wanted and didn't have. */
+  private planWants = 0
+  private wants: { level: number; x: number; z: number; d: number }[] = []
+  private wantAt = 0
+  private inflight = 0
+  // Reused every plan and frame.
+  private frustum = new Frustum()
+  private box = new Box3()
+  private viewProj = new Float32Array(16)
+  private matrix = new Matrix4()
 
   constructor(
     canvas: HTMLCanvasElement,
@@ -175,13 +204,20 @@ export class MapEngine {
     this.onStats = opts.onStats
     this.onCamera = opts.onCamera
     this.bench = opts.bench ?? false
-    this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance' })
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
-    this.renderer.outputColorSpace = THREE.LinearSRGBColorSpace
-    this.renderer.setClearColor(BG)
-    this.renderer.info.autoReset = true
+    const gl = canvas.getContext('webgl2', {
+      // On a high-density screen, edges are already fine, and multisampling
+      // takes about half the GPU's frame.
+      antialias: window.devicePixelRatio < 1.5,
+      alpha: false,
+      stencil: false,
+      powerPreference: 'high-performance',
+    })
+    if (!gl) throw new Error('WebGL2 is not available')
+    this.gl = gl
+    this.renderer = new Renderer(gl)
+    gl.clearColor(BG[0], BG[1], BG[2], 1)
 
-    this.camera = new THREE.PerspectiveCamera(55, 1, 2, 120000)
+    this.camera = new PerspectiveCamera(55, 1, 2, 120000)
     this.controls = new MapControls(this.camera, canvas)
     this.controls.enableDamping = true
     this.controls.dampingFactor = 0.12
@@ -198,30 +234,38 @@ export class MapEngine {
       this.dirty = true
       this.lastPlan = 0
       this.scheduleHash()
+      this.wake()
     })
 
-    if (this.bench) this.gpuTimer = GpuTimer.create(this.renderer.getContext() as WebGL2RenderingContext)
+    if (this.bench) this.gpuTimer = GpuTimer.create(gl)
     this.resize()
     window.addEventListener('resize', this.resize)
+    for (const event of ['pointerdown', 'wheel', 'touchstart']) canvas.addEventListener(event, this.wake, { passive: true })
     this.raf = requestAnimationFrame(this.frame)
   }
 
   dispose() {
     cancelAnimationFrame(this.raf)
+    clearTimeout(this.sleepTimer)
     window.removeEventListener('resize', this.resize)
+    for (const event of ['pointerdown', 'wheel', 'touchstart']) this.canvas.removeEventListener(event, this.wake)
     this.events?.close()
     this.clearTiles()
     this.workers.dispose()
     this.controls.dispose()
-    this.renderer.dispose()
+    this.gl.getExtension('WEBGL_lose_context')?.loseContext()
   }
 
   private resize = () => {
     const { clientWidth: w, clientHeight: h } = this.canvas
-    this.renderer.setSize(w, h, false)
+    const ratio = Math.min(window.devicePixelRatio, 2)
+    this.canvas.width = Math.floor(w * ratio)
+    this.canvas.height = Math.floor(h * ratio)
+    this.gl.viewport(0, 0, this.canvas.width, this.canvas.height)
     this.camera.aspect = w / Math.max(h, 1)
     this.camera.updateProjectionMatrix()
     this.dirty = true
+    this.wake()
   }
 
   /** Loads a map. `view` restores a camera position (e.g. from the URL). */
@@ -231,6 +275,7 @@ export class MapEngine {
     this.map = map
     // Nothing plans against the old map's manifest or textures while loading.
     this.manifest = null
+    this.ready = false
     this.pendingUpdate = false
     this.autoView = !view
     // Subscribe first so an update published while loading isn't missed.
@@ -250,52 +295,115 @@ export class MapEngine {
     const texData = new Uint8Array(await texRes.arrayBuffer())
     if (gen !== this.generation) return
     this.setManifest(manifest)
-    this.setupMaterials(texData, manifest.textures)
+    this.renderer.setBlockTextures(texData, manifest.textures)
+    this.ready = true
 
     if (view) this.placeCamera(view.x, view.z, view.dist, view.az, view.polar)
     else this.placeDefault()
     if (this.pendingUpdate) this.refreshManifest(gen)
     this.dirty = true
+    this.wake()
   }
 
   private setManifest(m: Manifest) {
     this.manifest = m
-    this.lodSet = new Set((m.lod ?? []).map(([l, x, z]) => key(l, x, z)))
-    this.masks = new Map((m.hires ?? []).map(([rx, rz, lo, hi]) => [`${rx},${rz}`, [lo, hi]]))
-    this.nodes = new Set(this.lodSet)
-    for (const [rx, rz, lo, hi] of m.hires ?? []) {
-      for (let bit = 0; bit < 64; bit++) {
-        if (!(((bit < 32 ? lo : hi) >>> (bit & 31)) & 1)) continue
-        const tx = rx * 8 + (bit & 7)
-        const tz = rz * 8 + (bit >> 3)
-        for (let l = 1; l <= m.lodLevels; l++) this.nodes.add(key(l, tx >> l, tz >> l))
+    // A level 1–3 node is a 2^(3-level) grid cell of a region's mask, so masks
+    // answer those without a set. Only nodes bigger than a region need one.
+    this.masks = new Map((m.hires ?? []).map(([rx, rz, lo, hi]) => [key(0, rx, rz), [lo, hi]]))
+    this.bigNodes = new Set()
+    this.roots = []
+    let row: [number, number][] = (m.hires ?? []).map(([rx, rz]) => [rx, rz])
+    for (let l = 4; l <= m.lodLevels; l++) {
+      const seen = new Set<number>()
+      const up: [number, number][] = []
+      for (const [x, z] of row) {
+        const px = x >> 1
+        const pz = z >> 1
+        const k = key(l, px, pz)
+        if (!seen.has(k)) {
+          seen.add(k)
+          this.bigNodes.add(k)
+          up.push([px, pz])
+        }
+      }
+      row = up
+    }
+    if (m.lodLevels >= 4) this.roots = row
+    else {
+      // Fewer levels than a region: every node at the top level is a root.
+      const seen = new Set<number>()
+      for (const [rx, rz, lo, hi] of m.hires ?? []) {
+        for (let bit = 0; bit < 64; bit++) {
+          if (!(((bit < 32 ? lo : hi) >>> (bit & 31)) & 1)) continue
+          const x = (rx * 8 + (bit & 7)) >> m.lodLevels
+          const z = (rz * 8 + (bit >> 3)) >> m.lodLevels
+          const k = key(m.lodLevels, x, z)
+          if (!seen.has(k)) {
+            seen.add(k)
+            this.roots.push([x, z])
+          }
+        }
       }
     }
+    this.missing = new Set((m.lodMissing ?? []).map(([l, x, z]) => key(l, x, z)))
+    if (m.lod) {
+      // An older manifest lists meshes instead. Everything else is missing.
+      const listed = new Set(m.lod.map(([l, x, z]) => key(l, x, z)))
+      this.forEachNode((l, x, z) => {
+        const k = key(l, x, z)
+        if (!listed.has(k)) this.missing.add(k)
+      })
+    }
     // Drop resident tiles whose mesh the manifest no longer lists.
-    for (const [k2, t] of this.tiles) {
-      const listed = t.level > 0 ? this.lodSet.has(k2) : this.exists(0, t.x, t.z)
-      if (!listed) this.dropTile(k2, t)
+    for (const t of [...this.tiles.values()]) {
+      const listed = t.level > 0 ? this.exists(t.level, t.x, t.z) && !this.missing.has(t.key) : this.exists(0, t.x, t.z)
+      if (!listed) this.dropTile(t)
     }
     this.lastPlan = 0
+  }
+
+  /** Visits every LOD node. Only for rare, whole-map work. */
+  private forEachNode(f: (level: number, x: number, z: number) => void) {
+    const m = this.manifest!
+    const walk = (level: number, x: number, z: number) => {
+      f(level, x, z)
+      if (level > 1) for (const [l, cx, cz] of this.children(level, x, z)) walk(l, cx, cz)
+    }
+    for (const [x, z] of this.roots) walk(m.lodLevels, x, z)
   }
 
   /** Starts over the mapped tile closest to the middle of everything mapped. */
   private placeDefault() {
     const m = this.manifest
     // Hires tiles always exist where anything is mapped; LOD meshes may not.
-    const tiles: [number, number][] = []
-    for (const [rx, rz, lo, hi] of m?.hires ?? []) {
-      for (let bit = 0; bit < 64; bit++) {
-        if (((bit < 32 ? lo : hi) >>> (bit & 31)) & 1) tiles.push([rx * 8 + (bit & 7), rz * 8 + (bit >> 3)])
+    const hires = m?.hires ?? []
+    if (!hires.length) return this.placeCamera(0, 0, 520, 35, 50)
+    let cx = 0
+    let cz = 0
+    let n = 0
+    const each = (f: (x: number, z: number) => void) => {
+      for (const [rx, rz, lo, hi] of hires) {
+        for (let bit = 0; bit < 64; bit++) {
+          if (((bit < 32 ? lo : hi) >>> (bit & 31)) & 1) f(rx * 8 + (bit & 7), rz * 8 + (bit >> 3))
+        }
       }
     }
-    if (!tiles.length) return this.placeCamera(0, 0, 520, 35, 50)
-    const cx = tiles.reduce((a, [x]) => a + x, 0) / tiles.length
-    const cz = tiles.reduce((a, [, z]) => a + z, 0) / tiles.length
-    let best = tiles[0]
-    for (const t of tiles) {
-      if ((t[0] - cx) ** 2 + (t[1] - cz) ** 2 < (best[0] - cx) ** 2 + (best[1] - cz) ** 2) best = t
-    }
+    each((x, z) => {
+      cx += x
+      cz += z
+      n++
+    })
+    cx /= n
+    cz /= n
+    let best = [0, 0]
+    let bestD = Infinity
+    each((x, z) => {
+      const d = (x - cx) ** 2 + (z - cz) ** 2
+      if (d < bestD) {
+        bestD = d
+        best = [x, z]
+      }
+    })
     this.placeCamera((best[0] + 0.5) * TILE, (best[1] + 0.5) * TILE, 900, 35, 50)
   }
 
@@ -308,6 +416,7 @@ export class MapEngine {
     // A map opened before its first render finished: frame it once tiles exist.
     if (wasEmpty && this.masks.size && this.autoView) this.placeDefault()
     this.dirty = true
+    this.wake()
   }
 
   get mapId() {
@@ -318,6 +427,7 @@ export class MapEngine {
     this.placeCamera(v.x, v.z, v.dist, v.az, v.polar)
     this.lastPlan = 0
     this.dirty = true
+    this.wake()
   }
 
   /** Debug summary of tile states per level. */
@@ -349,7 +459,7 @@ export class MapEngine {
     const t = this.controls.target
     const off = this.camera.position.clone().sub(t)
     const dist = off.length()
-    const polar = Math.acos(THREE.MathUtils.clamp(off.y / dist, -1, 1))
+    const polar = Math.acos(MathUtils.clamp(off.y / dist, -1, 1))
     const az = Math.atan2(off.x, off.z)
     return {
       x: Math.round(t.x),
@@ -367,47 +477,6 @@ export class MapEngine {
       const v = this.view()
       history.replaceState(null, '', `#${this.map.id}/${v.x}/${v.z}/${v.dist}/${v.az}/${v.polar}`)
     }, 400)
-  }
-
-  private setupMaterials(data: Uint8Array, layers: number) {
-    this.blockTex?.dispose()
-    this.materials.forEach((m) => m.dispose())
-    const tex = new THREE.DataArrayTexture(data, 16, 16, layers)
-    tex.format = THREE.RGBAFormat
-    tex.type = THREE.UnsignedByteType
-    tex.magFilter = THREE.NearestFilter
-    tex.minFilter = THREE.NearestMipmapLinearFilter
-    tex.wrapS = tex.wrapT = THREE.RepeatWrapping
-    tex.generateMipmaps = true
-    tex.anisotropy = Math.min(8, this.renderer.capabilities.getMaxAnisotropy())
-    tex.colorSpace = THREE.NoColorSpace
-    tex.needsUpdate = true
-    this.blockTex = tex
-
-    const shared = {
-      uTex: { value: tex },
-      uFogColor: { value: BG },
-      uFogRange: { value: new THREE.Vector2(4000, 9000) },
-    }
-    const make = (defines: Record<string, string>, extra: THREE.ShaderMaterialParameters = {}) =>
-      new THREE.ShaderMaterial({
-        glslVersion: THREE.GLSL3,
-        vertexShader: hiresVertex,
-        fragmentShader: hiresFragment,
-        uniforms: { ...shared, uAppear: { value: 1 }, uFade: { value: 0 } },
-        defines,
-        ...extra,
-      })
-    this.materials = [
-      make({}),
-      make({ CUTOUT: '' }),
-      make({ TRANSLUCENT: '' }, { transparent: true, depthWrite: false }),
-    ]
-  }
-
-  private fogRange(): THREE.Vector2 {
-    const d = this.camera.position.distanceTo(this.controls.target)
-    return new THREE.Vector2(d * 4 + 3000, d * 9 + 12000)
   }
 
   private listen() {
@@ -453,22 +522,32 @@ export class MapEngine {
     }
     this.lastPlan = 0
     this.dirty = true
+    this.wake()
   }
 
   // ---------------------------------------------------------------- planning
 
   private exists(level: number, x: number, z: number): boolean {
-    if (level > 0) return this.nodes.has(key(level, x, z))
-    const rx = Math.floor(x / 8)
-    const rz = Math.floor(z / 8)
-    const mask = this.masks.get(`${rx},${rz}`)
-    const bit = (z - rz * 8) * 8 + (x - rx * 8)
-    return !!mask && ((mask[bit >> 5] >>> (bit & 31)) & 1) === 1
+    if (level > 3) return this.bigNodes.has(key(level, x, z))
+    // A node at level l is a block of 2^l × 2^l bits in its region's 8×8 mask.
+    const shift = 3 - level
+    const mask = this.masks.get(key(0, x >> shift, z >> shift))
+    if (!mask) return false
+    const cx = x - ((x >> shift) << shift)
+    const cz = z - ((z >> shift) << shift)
+    const span = 1 << level
+    for (let bz = cz * span; bz < (cz + 1) * span; bz++) {
+      for (let bx = cx * span; bx < (cx + 1) * span; bx++) {
+        const bit = bz * 8 + bx
+        if ((mask[bit >> 5] >>> (bit & 31)) & 1) return true
+      }
+    }
+    return false
   }
 
   private children(level: number, x: number, z: number): [number, number, number][] {
     const out: [number, number, number][] = []
-    for (const [dx, dz] of [[0, 0], [1, 0], [0, 1], [1, 1]]) {
+    for (const [dx, dz] of CHILD_OFFSETS) {
       if (this.exists(level - 1, x * 2 + dx, z * 2 + dz)) out.push([level - 1, x * 2 + dx, z * 2 + dz])
     }
     return out
@@ -481,31 +560,34 @@ export class MapEngine {
    */
   private plan(now: number) {
     const m = this.manifest
-    if (!m || !this.blockTex) return
+    if (!m || !this.ready) return
     const cam = this.camera.position
     // Pixels per block at distance 1.
-    const k = this.canvas.clientHeight / (2 * Math.tan(THREE.MathUtils.degToRad(this.camera.fov / 2)))
-    const frustum = new THREE.Frustum().setFromProjectionMatrix(
-      new THREE.Matrix4().multiplyMatrices(this.camera.projectionMatrix, this.camera.matrixWorldInverse),
-    )
-    const box = new THREE.Box3()
+    const k = this.canvas.clientHeight / (2 * Math.tan(MathUtils.degToRad(this.camera.fov / 2)))
+    this.camera.updateMatrixWorld()
+    this.frustum.setFromProjectionMatrix(this.matrix.multiplyMatrices(this.camera.projectionMatrix, this.camera.matrixWorldInverse))
+    const frustum = this.frustum
+    const box = this.box
     const draw = new Set<Tile>()
     const want: { level: number; x: number; z: number; d: number }[] = []
+    const missing = this.missing
 
-    const meshed = (level: number, x: number, z: number) => level === 0 || this.lodSet.has(key(level, x, z))
+    const meshed = (level: number, x: number, z: number) => level === 0 || !missing.has(key(level, x, z))
     const needs = (t: Tile | undefined) => !t || t.stale || (t.state === 'failed' && now >= t.retryAt)
     // Settled: loaded at least once (an old mesh counts while it refreshes),
     // confirmed empty, or a node with no mesh to load.
     const settled = (l: number, x: number, z: number) => {
       if (!meshed(l, x, z)) return true
       const t = this.tiles.get(key(l, x, z))
-      return !!t && (!!t.group || t.state === 'empty')
+      return !!t && (!!t.mesh || t.state === 'empty')
     }
     const visit = (level: number, x: number, z: number, sibling: boolean) => {
       const size = TILE << level
-      box.min.set(x * size, m.minY, z * size)
-      box.max.set((x + 1) * size, m.maxY, (z + 1) * size)
       const tile = this.tiles.get(key(level, x, z))
+      // A loaded tile knows how tall it really is, which beats the world's height
+      // both for culling and for how close the camera really is.
+      box.min.set(x * size, tile?.mesh ? tile.mesh.minY : m.minY, z * size)
+      box.max.set((x + 1) * size, tile?.mesh ? tile.mesh.maxY : m.maxY, (z + 1) * size)
       const inView = frustum.intersectsBox(box)
       // Off-screen siblings of drawn tiles stay loaded: dropping one would make
       // its parent unsettled and swap the whole group back to coarse. Other
@@ -514,7 +596,7 @@ export class MapEngine {
       if (!inView) return
       const d = Math.max(box.distanceToPoint(cam), 1)
       if (meshed(level, x, z) && needs(tile)) want.push({ level, x, z, d })
-      const kids = level > 0 && ((1 << level) * k) / d > MAX_VOXEL_PX ? this.children(level, x, z) : []
+      const kids = level > 0 && ((1 << level) * k) / d > (MAX_VOXEL_PX[level] ?? 2) ? this.children(level, x, z) : EMPTY_KIDS
       if (kids.length) {
         if (kids.every(([l, kx, kz]) => settled(l, kx, kz))) {
           for (const [l, kx, kz] of kids) visit(l, kx, kz, true)
@@ -527,14 +609,12 @@ export class MapEngine {
         }
       }
       // Anything with a mesh draws, including an old one while it refreshes.
-      if (tile?.group) draw.add(tile)
+      if (tile?.mesh) {
+        tile.distance = d
+        draw.add(tile)
+      }
     }
-    for (const n of this.nodes) {
-      const [l, rest] = n.split(':')
-      if (Number(l) !== m.lodLevels) continue
-      const [x, z] = rest.split(',').map(Number)
-      visit(m.lodLevels, x, z, false)
-    }
+    for (const [x, z] of this.roots) visit(m.lodLevels, x, z, false)
 
     // Swap what's drawn, dissolving tiles in and out.
     for (const t of this.tiles.values()) {
@@ -543,25 +623,36 @@ export class MapEngine {
         t.drawn = on
         t.fadeStart = now
         this.fading.add(t)
-        if (on && t.group) t.group.visible = true
       }
     }
+    this.visible = [...draw]
+    for (const t of this.fading) if (!t.drawn && t.mesh) this.visible.push(t)
+    this.visible.sort((a, b) => a.distance - b.distance)
 
     // Drop tiles that haven't been wanted for a while.
-    for (const [k2, t] of this.tiles) {
-      if (!t.drawn && now - t.lastWanted > KEEP_MS && !this.fading.has(t)) this.dropTile(k2, t)
+    for (const t of [...this.tiles.values()]) {
+      if (!t.drawn && now - t.lastWanted > KEEP_MS && !this.fading.has(t)) this.dropTile(t)
     }
 
     // Requests: coarse levels first so there's always something to show, then nearest.
     let inflight = 0
     for (const t of this.tiles.values()) if (t.state === 'loading') inflight++
+    this.planWants = want.length
     want.sort((a, b) => b.level - a.level || a.d - b.d)
-    for (const w of want) {
-      if (inflight >= MAX_INFLIGHT) break
+    this.wants = want
+    this.wantAt = 0
+    this.inflight = inflight
+    this.requestMore(now)
+  }
+
+  /** Starts the next wanted tiles, up to the limit. Runs whenever one finishes. */
+  private requestMore(now: number) {
+    while (this.inflight < MAX_INFLIGHT && this.wantAt < this.wants.length) {
+      const w = this.wants[this.wantAt++]
       const t = this.tiles.get(key(w.level, w.x, w.z))
       if (t?.state === 'loading') continue
       this.loadTile(w.level, w.x, w.z, now)
-      inflight++
+      this.inflight++
     }
   }
 
@@ -574,36 +665,41 @@ export class MapEngine {
       level === 0
         ? `/maps/${this.map!.id}/hires/${Math.floor(x / 8)}_${Math.floor(z / 8)}/${x}_${z}.tmh`
         : `/maps/${this.map!.id}/lod/${level}/${x}_${z}.tmh`
-    const { id, done } = this.workers.request(url)
     const existing = this.tiles.get(k2)
+    const { id, done } = this.workers.request(url, !!existing?.stale)
     const tile: Tile = existing ?? {
+      key: k2,
       level,
       x,
       z,
       state: 'loading',
       retryAt: 0,
       req: id,
-      group: null,
-      gpuBytes: 0,
+      mesh: null,
       stale: false,
       tops: null,
       lastWanted: now,
       drawn: false,
       fadeStart: 0,
+      distance: 0,
     }
     tile.req = id
     tile.stale = false
     if (!existing) this.tiles.set(k2, tile)
     tile.state = 'loading'
+    const current = () => gen === this.generation && this.tiles.get(k2) === tile && tile.req === id
     done.then((res) => {
-      if (gen !== this.generation || this.tiles.get(k2) !== tile || tile.req !== id) return
-      // Refill the request slot on the next frame instead of the next plan tick.
+      if (!current()) return
+      // Refill the request slot right away, rather than waiting for a frame.
+      this.inflight--
+      this.requestMore(performance.now())
       this.lastPlan = 0
+      this.wake()
       if (res.kind === 'error') {
-        console.warn(`tile ${k2}: ${res.message}`)
+        console.warn(`tile ${level}:${x},${z}: ${res.message}`)
         // Keep an old mesh; with nothing to show, retry later instead of
         // treating the tile as empty and leaving a hole.
-        if (tile.group) tile.state = 'ready'
+        if (tile.mesh) tile.state = 'ready'
         else {
           tile.state = 'failed'
           tile.retryAt = performance.now() + 5000
@@ -614,158 +710,57 @@ export class MapEngine {
       this.downloaded += res.bytes
       if (!res.tile) {
         this.fading.delete(tile)
-        if (tile.group) this.disposeGroup(tile.group)
-        tile.group = null
-        tile.gpuBytes = 0
+        if (tile.mesh) this.renderer.release(tile.mesh)
+        tile.mesh = null
         tile.tops = null
         tile.state = 'empty'
         this.dirty = true
         return
       }
       const decoded = res.tile
-      const { group, bytes } = this.buildTile(decoded, level)
-      // Three uploads geometry the first time it's drawn. Queue the tile so each
-      // frame uploads only a bounded amount; it counts as loading until then.
+      // Each frame uploads only a bounded amount; the tile counts as loading until then.
       this.uploads.push(() => {
-        if (gen !== this.generation || this.tiles.get(k2) !== tile || tile.req !== id) {
-          this.disposeGroup(group)
+        if (!current()) return 0
+        let mesh = this.renderer.upload(decoded, level)
+        // The pools are full: make room from tiles nothing is drawing.
+        while (!mesh && this.evictOne(tile)) mesh = this.renderer.upload(decoded, level)
+        if (!mesh) {
+          tile.state = tile.mesh ? 'ready' : 'failed'
+          tile.retryAt = performance.now() + 1000
           return 0
         }
-        const old = tile.group
-        tile.group = group
-        tile.gpuBytes = bytes
-        tile.tops = decoded.tops.map((v) => (Number.isNaN(v) ? v : v * (1 << level)))
+        if (tile.mesh) this.renderer.release(tile.mesh)
+        tile.mesh = mesh
+        tile.tops = decoded.tops
         tile.state = 'ready'
-        group.visible = tile.drawn
-        this.setFade(tile, tile.drawn ? 1 : 0, 0)
-        this.scene.add(group)
-        // Three uploads geometry only for meshes it draws, so draw this one
-        // once regardless of the frustum to keep its upload in this frame's budget.
-        group.visible = true
-        for (const c of group.children) c.frustumCulled = false
-        this.justAdded.push(group)
-        if (old) this.disposeGroup(old)
         this.lastPlan = 0
         this.dirty = true
-        return bytes
+        return decoded.quads.byteLength + decoded.tables.byteLength
       })
     })
   }
 
-  private dropTile(k2: string, tile: Tile) {
+  /** Frees the longest-unwanted tile that isn't being drawn. */
+  private evictOne(except: Tile): boolean {
+    let oldest: Tile | null = null
+    for (const t of this.tiles.values()) {
+      if (t === except || t.drawn || !t.mesh || this.fading.has(t)) continue
+      if (!oldest || t.lastWanted < oldest.lastWanted) oldest = t
+    }
+    if (!oldest) return false
+    this.dropTile(oldest)
+    return true
+  }
+
+  private dropTile(tile: Tile) {
     if (tile.state === 'loading') this.workers.abort(tile.req)
     this.fading.delete(tile)
-    if (tile.group) this.disposeGroup(tile.group)
-    this.tiles.delete(k2)
+    if (tile.mesh) this.renderer.release(tile.mesh)
+    tile.mesh = null
+    const i = this.visible.indexOf(tile)
+    if (i >= 0) this.visible.splice(i, 1)
+    this.tiles.delete(tile.key)
     this.dirty = true
-  }
-
-  private disposeGroup(g: THREE.Group) {
-    this.scene.remove(g)
-    for (const c of g.children) {
-      const geo = (c as THREE.Mesh).geometry
-      // The index is shared between tiles; detach it so dispose keeps it.
-      geo.setIndex(null)
-      geo.dispose()
-    }
-    for (const m of g.userData.materials as THREE.Material[]) m.dispose()
-    for (const t of g.userData.textures as THREE.Texture[]) t.dispose()
-  }
-
-  /** Dissolve state: draw pixels whose noise is below `appear` and not below `fade`. */
-  private setFade(tile: Tile, appear: number, fade: number) {
-    for (const m of (tile.group?.userData.materials ?? []) as THREE.ShaderMaterial[]) {
-      m.uniforms.uAppear.value = appear
-      m.uniforms.uFade.value = fade
-    }
-  }
-
-  private indexFor(quads: number): THREE.BufferAttribute {
-    if (!this.sharedIndex || this.sharedIndex.count < quads * 6) {
-      let cap = 1 << 16
-      while (cap < quads) cap *= 2
-      const idx = new Uint32Array(cap * 6)
-      for (let q = 0, v = 0, i = 0; q < cap; q++, v += 4) {
-        idx[i++] = v
-        idx[i++] = v + 1
-        idx[i++] = v + 2
-        idx[i++] = v
-        idx[i++] = v + 2
-        idx[i++] = v + 3
-      }
-      this.sharedIndex = new THREE.BufferAttribute(idx, 1)
-    }
-    return this.sharedIndex
-  }
-
-  private buildTile(t: DecodedTile, level: number): { group: THREE.Group; bytes: number } {
-    const dataTex = (
-      data: Uint32Array | Uint16Array | Uint8Array,
-      w: number,
-      h: number,
-      format: THREE.PixelFormat,
-      type: THREE.TextureDataType,
-      internal: THREE.PixelFormatGPU | null,
-    ) => {
-      const tex = new THREE.DataTexture(data, w, h, format, type)
-      tex.internalFormat = internal
-      tex.magFilter = tex.minFilter = THREE.NearestFilter
-      tex.generateMipmaps = false
-      tex.flipY = false
-      tex.colorSpace = THREE.NoColorSpace
-      tex.needsUpdate = true
-      return tex
-    }
-    const quads = dataTex(t.quads, QUAD_ROW, t.quadRows, THREE.RGIntegerFormat, THREE.UnsignedIntType, 'RG32UI')
-    const templates = dataTex(t.templates, TABLE_ROW, t.templateRows, THREE.RGBAIntegerFormat, THREE.UnsignedShortType, 'RGBA16UI')
-    const colors = dataTex(t.colors, TABLE_ROW, t.colorRows, THREE.RGBAFormat, THREE.UnsignedByteType, null)
-    // One material per pass for this tile; the program and shared uniforms are reused.
-    const materials = this.materials.map((base) => {
-      const m = base.clone()
-      m.uniforms = {
-        ...base.uniforms,
-        uQuads: { value: quads },
-        uTpl: { value: templates },
-        uPal: { value: colors },
-        uAppear: { value: 1 },
-        uFade: { value: 0 },
-      }
-      return m
-    })
-    const [minQ, maxQ] = [t.minQ, t.maxQ]
-    const sphere = new THREE.Sphere(
-      new THREE.Vector3(33 * 64, (minQ + maxQ) / 2, 33 * 64),
-      Math.hypot(33 * 64, 33 * 64, (maxQ - minQ) / 2),
-    )
-    // A level-k tile is in voxels of 2^k blocks: scale its anchor space to blocks.
-    const s = 1 << level
-    const group = new THREE.Group()
-    let start = 0
-    for (let g = 0; g < GROUPS; g++) {
-      const n = t.counts[g]
-      if (n > 0) {
-        const geo = new THREE.BufferGeometry()
-        geo.setIndex(this.indexFor(start + n))
-        geo.setDrawRange(start * 6, n * 6)
-        geo.boundingSphere = sphere
-        // Leaf interiors draw with the cutout pass; translucent is the last group.
-        const pass = g === LEAF_INTERIOR ? 1 : Math.min(g, 2)
-        const mesh = new THREE.Mesh(geo, materials[pass])
-        mesh.position.set(t.origin[0] * s, t.origin[1] * s, t.origin[2] * s)
-        mesh.scale.setScalar(s / 64)
-        mesh.renderOrder = pass
-        mesh.matrixAutoUpdate = false
-        mesh.updateMatrix()
-        if (g === LEAF_INTERIOR) group.userData.leafInterior = mesh
-        group.add(mesh)
-      }
-      start += n
-    }
-    group.userData.materials = materials
-    group.userData.textures = [quads, templates, colors]
-    group.matrixAutoUpdate = false
-    const bytes = t.quads.byteLength + t.templates.byteLength + t.colors.byteLength
-    return { group, bytes }
   }
 
   /** Terrain height under a point, from the finest loaded tile there. */
@@ -779,12 +774,26 @@ export class MapEngine {
       const cx = Math.floor(((x - tx * size) / size) * 64)
       const cz = Math.floor(((z - tz * size) / size) * 64)
       const h = t.tops[cz * 64 + cx]
-      if (!Number.isNaN(h)) return h
+      if (h !== NO_TOP) return h * (1 << level)
     }
     return null
   }
 
   // ---------------------------------------------------------------- frame
+
+  private sleepTick = () => {
+    this.plan(performance.now())
+    if (this.planWants || this.dirty) this.wake()
+    else this.sleepTimer = window.setTimeout(this.sleepTick, SLEEP_MS)
+  }
+
+  private wake = () => {
+    clearTimeout(this.sleepTimer)
+    this.idleFrames = 0
+    if (!this.asleep) return
+    this.asleep = false
+    this.raf = requestAnimationFrame(this.frame)
+  }
 
   private frame = (now: number) => {
     this.raf = requestAnimationFrame(this.frame)
@@ -805,36 +814,26 @@ export class MapEngine {
       budget -= this.uploads.shift()!()
     }
 
+    // A finished dissolve changes which tiles are visible, so this comes before planning.
+    for (const tile of this.fading) {
+      if (now - tile.fadeStart >= FADE_MS) {
+        this.fading.delete(tile)
+        tile.fadeStart = 0
+        if (!tile.drawn) this.lastPlan = 0
+      }
+      this.dirty = true
+    }
+
     if (now - this.lastPlan > 150) {
       this.lastPlan = now
       this.plan(now)
     }
 
-    // Dissolves: incoming tiles draw the pixels outgoing ones drop.
-    for (const tile of this.fading) {
-      const k = Math.min(1, (now - tile.fadeStart) / FADE_MS)
-      if (tile.drawn) this.setFade(tile, k, 0)
-      else this.setFade(tile, 1, k)
-      if (k >= 1) {
-        this.fading.delete(tile)
-        if (!tile.drawn && tile.group) tile.group.visible = false
-      }
-      this.dirty = true
-    }
-
-    if (moved || this.dirty || this.bench) {
-      this.gateLeaves()
-      const fog = this.fogRange()
-      for (const m of this.materials) (m.uniforms.uFogRange.value as THREE.Vector2).copy(fog)
+    const drawing = moved || this.dirty || this.bench
+    if (drawing) {
       const t0 = performance.now()
       const q = this.gpuTimer?.begin()
-      this.renderer.render(this.scene, this.camera)
-      for (const g of this.justAdded) {
-        for (const c of g.children) c.frustumCulled = true
-        const tile = [...this.tiles.values()].find((x) => x.group === g)
-        g.visible = !!tile && (tile.drawn || this.fading.has(tile))
-      }
-      this.justAdded = []
+      this.drawFrame(now)
       if (q) this.gpuTimer!.end(q)
       this.frameMsAcc += performance.now() - t0
       this.frames++
@@ -843,12 +842,9 @@ export class MapEngine {
     }
 
     if (now - this.lastStats > 1000) {
-      const info = this.renderer.info.render
-      let gpu = this.blockTex && this.manifest ? this.manifest.textures * 1024 * 1.34 : 0
       const levels = Array.from({ length: (this.manifest?.lodLevels ?? 0) + 1 }, () => 0)
       let pending = 0
       for (const tile of this.tiles.values()) {
-        gpu += tile.gpuBytes
         if (tile.drawn) levels[tile.level]++
         if (tile.state === 'loading') pending++
       }
@@ -856,38 +852,73 @@ export class MapEngine {
         fps: (this.frames * 1000) / (now - this.lastStats),
         frameMs: this.frames ? this.frameMsAcc / this.frames : 0,
         gpuMs: this.gpuTimer?.p95() ?? null,
-        calls: info.calls,
-        triangles: info.triangles,
+        calls: this.drawCalls,
+        triangles: this.triangles,
         levels,
         pending,
         downloadedMB: this.downloaded / 1e6,
-        gpuMB: gpu / 1e6,
+        gpuMB: this.renderer.gpuBytes / 1e6,
       })
       this.frames = 0
       this.frameMsAcc = 0
       this.lastStats = now
     }
+
+    // With nothing to do, stop asking for frames, so an idle map costs no power.
+    // A slow timer keeps planning, for retries and expiring tiles.
+    if (!drawing && !this.uploads.length && !this.fading.size && !this.planWants) {
+      if (++this.idleFrames > IDLE_FRAMES) {
+        this.asleep = true
+        cancelAnimationFrame(this.raf)
+        this.sleepTimer = window.setTimeout(this.sleepTick, SLEEP_MS)
+      }
+    } else this.idleFrames = 0
   }
 
-  /**
-   * Leaf faces that touch other leaves only show up close; past LEAF_NEAR the
-   * outer faces already cover them, so they're skipped.
-   */
-  private gateLeaves() {
+  /** Builds this frame's draw list, nearest tiles first, and draws it. */
+  private drawFrame(now: number) {
+    const r = this.renderer
     const cam = this.camera.position
-    for (const tile of this.tiles.values()) {
-      const mesh = tile.group?.userData.leafInterior as THREE.Mesh | undefined
-      if (!mesh) continue
-      const size = TILE << tile.level
-      const dx = Math.max(tile.x * size - cam.x, 0, cam.x - (tile.x + 1) * size)
-      const dz = Math.max(tile.z * size - cam.z, 0, cam.z - (tile.z + 1) * size)
-      mesh.visible = Math.hypot(dx, dz) < LEAF_NEAR
+    const camera = [cam.x, cam.y, cam.z]
+    const dissolve = (t: Tile) => {
+      if (!t.fadeStart) return 1
+      const k = Math.min(1, (now - t.fadeStart) / FADE_MS)
+      return t.drawn ? k : -k
     }
+    r.begin()
+    r.startPass(Pass.Opaque)
+    for (const t of this.visible) if (!t.fadeStart) r.add(Pass.Opaque, t.mesh!, camera, false, 1)
+    r.startPass(Pass.OpaqueFade)
+    for (const t of this.visible) if (t.fadeStart) r.add(Pass.OpaqueFade, t.mesh!, camera, false, dissolve(t))
+    r.startPass(Pass.Cutout)
+    for (const t of this.visible) {
+      // Leaf faces that touch other leaves only show up close; past LEAF_NEAR the
+      // outer faces already cover them.
+      const size = TILE << t.level
+      const dx = Math.max(t.x * size - cam.x, 0, cam.x - (t.x + 1) * size)
+      const dz = Math.max(t.z * size - cam.z, 0, cam.z - (t.z + 1) * size)
+      const near = Math.hypot(dx, dz)
+      r.add(Pass.Cutout, t.mesh!, camera, near < LEAF_NEAR, dissolve(t), near < PLANT_NEAR)
+    }
+    r.startPass(Pass.Translucent)
+    for (const t of this.visible) r.add(Pass.Translucent, t.mesh!, camera, false, dissolve(t))
+
+    // The view without its translation; positions reach the shader camera-relative.
+    this.camera.updateMatrixWorld()
+    const m = this.matrix.copy(this.camera.matrixWorldInverse)
+    m.elements[12] = m.elements[13] = m.elements[14] = 0
+    m.premultiply(this.camera.projectionMatrix)
+    this.viewProj.set(m.elements)
+    const d = cam.distanceTo(this.controls.target)
+    const { calls, triangles } = r.draw(this.viewProj, camera, BG, [d * 4 + 3000, d * 9 + 12000])
+    this.drawCalls = calls
+    this.triangles = triangles
   }
 
   private clearTiles() {
-    for (const [k2, t] of this.tiles) this.dropTile(k2, t)
+    for (const t of [...this.tiles.values()]) this.dropTile(t)
     this.tiles.clear()
+    this.visible = []
     this.uploads = []
   }
 }

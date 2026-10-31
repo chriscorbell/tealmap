@@ -13,16 +13,18 @@
 //! so on. A change only rebuilds the tile's ancestors.
 
 use crate::mesh::{Settings, TILE, Volume};
-use crate::model::{AIR, BlockInfo, Registry};
+use crate::model::{AIR, BlockInfo, F_LAVA, F_WATER, HIDDEN_NAME, Registry};
 use anyhow::{Result, bail};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-pub const LEVELS: u32 = 4;
-/// Minimum solid children (of 8) for a voxel to be solid, per level. A low
-/// bar keeps thin things (trunks, spikes, walls) from vanishing as levels
-/// compound; the screen-space test keeps the slight fattening to a few pixels.
-const MIN_SOLID: [u8; LEVELS as usize + 1] = [0, 2, 2, 2, 2];
+pub const LEVELS: u32 = 7;
+/// Minimum solid children (of 8) for a voxel to be solid. A low bar keeps thin
+/// things (trunks, spikes, walls) from vanishing as levels compound; the
+/// screen-space test keeps the slight fattening to a few pixels.
+const MIN_SOLID: u8 = 2;
+/// The first level whose fluid surfaces sit at their real height.
+const REAL_FLUID_HEIGHT_LEVEL: u32 = 5;
 /// Columns per LOD tile side.
 pub const N: usize = TILE as usize;
 
@@ -120,6 +122,7 @@ pub fn from_volume(v: &Volume, reg: &Registry, min_y: i32, max_y: i32) -> Grid {
     let h = (max_y - min_y) as usize;
     let mut g = Grid::empty(N, h, min_y);
     let infos = reg.snapshot();
+    let hidden = reg.id(HIDDEN_NAME, &mut []);
     // Bottom up, so each column ends with the biome of its top block.
     for vy in 1..v.h.saturating_sub(1) {
         let wy = v.y0 + vy as i32;
@@ -131,10 +134,16 @@ pub fn from_volume(v: &Volume, reg: &Registry, min_y: i32, max_y: i32) -> Grid {
             for x in 0..N {
                 let (vx, vz) = (x + 1, z + 1);
                 let id = v.block(vx, vy, vz);
-                if id == AIR || !infos[id as usize].lod_counts || v.cave(vx, vy, vz) {
+                if id == AIR || !infos[id as usize].lod_counts {
                     continue;
                 }
                 let col = z * N + x;
+                // Removed blocks stay solid here. As air, they'd expose the
+                // underside of everything above them.
+                if v.cave(vx, vy, vz) || v.in_the_dark(vx, vy, vz) {
+                    g.states[col * h + y] = hidden;
+                    continue;
+                }
                 g.states[col * h + y] = id;
                 g.biomes[col] = v.biome(vx, vy, vz);
             }
@@ -147,10 +156,11 @@ pub fn from_volume(v: &Volume, reg: &Registry, min_y: i32, max_y: i32) -> Grid {
 /// `min_solid` of its 8 children are, and takes the state that's most common
 /// among them, counting children on the surface (open above) three times so
 /// the top of the terrain wins over what's under it.
-pub fn downsample(src: &Grid, reg: &Registry, min_solid: u8) -> Grid {
+pub fn downsample(src: &Grid, reg: &Registry, min_solid: u8, level: u32) -> Grid {
     let (w, h) = (src.w / 2, src.h.div_ceil(2));
     let mut out = Grid::empty(w, h, src.y0.div_euclid(2));
     let infos = reg.snapshot();
+    let hidden = reg.id(HIDDEN_NAME, &mut []);
     let mut votes: Vec<(u16, u32)> = Vec::with_capacity(8);
     for z in 0..w {
         for x in 0..w {
@@ -159,12 +169,22 @@ pub fn downsample(src: &Grid, reg: &Registry, min_solid: u8) -> Grid {
                 let c = (z * 2 + dz) * src.w + x * 2 + dx;
                 &src.states[c * src.h..(c + 1) * src.h]
             });
-            for y in 0..h {
+            // Everything above the tallest child column is air.
+            let tallest = columns
+                .iter()
+                .map(|c| c.iter().rposition(|&s| s != AIR).map_or(0, |y| y + 1))
+                .max()
+                .unwrap();
+            for y in 0..tallest.div_ceil(2) {
                 let (cy0, cy1) = (y * 2, y * 2 + 1);
-                // Most voxels are empty; settle those without voting.
+                // Most voxels are empty or buried; settle those without voting.
                 let bottom = columns.map(|c| c[cy0]);
                 let top = columns.map(|c| c.get(cy1).copied().unwrap_or(AIR));
                 if bottom == [AIR; 4] && top == [AIR; 4] {
+                    continue;
+                }
+                if bottom == [hidden; 4] && top == [hidden; 4] {
+                    out.states[col * h + y] = hidden;
                     continue;
                 }
                 votes.clear();
@@ -177,6 +197,9 @@ pub fn downsample(src: &Grid, reg: &Registry, min_solid: u8) -> Grid {
                         continue;
                     }
                     solid += 1;
+                    if s == hidden {
+                        continue;
+                    }
                     // Votes count the space a block fills, doubled on the surface.
                     let above = column.get(cy + 1).copied().unwrap_or(AIR);
                     let surface = if above == AIR { 2 } else { 1 };
@@ -187,10 +210,20 @@ pub fn downsample(src: &Grid, reg: &Registry, min_solid: u8) -> Grid {
                     }
                 }
                 if solid >= min_solid {
-                    out.states[col * h + y] = pick(&votes, &infos, reg);
+                    // Anything visible beats rock that's out of sight.
+                    let state = if votes.is_empty() {
+                        hidden
+                    } else {
+                        pick(&votes, &infos, reg)
+                    };
+                    out.states[col * h + y] = if level >= REAL_FLUID_HEIGHT_LEVEL {
+                        fluid_at_real_height(state, &columns, y, &infos, reg)
+                    } else {
+                        state
+                    };
                 }
             }
-            // The biome of the child column with the most solid voxels.
+            // The biome of the child column with the most visible voxels.
             let kids =
                 [(0, 0), (1, 0), (0, 1), (1, 1)].map(|(dx, dz)| (z * 2 + dz) * src.w + x * 2 + dx);
             let best = kids
@@ -198,7 +231,7 @@ pub fn downsample(src: &Grid, reg: &Registry, min_solid: u8) -> Grid {
                 .max_by_key(|&&c| {
                     let n = src.states[c * src.h..(c + 1) * src.h]
                         .iter()
-                        .filter(|&&s| s != AIR)
+                        .filter(|&&s| s != AIR && s != hidden)
                         .count();
                     (n, std::cmp::Reverse(c))
                 })
@@ -207,6 +240,59 @@ pub fn downsample(src: &Grid, reg: &Registry, min_solid: u8) -> Grid {
         }
     }
     out
+}
+
+/// How much of its space a fluid fills, in ninths, the way the mesher reads it.
+fn fluid_ninths(info: &BlockInfo) -> usize {
+    match info.fluid_level as usize {
+        0 | 8.. => 8,
+        level => 8 - level,
+    }
+}
+
+/// A voxel of fluid would otherwise fill its whole height, putting the surface
+/// up to half a voxel too high, and differently per level. On the coarsest
+/// levels that's dozens of blocks, and neighbors drawn at different levels would
+/// show a gap between their surfaces. So there, a surface voxel takes the fluid
+/// level that matches how full its children really are. Finer levels leave it:
+/// a lower surface would uncover banks that are out of sight now.
+fn fluid_at_real_height(
+    state: u16,
+    columns: &[&[u16]; 4],
+    y: usize,
+    infos: &[&BlockInfo],
+    reg: &Registry,
+) -> u16 {
+    // Picking can mint a new state, which `infos` doesn't have yet.
+    let info = reg.get(state);
+    if !info.is_fluid() {
+        return state;
+    }
+    let same = |s: u16| infos[s as usize].flags & info.flags & (F_WATER | F_LAVA) != 0;
+    // How full a child is, in ninths: all the way under more fluid, else its level.
+    let fullness = |cy: usize| {
+        columns
+            .iter()
+            .filter(|c| c.get(cy).is_some_and(|&s| same(s)))
+            .map(|c| {
+                if c.get(cy + 1).is_some_and(|&s| same(s)) {
+                    9
+                } else {
+                    fluid_ninths(infos[c[cy] as usize])
+                }
+            })
+            .max()
+    };
+    let ninths = match fullness(y * 2 + 1) {
+        // The upper half has fluid: the lower half is full under it.
+        Some(top) => (9 + top) / 2,
+        None => fullness(y * 2).map_or(8, |bottom| bottom / 2),
+    };
+    if ninths >= 8 {
+        return state;
+    }
+    let (name, ninths) = (&info.name, ninths.max(1));
+    reg.id(name, &mut [("level".to_owned(), (8 - ninths).to_string())])
 }
 
 const CHILDREN: [(usize, usize, usize); 8] = [
@@ -275,9 +361,22 @@ pub fn source_path(out: &Path, level: u32, x: i32, z: i32) -> PathBuf {
 
 const SRC_MAGIC: &[u8; 4] = b"TLS1";
 
-/// Saves a source grid as column runs, with state keys and biome names in
-/// per-file tables, so it can be read back by another process.
-pub fn save_source(path: &Path, g: &Grid, reg: &Registry) -> Result<()> {
+/// Saves a source grid, or removes it if there's none. Returns whether the file changed.
+pub fn write_source(path: &Path, g: Option<&Grid>, reg: &Registry) -> Result<bool> {
+    let Some(g) = g else {
+        return match std::fs::remove_file(path) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e.into()),
+        };
+    };
+    let bytes = encode_source(g, reg);
+    crate::render::write_if_changed(path, &bytes)
+}
+
+/// A source grid as column runs, with state keys and biome names in per-file
+/// tables, so it can be read back by another process.
+fn encode_source(g: &Grid, reg: &Registry) -> Vec<u8> {
     let mut keys: Vec<&str> = Vec::new();
     let mut key_ids: HashMap<u16, u16> = HashMap::new();
     let mut names: Vec<&str> = Vec::new();
@@ -331,7 +430,7 @@ pub fn save_source(path: &Path, g: &Grid, reg: &Registry) -> Result<()> {
     out.extend_from_slice(&body);
     let mut gz = Vec::new();
     crate::render::gzip_into(&out, &mut gz);
-    crate::render::write_atomic(path, &gz)
+    gz
 }
 
 pub fn load_source(path: &Path, reg: &Registry) -> Result<Option<Grid>> {
@@ -460,13 +559,13 @@ pub fn build_tile(
     } else {
         None
     };
-    let parent = (level < LEVELS).then(|| downsample(&core, reg, MIN_SOLID[level as usize + 1]));
+    let parent = (level < LEVELS).then(|| downsample(&core, reg, MIN_SOLID, level + 1));
     Ok((tile, parent.filter(|g| !g.is_empty())))
 }
 
 /// The level 1 source a hires tile leaves: its blocks, downsampled once.
 pub fn hires_source(v: &Volume, reg: &Registry, min_y: i32, max_y: i32) -> Option<Grid> {
-    let g = downsample(&from_volume(v, reg, min_y, max_y), reg, MIN_SOLID[1]);
+    let g = downsample(&from_volume(v, reg, min_y, max_y), reg, MIN_SOLID, 1);
     (!g.is_empty()).then_some(g)
 }
 
@@ -489,20 +588,57 @@ mod tests {
             g.states[c * 4 + 3] = grass;
         }
         g.states[3 * 4] = stone;
-        let d = downsample(&g, &reg, 4);
+        let d = downsample(&g, &reg, 4, 1);
         assert_eq!((d.w, d.h), (1, 2));
         // Bottom voxel: 7 stone of 8. Top voxel: 3 stone + 3 grass of 8, and
         // grass is on the surface, so it wins.
         assert_eq!(d.states, vec![stone, grass]);
         // With a higher bar, the top voxel (6 of 8) still stays; 7 of 8 drops it.
-        assert_eq!(downsample(&g, &reg, 7).states, vec![stone, AIR]);
+        assert_eq!(downsample(&g, &reg, 7, 1).states, vec![stone, AIR]);
     }
 
     #[test]
     fn bounds_align_to_the_coarsest_voxel() {
-        assert_eq!(bounds(-64, 320), (-64, 320));
-        assert_eq!(bounds(-64, 319), (-64, 320));
-        assert_eq!(bounds(-60, 300), (-64, 304));
+        assert_eq!(bounds(-64, 320), (-128, 384));
+        assert_eq!(bounds(-128, 319), (-128, 384));
+        assert_eq!(bounds(-60, 300), (-128, 384));
+    }
+
+    #[test]
+    fn fluid_surfaces_stay_at_their_real_height() {
+        let reg = Registry::new(Baker::new(AssetFiles::new()));
+        let water = reg.id("minecraft:water", &mut []);
+        // Four columns of water two blocks deep, in a grid four blocks high.
+        let mut g = Grid::empty(2, 4, 0);
+        for c in 0..4 {
+            g.states[c * 4..c * 4 + 2].fill(water);
+        }
+        let d = downsample(&g, &reg, 2, REAL_FLUID_HEIGHT_LEVEL);
+        // The first voxel holds all of it, and it's nearly full, like water is.
+        assert_eq!(d.states[1], AIR);
+        assert_eq!(d.states[0], water);
+        // One level up, the same water only half fills its voxel.
+        let mut g2 = Grid::empty(2, 2, 0);
+        for c in 0..4 {
+            g2.states[c * 2] = d.states[0];
+        }
+        let up = downsample(&g2, &reg, 2, REAL_FLUID_HEIGHT_LEVEL);
+        assert_eq!(reg.get(up.states[0]).fluid_level, 4);
+        assert_eq!(fluid_ninths(reg.get(up.states[0])), 4);
+        // Finer levels keep the voxel full.
+        assert_eq!(downsample(&g2, &reg, 2, 1).states[0], water);
+    }
+
+    #[test]
+    fn hidden_voxels_stay_solid_but_lose_every_vote() {
+        let reg = Registry::new(Baker::new(AssetFiles::new()));
+        let stone = reg.id("minecraft:stone", &mut []);
+        let hidden = reg.id(HIDDEN_NAME, &mut []);
+        let mut g = Grid::empty(2, 4, 0);
+        // Bottom voxel all hidden; top voxel seven hidden and one stone.
+        g.states.fill(hidden);
+        g.states[3] = stone;
+        assert_eq!(downsample(&g, &reg, 2, 1).states, vec![hidden, stone]);
     }
 
     #[test]
@@ -527,7 +663,9 @@ mod tests {
         g.biomes = vec![reg.baker.biomes.id("minecraft:plains"), 0, 0, 0];
         let dir = std::env::temp_dir().join(format!("tealmap-lod-{}", std::process::id()));
         let path = dir.join("src.bin");
-        save_source(&path, &g, &reg).unwrap();
+        assert!(write_source(&path, Some(&g), &reg).unwrap());
+        // Writing the same grid again leaves the file alone.
+        assert!(!write_source(&path, Some(&g), &reg).unwrap());
         // A fresh registry gets different ids; keys still map back.
         let reg2 = Registry::new(Baker::new(AssetFiles::new()));
         reg2.id("minecraft:dirt", &mut []);

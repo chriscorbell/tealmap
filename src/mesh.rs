@@ -6,34 +6,48 @@
 //! Tile format (little-endian, gzip on disk). A tile is a list of quads, and
 //! each quad is an integer block anchor plus a shape ("template": four corner
 //! offsets, UVs and a texture layer) and a color from small per-tile tables.
-//! Quads are grouped by column and stored as byte planes, which gzip squeezes
-//! to about one byte per quad. The viewer draws them straight from these
-//! records by vertex pulling.
+//! Neighboring faces that look the same merge into one quad that stretches its
+//! template over several blocks. Quads are stored by render group and face
+//! direction, so the viewer can skip whole directions that face away from the
+//! camera, and coded plane by plane as byte planes of differences, which gzip
+//! squeezes well. The viewer draws them straight from these records by vertex
+//! pulling.
 //!
 //! ```text
-//! 0   magic "TMH2"
+//! 0   magic "TMH3"
 //! 4   i32 origin x, y, z            block coords of anchor (0, 0, 0)
 //! 16  u16 min qy, u16 max qy        bounds, 1/64 block from origin y
-//! 20  4 × u32 quad count            opaque, cutout, leaf interior, translucent
-//! 36  u32 templates T, u32 colors P
-//! 44  T × 21 u16 templates          4 × corner (x, y, z) in 1/64 block + 64,
-//!                                   4 × (u, v) in 1/4096 texture, layer
-//!     P × u32 colors                r, g, b, sky << 4 | block light
-//!     per group:
-//!       W × W column counts         u16 as a low-byte then a high-byte plane
-//!       n × y step                  u16 planes; y runs down from 1023 per column
+//! 20  4 × 7 × u32 quad count        per group (opaque, cutout, leaf interior,
+//!                                   translucent) and direction (down, up, north,
+//!                                   south, west, east, other)
+//! 132 u32 templates T, u32 colors P
+//! 140 22 × T × u16 templates        one plane per field, low bytes then high:
+//!                                   4 × corner (x, y, z) in 1/64 block + 64,
+//!                                   4 × (u, v) in 1/4096 texture, layer, stretch
+//!     P × 3 colors                  r, g, b planes
+//!     per stream, n quads sorted by plane (the block coordinate along the face
+//!     normal), then v, then u, the axes the quad stretches along:
+//!       n × plane step              u16 planes; plane minus the previous plane
+//!       n × v step                  u16 planes; v minus the previous v in this plane
+//!       n × u step                  u8; u minus the previous u in this row
+//!       n × w - 1, n × h - 1        u8, blocks along u and v
 //!       n × template index          u16 planes
 //!       n × color index             u16 planes
 //! ```
 //!
-//! Quads are ordered by column (z, then x) and descending y within a column.
+//! The u and v of a stream are x and y (north, south), z and y (west, east), or
+//! x and z (everything else), with y, x, z or y left as the plane. Stretch: bits
+//! 0-3 mark the corners at the far end of u, bits 4-7 those at the far end of v,
+//! and bits 8-15 hold the UV steps per block along u and then v, as (u, v) pairs
+//! of 2-bit codes (0 back a texture, 1 none, 2 forward).
+//!
 //! Leaf faces that touch other leaves form their own group, so the viewer can
 //! skip them at a distance, where they can't be seen.
 
 use crate::biome::BiomeColors;
 use crate::model::{
     AIR, BlockInfo, DIR_VEC, DOWN, EAST, F_CULL_SAME, F_LEAVES, Layer, NORTH, Quad, QuadShape,
-    Registry, SOUTH, Tint, UP, WEST, opposite,
+    Registry, SOUTH, Tint, UP, WEST, merge_axes, opposite,
 };
 use crate::world::Chunk;
 use rustc_hash::FxHashMap;
@@ -46,8 +60,15 @@ const STRIDE_Y: usize = W * W;
 /// Biome cells (4×4×4 blocks) per volume side: 16 per tile plus the halo's.
 const BIOME_W: usize = TILE as usize / 4 + 2;
 const GROUPS: usize = 4;
+/// Face directions a stream can hold: six block faces and everything else.
+const DIRS: usize = 7;
 /// The group for leaf faces that touch other leaves.
 const LEAF_INTERIOR: usize = 2;
+/// The most blocks a merged quad spans along one axis.
+const MAX_RUN: u16 = 64;
+/// Tile tables never grow past these; see [`Mesher::encode`].
+const MAX_TEMPLATES: usize = 1 << 13;
+const MAX_COLORS: usize = 1 << 13;
 
 pub struct Settings {
     pub min_y: i32,
@@ -76,9 +97,11 @@ pub struct Volume {
     per_column_biomes: bool,
     /// Per column (W×W): ocean floor y, or i32::MIN when caves can't be detected.
     floor: Vec<i32>,
-    /// Below `caves_below`: a voxel's light ORed with its six neighbors'.
+    /// A voxel's light ORed with its six neighbors', for finding caves.
     lit: Vec<u8>,
     caves_below: i32,
+    /// Removes unlit faces under the surface; off when cave removal is off.
+    remove_dark: bool,
 }
 
 impl Volume {
@@ -95,6 +118,7 @@ impl Volume {
             floor: Vec::new(),
             lit: Vec::new(),
             caves_below: i32::MIN,
+            remove_dark: false,
         }
     }
 
@@ -207,7 +231,9 @@ impl Volume {
                 }
             }
         }
-        self.build_lit(settings.remove_caves_below_y);
+        self.caves_below = settings.remove_caves_below_y;
+        self.remove_dark = settings.remove_caves_below_y > settings.min_y;
+        self.build_lit();
         true
     }
 
@@ -269,6 +295,7 @@ impl Volume {
         self.floor.resize(W * W, i32::MIN);
         self.lit.clear();
         self.caves_below = i32::MIN;
+        self.remove_dark = false;
         let infos = reg.snapshot();
         for vz in 0..W {
             for vx in 0..W {
@@ -299,12 +326,10 @@ impl Volume {
         true
     }
 
-    /// For each voxel below `below`, ORs its light with its neighbors', a row
-    /// at a time so it vectorizes. Halo columns have no neighbor outside the
-    /// volume on that side.
-    fn build_lit(&mut self, below: i32) {
-        self.caves_below = below;
-        let layers = below.saturating_sub(self.y0).clamp(0, self.h as i32 - 1) as usize;
+    /// For each voxel, ORs its light with its neighbors', a row at a time so it
+    /// vectorizes. Halo columns have no neighbor outside the volume on that side.
+    fn build_lit(&mut self) {
+        let layers = self.h - 1;
         self.lit.clear();
         self.lit.resize(layers * W * W, 0);
         let l = &self.light;
@@ -359,18 +384,36 @@ impl Volume {
     #[inline]
     pub fn cave(&self, vx: usize, vy: usize, vz: usize) -> bool {
         let wy = self.y0 + vy as i32;
-        if wy >= self.caves_below {
-            return false;
-        }
+        wy < self.caves_below
+            && self.under_surface(vx, vz, wy)
+            && self.lit[self.idx(vx, vy, vz)] >> 4 == 0
+    }
+
+    /// Whether a block is below the surface and nothing around it has any light:
+    /// not sky, not a torch. Nobody can see it, at any height.
+    #[inline]
+    pub fn in_the_dark(&self, vx: usize, vy: usize, vz: usize) -> bool {
+        self.remove_dark
+            && self.under_surface(vx, vz, self.y0 + vy as i32)
+            && self.lit[self.idx(vx, vy, vz)] == 0
+    }
+
+    /// Whether a face this dark is one nobody can see. A seabed's stays: water
+    /// doesn't block the view.
+    #[inline]
+    fn dark_face(&self, light: u8, vx: usize, vy: usize, vz: usize) -> bool {
+        light == 0 && self.remove_dark && self.under_surface(vx, vz, self.y0 + vy as i32)
+    }
+
+    #[inline]
+    fn under_surface(&self, vx: usize, vz: usize, wy: i32) -> bool {
         let floor = self.floor[vz * W + vx];
-        if floor == i32::MIN || wy >= floor - 1 {
-            return false;
-        }
-        self.lit[self.idx(vx, vy, vz)] >> 4 == 0
+        floor != i32::MIN && wy < floor - 1
     }
 }
 
 /// One quad in a tile: a sort key (column, then top down), its template and color.
+#[derive(Clone, Copy)]
 struct Rec {
     key: u32,
     template: u32,
@@ -397,6 +440,29 @@ impl Rec {
     }
 }
 
+/// A quad of a stream, in the field order streams sort by.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Cell {
+    plane: u16,
+    v: u16,
+    u: u16,
+    template: u32,
+    color: u32,
+    w: u16,
+    h: u16,
+}
+
+/// A run of equal faces along u, growing along v.
+#[derive(Clone, Copy)]
+struct Run {
+    template: u32,
+    color: u32,
+    u: u16,
+    w: u16,
+    v0: u16,
+    h: u16,
+}
+
 /// Per-state flags read for every voxel.
 const IS_OCCLUDER: u8 = 1;
 const ALWAYS_CULLED: u8 = 2;
@@ -404,6 +470,10 @@ const DRAWS_NOTHING: u8 = 4;
 
 pub struct Mesher {
     groups: [Vec<Rec>; GROUPS],
+    /// The final quads, merged where possible.
+    streams: [[Vec<Cell>; DIRS]; GROUPS],
+    /// Faces waiting to merge, per direction: sorted, they sit row by row.
+    faces: [Vec<Cell>; DIRS],
     min_qy: u16,
     max_qy: u16,
     /// Flags per state id; the array size spares every lookup a bounds check.
@@ -417,9 +487,7 @@ pub struct Mesher {
     open_above: Vec<bool>,
     /// Fluid faces, baked on first use. See [`fluid_slot`].
     fluid_quads: Vec<Option<Quad>>,
-    /// Per template id: the tile it was last used in, and its table index there.
-    template_slots: Vec<(u32, u16)>,
-    tile_stamp: u32,
+    template_ids: FxHashMap<u32, u16>,
     color_ids: FxHashMap<u32, u16>,
 }
 
@@ -449,6 +517,8 @@ impl Mesher {
     pub fn new() -> Self {
         Mesher {
             groups: Default::default(),
+            streams: Default::default(),
+            faces: Default::default(),
             min_qy: u16::MAX,
             max_qy: 0,
             flags: vec![0; 65536].into_boxed_slice().try_into().unwrap(),
@@ -457,8 +527,7 @@ impl Mesher {
             run_top: vec![i32::MAX; W * W],
             open_above: vec![true; W * W],
             fluid_quads: vec![None; 2 * 6 * 10 * 10],
-            template_slots: Vec::new(),
-            tile_stamp: 0,
+            template_ids: FxHashMap::default(),
             color_ids: FxHashMap::default(),
         }
     }
@@ -466,10 +535,10 @@ impl Mesher {
     /// Marks voxels the mesher can skip: those that draw nothing, and those whose
     /// faces are all culled by six occluding neighbors. A row at a time, so the
     /// neighbor test vectorizes.
-    fn find_skippable(&mut self, v: &Volume, infos: &[&BlockInfo]) {
+    fn find_skippable(&mut self, v: &Volume, infos: &[&BlockInfo], lod: bool) {
         for (id, info) in infos.iter().enumerate() {
             let mut f = 0;
-            if info.occludes == 0x3f {
+            if info.occludes == 0x3f || (lod && info.flags & F_LEAVES != 0) {
                 f |= IS_OCCLUDER;
             }
             if info.always_culled {
@@ -521,7 +590,7 @@ impl Mesher {
 
         let infos = reg.snapshot();
         let biomes = reg.baker.biomes.snapshot();
-        self.find_skippable(v, &infos);
+        self.find_skippable(v, &infos, s.lod);
         self.run_top.fill(i32::MAX);
         self.open_above.fill(true);
 
@@ -567,7 +636,14 @@ impl Mesher {
                         top = self.run_top[col];
                     }
 
-                    let quads = info.variant(wx, wy, wz);
+                    // At LOD scale a voxel is a few pixels: which way its texture
+                    // is turned can't be seen, and one variant merges better.
+                    let quads = if s.lod {
+                        info.first_variant()
+                    } else {
+                        info.variant(wx, wy, wz)
+                    };
+                    let solid_leaves = s.lod && info.flags & F_LEAVES != 0;
                     let mut tint: Option<[u8; 3]> = None;
                     for q in quads {
                         if let Some(d) = q.cull {
@@ -577,7 +653,11 @@ impl Mesher {
                             let n = neighbor(i, d);
                             let nid = v.blocks[n];
                             let ninfo = infos[nid as usize];
-                            if ninfo.occludes & (1 << opposite(d)) != 0 {
+                            // LOD leaves are solid cubes: they draw with no alpha
+                            // and hide what's behind them.
+                            if ninfo.occludes & (1 << opposite(d)) != 0
+                                || (s.lod && ninfo.flags & F_LEAVES != 0)
+                            {
                                 if border && wy >= top - (SKIRT - 1) && outward(vx, vz, d) {
                                     // Skirt: kept against a solid neighbor, lit as if open.
                                     let color = if q.tinted {
@@ -585,7 +665,8 @@ impl Mesher {
                                     } else {
                                         [255, 255, 255]
                                     };
-                                    self.emit(q, base, color, 0xf0, group_of(q.layer));
+                                    let group = if solid_leaves { 0 } else { group_of(q.layer) };
+                                    self.emit(q, base, color, 0xf0, group);
                                 }
                                 continue;
                             }
@@ -596,6 +677,9 @@ impl Mesher {
                             }
                         }
                         let light = face_light(v, i, q);
+                        if v.dark_face(light, vx, vy, vz) {
+                            continue;
+                        }
                         let color = if q.tinted {
                             *tint.get_or_insert_with(|| {
                                 tint_color(info, biomes[v.biome(vx, vy, vz) as usize])
@@ -604,6 +688,7 @@ impl Mesher {
                             [255, 255, 255]
                         };
                         let group = match q.cull {
+                            _ if solid_leaves => 0,
                             Some(d)
                                 if info.flags & F_LEAVES != 0
                                     && infos[v.blocks[neighbor(i, d)] as usize].flags
@@ -625,7 +710,8 @@ impl Mesher {
                         } else {
                             biomes[v.biome(vx, vy, vz) as usize].water
                         };
-                        self.fluid(v, &infos, reg, i, lava, tex, base, color);
+                        let dark = |light| v.dark_face(light, vx, vy, vz);
+                        self.fluid(v, &infos, reg, i, lava, tex, base, color, &dark);
                     }
                 }
             }
@@ -684,6 +770,9 @@ impl Mesher {
                     {
                         continue;
                     }
+                    if v.dark_face(v.light[n], vx, vy, vz) {
+                        continue;
+                    }
                     let wx = v.x0 + vx as i32 - 1;
                     let wz = v.z0 + vz as i32 - 1;
                     let base = [wx - origin[0], wy - origin[1], wz - origin[2]];
@@ -718,7 +807,7 @@ impl Mesher {
             (color[0] as f32 * f) as u8,
             (color[1] as f32 * f) as u8,
             (color[2] as f32 * f) as u8,
-            light,
+            0,
         ]);
         let qy = |o: u16| (base[1] * 64 + o as i32 - 64).clamp(0, 65535) as u16;
         self.min_qy = self.min_qy.min(qy(q.y_range.0));
@@ -737,6 +826,7 @@ impl Mesher {
         tex: u16,
         base: [i32; 3],
         color: [u8; 3],
+        dark: &dyn Fn(u8) -> bool,
     ) {
         let same = |n: usize| {
             let b = infos[v.blocks[n] as usize];
@@ -785,6 +875,9 @@ impl Mesher {
             } else {
                 v.light[n].max(v.light[i])
             };
+            if dark(light) {
+                continue;
+            }
             let slot = fluid_slot(lava, d, height, lo);
             if self.fluid_quads[slot].is_none() {
                 self.fluid_quads[slot] = Some(fluid_quad(reg, lava, d, height, lo, tex));
@@ -795,84 +888,236 @@ impl Mesher {
         }
     }
 
+    /// Merges equal neighboring faces in group `g` into `streams[g]`: first
+    /// along u within each row, then equal runs across consecutive rows.
+    fn merge_group(&mut self, reg: &Registry, g: usize) {
+        for d in 0..DIRS {
+            self.streams[g][d].clear();
+            self.faces[d].clear();
+        }
+        for r in &self.groups[g] {
+            let info = reg.baker.template_info(r.template);
+            let d = info.dir as usize;
+            let p = [r.x() as u16, r.y(), r.z() as u16];
+            let (u, v) = merge_axes(info.dir);
+            let cell = Cell {
+                plane: p[3 - u - v],
+                v: p[v],
+                u: p[u],
+                template: r.template,
+                color: r.color,
+                w: 1,
+                h: 1,
+            };
+            if info.merge_u || info.merge_v {
+                self.faces[d].push(cell);
+            } else {
+                self.streams[g][d].push(cell);
+            }
+        }
+        let shape = |c: &Run| (c.template, c.color, c.u);
+        let (mut prev, mut cur): (Vec<Run>, Vec<Run>) = (Vec::new(), Vec::new());
+        for d in 0..DIRS {
+            let mut faces = std::mem::take(&mut self.faces[d]);
+            // Row by row, with equal shapes next to each other.
+            faces.sort_unstable_by_key(|c| (c.plane, c.v, c.template, c.color, c.u));
+            let out = &mut self.streams[g][d];
+            let finish = |plane: u16, r: &Run, out: &mut Vec<Cell>| {
+                out.push(Cell {
+                    plane,
+                    v: r.v0,
+                    u: r.u,
+                    template: r.template,
+                    color: r.color,
+                    w: r.w,
+                    h: r.h,
+                });
+            };
+            let mut i = 0;
+            while i < faces.len() {
+                let plane = faces[i].plane;
+                prev.clear();
+                let mut prev_v = u16::MAX - 1;
+                while i < faces.len() && faces[i].plane == plane {
+                    let v = faces[i].v;
+                    cur.clear();
+                    while i < faces.len() && faces[i].plane == plane && faces[i].v == v {
+                        let c = faces[i];
+                        let info = reg.baker.template_info(c.template);
+                        i += 1;
+                        let mut w = 1;
+                        if info.merge_u {
+                            while i < faces.len()
+                                && (faces[i].plane, faces[i].v) == (plane, v)
+                                && (faces[i].template, faces[i].color) == (c.template, c.color)
+                                && faces[i].u == c.u + w
+                                && w < MAX_RUN
+                            {
+                                w += 1;
+                                i += 1;
+                            }
+                        }
+                        cur.push(Run {
+                            template: c.template,
+                            color: c.color,
+                            u: c.u,
+                            w,
+                            v0: v,
+                            h: 1,
+                        });
+                    }
+                    // Both rows are sorted by shape, so they can be walked together.
+                    // Runs that match one in the row before grow it; the others
+                    // are finished.
+                    let touching = v == prev_v + 1;
+                    let mut p = 0;
+                    for run in &mut cur {
+                        while touching && p < prev.len() && shape(&prev[p]) < shape(run) {
+                            finish(plane, &prev[p], out);
+                            p += 1;
+                        }
+                        if touching
+                            && p < prev.len()
+                            && shape(&prev[p]) == shape(run)
+                            && prev[p].w == run.w
+                            && prev[p].h < MAX_RUN
+                            && reg.baker.template_info(run.template).merge_v
+                        {
+                            run.v0 = prev[p].v0;
+                            run.h = prev[p].h + 1;
+                            p += 1;
+                        }
+                    }
+                    for r in &prev[p..] {
+                        finish(plane, r, out);
+                    }
+                    std::mem::swap(&mut prev, &mut cur);
+                    prev_v = v;
+                }
+                for r in &prev {
+                    finish(plane, r, out);
+                }
+            }
+            self.faces[d] = faces;
+        }
+    }
+
     fn encode(&mut self, reg: &Registry, origin: [i32; 3]) -> Vec<u8> {
-        // Canonical order: by column, then top down. Ties keep emit order,
-        // which is itself deterministic.
-        for g in &mut self.groups {
-            g.sort_by_key(|r| r.key);
+        for g in 0..GROUPS {
+            self.merge_group(reg, g);
         }
         // Per-tile tables, numbered in order of first use.
-        self.tile_stamp += 1;
-        let stamp = self.tile_stamp;
+        self.template_ids.clear();
         self.color_ids.clear();
         let mut templates: Vec<u32> = Vec::new();
         let mut colors: Vec<u32> = Vec::new();
-        let mut refs: Vec<Vec<(u16, u16)>> = Vec::with_capacity(GROUPS);
-        for g in &self.groups {
-            let mut group_refs = Vec::with_capacity(g.len());
-            for r in g {
-                let id = r.template as usize;
-                if id >= self.template_slots.len() {
-                    self.template_slots.resize(id + 1, (0, 0));
-                }
-                let slot = &mut self.template_slots[id];
-                if slot.0 != stamp {
-                    *slot = (stamp, templates.len() as u16);
+        let mut quads = 0;
+        for stream in self.streams.iter_mut().flatten() {
+            // Sorting by every field makes the order canonical.
+            stream.sort_unstable();
+            quads += stream.len();
+            for r in stream.iter() {
+                self.template_ids.entry(r.template).or_insert_with(|| {
                     templates.push(r.template);
-                }
-                let c = *self.color_ids.entry(r.color).or_insert_with(|| {
+                    (templates.len() - 1) as u16
+                });
+                self.color_ids.entry(r.color).or_insert_with(|| {
                     colors.push(r.color);
                     (colors.len() - 1) as u16
                 });
-                group_refs.push((slot.1, c));
             }
-            refs.push(group_refs);
+        }
+        // The quad records have 13 bits for each table index. A tile that needs
+        // more is beyond anything real terrain produces; it draws wrong colors
+        // or shapes rather than failing the whole render.
+        if templates.len() > MAX_TEMPLATES || colors.len() > MAX_COLORS {
+            tracing::warn!(
+                "tile at {origin:?} has {} templates and {} colors; some quads will look wrong",
+                templates.len(),
+                colors.len()
+            );
         }
 
-        let quads: usize = self.groups.iter().map(|g| g.len()).sum();
         let mut out =
-            Vec::with_capacity(64 + templates.len() * 42 + quads * 6 + GROUPS * 2 * W * W);
-        out.extend_from_slice(b"TMH2");
+            Vec::with_capacity(140 + templates.len() * 44 + colors.len() * 3 + quads * 10);
+        out.extend_from_slice(b"TMH3");
         for o in origin {
             out.extend_from_slice(&o.to_le_bytes());
         }
         out.extend_from_slice(&self.min_qy.to_le_bytes());
         out.extend_from_slice(&self.max_qy.to_le_bytes());
-        for g in &self.groups {
-            out.extend_from_slice(&(g.len() as u32).to_le_bytes());
+        for stream in self.streams.iter().flatten() {
+            out.extend_from_slice(&(stream.len() as u32).to_le_bytes());
         }
         out.extend_from_slice(&(templates.len() as u32).to_le_bytes());
         out.extend_from_slice(&(colors.len() as u32).to_le_bytes());
-        for &t in &templates {
-            for v in reg.baker.template(t).iter() {
-                out.extend_from_slice(&v.to_le_bytes());
+        let field = |id: u32, k: usize| {
+            if k < 21 {
+                reg.baker.template(id)[k]
+            } else {
+                reg.baker.template_info(id).stretch
             }
-        }
-        for c in &colors {
-            out.extend_from_slice(&c.to_le_bytes());
-        }
-        let planes = |out: &mut Vec<u8>, vals: &[u16]| {
-            out.extend(vals.iter().map(|v| *v as u8));
-            out.extend(vals.iter().map(|v| (*v >> 8) as u8));
         };
-        for (g, r) in self.groups.iter().zip(&refs) {
-            let mut counts = vec![0u16; W * W];
-            for q in g {
-                counts[q.z() * W + q.x()] += 1;
+        for k in 0..22 {
+            out.extend(templates.iter().map(|&t| field(t, k) as u8));
+            out.extend(templates.iter().map(|&t| (field(t, k) >> 8) as u8));
+        }
+        for channel in 0..3 {
+            out.extend(colors.iter().map(|c| c.to_le_bytes()[channel]));
+        }
+        let planes = |out: &mut Vec<u8>, vals: &mut dyn Iterator<Item = u16>, n: usize| {
+            let start = out.len();
+            out.resize(start + 2 * n, 0);
+            let (lo, hi) = out[start..].split_at_mut(n);
+            for (i, v) in vals.enumerate() {
+                lo[i] = v as u8;
+                hi[i] = (v >> 8) as u8;
             }
-            planes(&mut out, &counts);
-            let mut steps = Vec::with_capacity(g.len());
-            let mut prev = (usize::MAX, usize::MAX, 1023u16);
-            for q in g {
-                if (q.z(), q.x()) != (prev.0, prev.1) {
-                    prev = (q.z(), q.x(), 1023);
-                }
-                steps.push(prev.2 - q.y());
-                prev.2 = q.y();
-            }
-            planes(&mut out, &steps);
-            planes(&mut out, &r.iter().map(|x| x.0).collect::<Vec<_>>());
-            planes(&mut out, &r.iter().map(|x| x.1).collect::<Vec<_>>());
+        };
+        for stream in self.streams.iter().flatten() {
+            let n = stream.len();
+            let mut last = 0;
+            planes(
+                &mut out,
+                &mut stream.iter().map(|q| {
+                    let d = q.plane - last;
+                    last = q.plane;
+                    d
+                }),
+                n,
+            );
+            let mut last = (u16::MAX, 0);
+            planes(
+                &mut out,
+                &mut stream.iter().map(|q| {
+                    let d = if q.plane == last.0 { q.v - last.1 } else { q.v };
+                    last = (q.plane, q.v);
+                    d
+                }),
+                n,
+            );
+            let mut last = (u16::MAX, u16::MAX, 0);
+            out.extend(stream.iter().map(|q| {
+                let d = if (q.plane, q.v) == (last.0, last.1) {
+                    q.u - last.2
+                } else {
+                    q.u
+                };
+                last = (q.plane, q.v, q.u);
+                d as u8
+            }));
+            out.extend(stream.iter().map(|q| (q.w - 1) as u8));
+            out.extend(stream.iter().map(|q| (q.h - 1) as u8));
+            planes(
+                &mut out,
+                &mut stream.iter().map(|q| self.template_ids[&q.template]),
+                n,
+            );
+            planes(
+                &mut out,
+                &mut stream.iter().map(|q| self.color_ids[&q.color]),
+                n,
+            );
         }
         out
     }
@@ -968,65 +1213,104 @@ fn neighbor(i: usize, d: u8) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::assets::AssetFiles;
+    use crate::model::{Baker, Template};
 
-    /// Decodes a TMH2 tile back to (group, x, y, z, template, color) per quad.
-    fn decode(t: &[u8]) -> Vec<(usize, u8, u16, u8, crate::model::Template, u32)> {
-        let u16_at = |o: usize| u16::from_le_bytes([t[o], t[o + 1]]);
+    /// A quad decoded back from a tile.
+    #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+    struct Decoded {
+        group: usize,
+        dir: usize,
+        x: u16,
+        y: u16,
+        z: u16,
+        w: u16,
+        h: u16,
+        template: Template,
+        stretch: u16,
+        color: u32,
+    }
+
+    fn decode(t: &[u8]) -> Vec<Decoded> {
         let u32_at = |o: usize| u32::from_le_bytes(t[o..o + 4].try_into().unwrap());
-        assert_eq!(&t[..4], b"TMH2");
-        let counts: Vec<usize> = (0..4).map(|g| u32_at(20 + g * 4) as usize).collect();
-        let (nt, np) = (u32_at(36) as usize, u32_at(40) as usize);
-        let mut o = 44;
-        let templates: Vec<crate::model::Template> = (0..nt)
-            .map(|i| std::array::from_fn(|k| u16_at(o + i * 42 + k * 2)))
+        assert_eq!(&t[..4], b"TMH3");
+        let (nt, np) = (u32_at(132) as usize, u32_at(136) as usize);
+        let mut o = 140;
+        let field = |o: usize, i: usize| t[o + i] as u16 | (t[o + nt + i] as u16) << 8;
+        let templates: Vec<(Template, u16)> = (0..nt)
+            .map(|i| {
+                (
+                    std::array::from_fn(|k| field(o + k * 2 * nt, i)),
+                    field(o + 21 * 2 * nt, i),
+                )
+            })
             .collect();
-        o += nt * 42;
-        let colors: Vec<u32> = (0..np).map(|i| u32_at(o + i * 4)).collect();
-        o += np * 4;
+        o += nt * 44;
+        let colors: Vec<u32> = (0..np)
+            .map(|i| u32::from_le_bytes([t[o + i], t[o + np + i], t[o + 2 * np + i], 0]))
+            .collect();
+        o += np * 3;
         let mut out = Vec::new();
-        for (g, &n) in counts.iter().enumerate() {
-            let plane =
-                |o: usize, len: usize, i: usize| t[o + i] as u16 | (t[o + len + i] as u16) << 8;
-            let (cols, steps, tpls, cols_idx) = (
+        for s in 0..GROUPS * DIRS {
+            let n = u32_at(20 + s * 4) as usize;
+            let (planes, vs, us, ws, hs, tpls, cols) = (
                 o,
-                o + 2 * W * W,
-                o + 2 * W * W + 2 * n,
-                o + 2 * W * W + 4 * n,
+                o + 2 * n,
+                o + 4 * n,
+                o + 5 * n,
+                o + 6 * n,
+                o + 7 * n,
+                o + 9 * n,
             );
-            let mut q = 0;
-            for z in 0..W {
-                for x in 0..W {
-                    let mut y = 1023u16;
-                    for _ in 0..plane(cols, W * W, z * W + x) {
-                        y -= plane(steps, n, q);
-                        let tpl = templates[plane(tpls, n, q) as usize];
-                        out.push((
-                            g,
-                            x as u8,
-                            y,
-                            z as u8,
-                            tpl,
-                            colors[plane(cols_idx, n, q) as usize],
-                        ));
-                        q += 1;
-                    }
-                }
+            let plane = |at: usize, i: usize| t[at + i] as u16 | (t[at + n + i] as u16) << 8;
+            let (dir, mut pl, mut v, mut u) = (s % DIRS, 0u16, 0u16, 0u16);
+            for i in 0..n {
+                let (dp, dv) = (plane(planes, i), plane(vs, i));
+                pl += dp;
+                let new_plane = dp != 0 || i == 0;
+                v = if new_plane { dv } else { v + dv };
+                let new_row = new_plane || dv != 0;
+                let du = t[us + i] as u16;
+                u = if new_row { du } else { u + du };
+                let (a_u, a_v) = merge_axes(dir as u8);
+                let mut p = [0u16; 3];
+                p[a_u] = u;
+                p[a_v] = v;
+                p[3 - a_u - a_v] = pl;
+                let (template, stretch) = templates[plane(tpls, i) as usize];
+                out.push(Decoded {
+                    group: s / DIRS,
+                    dir,
+                    x: p[0],
+                    y: p[1],
+                    z: p[2],
+                    w: t[ws + i] as u16 + 1,
+                    h: t[hs + i] as u16 + 1,
+                    template,
+                    stretch,
+                    color: colors[plane(cols, i) as usize],
+                });
             }
-            o += 2 * W * W + 6 * n;
+            o += 11 * n;
         }
         assert_eq!(o, t.len());
         out
     }
 
-    fn quad(reg: &Registry, dx: f32, layer: Layer, tex: u16) -> Quad {
+    fn registry() -> Registry {
+        Registry::new(Baker::new(AssetFiles::new()))
+    }
+
+    /// A one-block face pointing up, or a skewed quad that can't merge.
+    fn quad(reg: &Registry, skew: f32, layer: Layer, tex: u16) -> Quad {
         reg.baker.quad(QuadShape {
             pos: [
-                [dx, 0.5, 0.0],
-                [dx, 0.0, 0.0],
-                [dx + 1.0, 0.0, 1.25],
-                [dx + 1.0, 0.5, 1.0],
+                [skew, 1.0, 0.0],
+                [skew, 1.0, 1.0],
+                [1.0 + skew * 2.0, 1.0, 1.0],
+                [1.0, 1.0, 0.0],
             ],
-            uv: [[0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.5]],
+            uv: [[0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0]],
             tex,
             layer,
             cull: None,
@@ -1038,9 +1322,7 @@ mod tests {
 
     #[test]
     fn skirts_cover_ground_under_a_roof() {
-        use crate::assets::AssetFiles;
-        use crate::model::Baker;
-        let reg = Registry::new(Baker::new(AssetFiles::new()));
+        let reg = registry();
         let stone = reg.id("minecraft:stone", &mut []);
         // A 66×66 LOD grid (tile plus ring). The tile's east border column has
         // ground up to y=5 and a roof at y=20; the ring next to it is solid up
@@ -1063,56 +1345,127 @@ mod tests {
             lod: true,
         };
         let tile = Mesher::new().mesh(&v, &reg, &s).unwrap();
-        // East faces have all four corners at x = 1 block, stored as 64 + 64.
-        let east_at = |y: u16| {
-            decode(&tile)
+        // East faces sit in column 64 and merge down the wall into strips.
+        let quads = decode(&tile);
+        let east_covers = |y: u16| {
+            quads
                 .iter()
-                .any(|q| q.1 == 64 && q.2 == y + 1 && (0..4).all(|k| q.4[k * 3] == 128))
+                .any(|q| q.dir == EAST as usize && q.x == 64 && q.y <= y + 1 && y + 1 < q.y + q.h)
         };
-        assert!(east_at(5), "ground under the roof has no skirt at its top");
-        assert!(east_at(4), "the skirt covers two voxels");
-        assert!(!east_at(3), "faces below the skirt still cull");
+        assert!(
+            east_covers(5),
+            "ground under the roof has no skirt at its top"
+        );
+        assert!(east_covers(4), "the skirt covers two voxels");
+        assert!(!east_covers(3), "faces below the skirt still cull");
     }
 
     #[test]
-    fn tmh2_round_trips() {
-        use crate::assets::AssetFiles;
-        use crate::model::Baker;
-        let reg = Registry::new(Baker::new(AssetFiles::new()));
+    fn tiles_round_trip() {
+        let reg = registry();
         let mut m = Mesher::new();
         let mut expected = Vec::new();
         // Quads in several columns, stacked in one column, across all groups,
-        // and with offsets that reach past their block (negative and > 1).
+        // and with shapes that can't merge.
         let cases = [
-            ([0, 1, 0], -1.0, Layer::Opaque, 3, 0),
-            ([65, 385, 65], 0.0, Layer::Cutout, 4, 1),
+            ([0, 1, 0], 0.25, Layer::Opaque, 3, 0),
+            ([65, 385, 65], 0.5, Layer::Cutout, 4, 1),
             ([10, 70, 20], 0.25, Layer::Opaque, 3, 0),
-            ([10, 90, 20], 0.0, Layer::Translucent, 7, 3),
-            ([10, 70, 20], 0.0, Layer::Cutout, 5, LEAF_INTERIOR),
-            ([10, 71, 20], 0.0, Layer::Opaque, 3, 0),
+            ([10, 90, 20], 0.5, Layer::Translucent, 7, 3),
+            ([10, 70, 20], 0.5, Layer::Cutout, 5, LEAF_INTERIOR),
+            ([10, 71, 20], 0.25, Layer::Opaque, 3, 0),
             // Worlds can be up to 1000 blocks tall.
-            ([3, 1001, 4], 0.0, Layer::Opaque, 3, 0),
+            ([3, 1001, 4], 0.25, Layer::Opaque, 3, 0),
         ];
-        for (i, (base, dx, layer, tex, group)) in cases.into_iter().enumerate() {
-            let q = quad(&reg, dx, layer, tex);
+        for (i, (base, skew, layer, tex, group)) in cases.into_iter().enumerate() {
+            let q = quad(&reg, skew, layer, tex);
             m.emit(&q, base, [i as u8 * 40, 200, 30], 0xf3, group);
             let r = m.groups[group].last().unwrap();
-            let t = *reg.baker.template(r.template);
-            expected.push((group, r.x() as u8, r.y(), r.z() as u8, t, r.color));
+            let t = reg.baker.template(r.template);
+            expected.push(Decoded {
+                group,
+                dir: UP as usize,
+                x: base[0] as u16,
+                y: base[1] as u16,
+                z: base[2] as u16,
+                w: 1,
+                h: 1,
+                template: *t,
+                stretch: 0,
+                color: r.color,
+            });
         }
         let tile = m.encode(&reg, [0, 0, 0]);
         let mut got = decode(&tile);
         got.sort();
         expected.sort();
         assert_eq!(got, expected);
-        // Offsets are stored with a +64 bias in 1/64 block.
-        assert_eq!(
-            expected
-                .iter()
-                .find(|e| e.4[20] == 3 && e.2 == 1)
-                .unwrap()
-                .4[0],
-            0
-        );
+    }
+
+    #[test]
+    fn equal_faces_merge_into_one_quad() {
+        let reg = registry();
+        let mut m = Mesher::new();
+        let q = quad(&reg, 0.0, Layer::Opaque, 3);
+        // A 3×2 patch, plus a separate face of another color next to it.
+        for x in 0..3 {
+            for z in 0..2 {
+                m.emit(&q, [10 + x, 5, 20 + z], [255, 255, 255], 0xf0, 0);
+            }
+        }
+        m.emit(&q, [13, 5, 20], [1, 2, 3], 0xf0, 0);
+        let quads = decode(&m.encode(&reg, [0, 0, 0]));
+        assert_eq!(quads.len(), 2);
+        let big = quads.iter().find(|q| q.x == 10).unwrap();
+        assert_eq!((big.y, big.z, big.w, big.h), (5, 20, 3, 2));
+        assert_eq!(quads.iter().find(|q| q.x == 13).unwrap().w, 1);
+        // Corners 2 and 3 are at far x, 1 and 2 at far z, and the texture
+        // advances along x and along z, each in one texture axis.
+        assert_eq!(big.stretch & 0xf, 0b1100);
+        assert_eq!(big.stretch >> 4 & 0xf, 0b0110);
+        assert_eq!(big.stretch >> 8, 0b10_01_01_10);
+    }
+
+    #[test]
+    fn rotated_textures_stretch_backwards() {
+        let reg = registry();
+        let mut m = Mesher::new();
+        // A face whose texture runs backwards along x.
+        let q = reg.baker.quad(QuadShape {
+            pos: [
+                [0.0, 1.0, 0.0],
+                [0.0, 1.0, 1.0],
+                [1.0, 1.0, 1.0],
+                [1.0, 1.0, 0.0],
+            ],
+            uv: [[1.0, 0.0], [1.0, 1.0], [0.0, 1.0], [0.0, 0.0]],
+            tex: 3,
+            layer: Layer::Opaque,
+            cull: None,
+            light_dir: UP,
+            tinted: false,
+            shade: 1.0,
+        });
+        m.emit(&q, [1, 1, 1], [9, 9, 9], 0xf0, 0);
+        m.emit(&q, [2, 1, 1], [9, 9, 9], 0xf0, 0);
+        let quads = decode(&m.encode(&reg, [0, 0, 0]));
+        assert_eq!((quads.len(), quads[0].w), (1, 2));
+        assert_eq!(quads[0].stretch >> 8 & 3, 0, "u runs back along x");
+    }
+
+    #[test]
+    fn every_tile_stretches_to_the_right_size() {
+        // Far corners stretch by (w - 1) blocks along u and (h - 1) along v; a
+        // merged quad covers the same area as the faces that went into it.
+        let reg = registry();
+        let q = quad(&reg, 0.0, Layer::Opaque, 3);
+        let mut m = Mesher::new();
+        for x in 0..MAX_RUN as i32 + 3 {
+            m.emit(&q, [x % 66, 2, x / 66 * 2], [1, 1, 1], 0xf0, 0);
+        }
+        let quads = decode(&m.encode(&reg, [0, 0, 0]));
+        let area: u32 = quads.iter().map(|q| q.w as u32 * q.h as u32).sum();
+        assert_eq!(area, MAX_RUN as u32 + 3);
+        assert!(quads.iter().all(|q| q.w <= MAX_RUN && q.h <= MAX_RUN));
     }
 }
