@@ -7,7 +7,7 @@ use crate::mesh::{Mesher, Settings, TILE, Volume};
 use crate::model::{Baker, Registry};
 use crate::region::{Region, list_regions};
 use crate::world::{Chunk, DecodeCache, decode_chunk};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -170,6 +170,23 @@ impl MapCtx {
         self.cfg.world.join("region")
     }
 
+    /// The world's region files, or an error if it looks like the world is
+    /// unavailable rather than empty. A world that restarts from nothing has
+    /// region files again by its first save, so this only holds up a real
+    /// reset for that long. `clear` is an operator asking for the wipe.
+    fn source_regions(&self, clear: bool) -> Result<Vec<(i32, i32, PathBuf)>> {
+        let dir = self.region_dir();
+        let regions = list_regions(&dir)?;
+        if regions.is_empty() && !clear && !self.stored_regions()?.is_empty() {
+            bail!(
+                "{} has no region files, but this map was rendered from some. Keeping its tiles. \
+                 If the world really is empty, `tealmap render --full` clears them",
+                dir.display()
+            );
+        }
+        Ok(regions)
+    }
+
     /// Renders everything that changed since the last pass (or everything, if
     /// `full`), and returns the whole pass.
     ///
@@ -184,6 +201,8 @@ impl MapCtx {
         mut publish: impl FnMut(&Update),
     ) -> Result<Update> {
         let t0 = Instant::now();
+        // Before anything is deleted: a lost mount must not read as a deleted world.
+        let regions = self.source_regions(full)?;
         // Batches keep this version in the manifest until the pass ends, so a
         // forced full pass that stops early runs as a full pass again.
         let prev = self.stored_version()?;
@@ -205,7 +224,6 @@ impl MapCtx {
             // Publish the map before the first batch finishes so viewers can open it.
             self.write_manifest(prev)?;
         }
-        let regions = list_regions(&self.region_dir())?;
         let present: BTreeSet<(i32, i32)> = regions.iter().map(|&(x, z, _)| (x, z)).collect();
 
         // 1. Find changed chunks by hashing compressed payloads of changed region files.
@@ -1192,6 +1210,66 @@ mod tests {
             render("d", true),
             "full render kept stale tiles"
         );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_missing_world_keeps_the_map() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let base = temp_dir("missing");
+        let world = base.join("world");
+        let moved = base.join("moved");
+        copy_dir(&fixture("26.2").join("region"), &world.join("region"));
+        let render = |data: &str, full: bool| {
+            MapCtx::with_baker(
+                map_config(&world),
+                &base.join(data),
+                Baker::new(AssetFiles::new()),
+            )
+            .unwrap()
+            .render(&pool, full, |_| {})
+        };
+        render("a", false).unwrap();
+        let map = base.join("a/maps/test");
+        let first = snapshot(&map);
+        assert!(!first.is_empty());
+
+        // The world's gone, as when a mount drops: every pass fails and nothing
+        // is deleted, even one that asks for a full render.
+        std::fs::rename(&world, &moved).unwrap();
+        for full in [false, true] {
+            let err = format!("{:#}", render("a", full).unwrap_err());
+            assert!(err.contains("doesn't exist"), "{err}");
+            assert_eq!(snapshot(&map), first, "full = {full}");
+        }
+        // A map nothing has rendered fails too, without publishing a manifest.
+        assert!(render("fresh", false).is_err());
+        assert!(!base.join("fresh/maps/test/map.json").exists());
+
+        // An empty directory, as when a mount's source goes missing, only
+        // clears the map when an operator asks for it.
+        std::fs::create_dir_all(world.join("region")).unwrap();
+        let err = format!("{:#}", render("a", false).unwrap_err());
+        assert!(err.contains("no region files"), "{err}");
+        assert_eq!(snapshot(&map), first);
+        // An empty world with nothing rendered from it is fine.
+        render("empty", false).unwrap();
+
+        // When the world comes back, nothing has changed and nothing re-renders.
+        std::fs::remove_dir_all(&world).unwrap();
+        std::fs::rename(&moved, &world).unwrap();
+        assert_eq!(render("a", false).unwrap().stats.chunks, 0);
+        assert_eq!(snapshot(&map), first);
+
+        // A world emptied on purpose.
+        std::fs::remove_dir_all(world.join("region")).unwrap();
+        std::fs::create_dir_all(world.join("region")).unwrap();
+        render("a", true).unwrap();
+        assert!(snapshot(&map).keys().all(|k| !k.ends_with(".tmh")));
 
         let _ = std::fs::remove_dir_all(&base);
     }

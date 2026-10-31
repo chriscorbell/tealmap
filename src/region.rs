@@ -171,7 +171,11 @@ pub fn list_regions(dir: &Path) -> Result<Vec<(i32, i32, PathBuf)>> {
     let mut out = Vec::new();
     let rd = match std::fs::read_dir(dir) {
         Ok(rd) => rd,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => bail!(
+            "{} doesn't exist. A map's `world` is the dimension directory that contains region/: \
+             world/dimensions/minecraft/overworld on 26.x, world on 1.21 and older",
+            dir.display()
+        ),
         Err(e) => return Err(e).with_context(|| format!("listing {}", dir.display())),
     };
     for ent in rd {
