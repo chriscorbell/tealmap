@@ -39,6 +39,12 @@ impl Region {
         })
     }
 
+    /// Whether the file is shorter than its header: being written, or damaged,
+    /// but not a region with no chunks, which still has a whole header.
+    pub fn truncated(&self) -> bool {
+        self.header.is_empty()
+    }
+
     /// Header entry for a chunk at local coords (0..32).
     pub fn entry(&self, lx: usize, lz: usize) -> ChunkEntry {
         let i = (lx & 31) + (lz & 31) * 32;

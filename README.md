@@ -39,7 +39,7 @@ services:
 
 Copy [`tealmap.example.toml`](tealmap.example.toml) to `tealmap.toml` and point each map's `world` at a dimension directory. To render once without serving, run `tealmap render`. Add `--full` to ignore saved state.
 
-If a map's world goes missing or has no region files left, even in the middle of a render, tealmap logs an error and keeps the map's tiles until the world comes back. When a world really is empty, `tealmap render --full` clears them.
+If a map's world goes missing or has no region files left, tealmap logs an error and keeps the map's tiles until the world comes back. If the world really is empty, stop the server and run `tealmap render --map <id> --full` to clear them. If its directory is gone for good, delete the map's folder under `data/maps`.
 
 ## Develop
 

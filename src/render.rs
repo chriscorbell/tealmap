@@ -191,8 +191,10 @@ impl MapCtx {
         if regions.is_empty() && !clear && !self.stored_regions()?.is_empty() {
             bail!(
                 "{} has no region files, but this map was rendered from some. Keeping its tiles. \
-                 If the world really is empty, `tealmap render --full` clears them",
-                dir.display()
+                 If the world really is empty, stop the server and run \
+                 `tealmap render --map {} --full` to clear them",
+                dir.display(),
+                self.cfg.id
             );
         }
         Ok(regions)
@@ -283,6 +285,7 @@ impl MapCtx {
         let batches = batches(&jobs, self.batch_tiles * pool.current_num_threads());
         let total: usize = jobs.iter().map(|j| j.1.len()).sum();
         let queued: BTreeSet<(i32, i32)> = jobs.iter().map(|j| j.0).collect();
+        let scanned: BTreeSet<(i32, i32)> = scans.iter().map(|s| (s.rx, s.rz)).collect();
         let mut finished = BTreeSet::new();
         let mut failed = BTreeSet::new();
         let mut saved = vec![false; scans.len()];
@@ -316,10 +319,20 @@ impl MapCtx {
                     *saved = true;
                 }
             }
+            self.mark_failed(
+                results.iter().flat_map(|r| r.failed.iter().copied()),
+                &scanned,
+            )?;
             if rendered < total {
                 tracing::info!("{}: {rendered}/{total} tiles", self.cfg.id);
             }
             publish(&up);
+            // Failed chunks can be one bad file, which the next pass retries.
+            // If the whole world has gone, every batch left would fail too, and
+            // this pass mustn't count as finished: stop here.
+            if results.iter().any(|r| !r.failed.is_empty()) {
+                self.source_regions(false)?;
+            }
         }
         // With no jobs, no batch saved state.
         for (s, _) in scans.iter().zip(&saved).filter(|(_, saved)| !**saved) {
@@ -352,6 +365,32 @@ impl MapCtx {
         self.save_state(s.rx, s.rz, &hashes, stamp)?;
         if let Some(st) = stamp {
             self.seen.lock().unwrap().insert((s.rx, s.rz), st);
+        }
+        Ok(())
+    }
+
+    /// Records failed chunks in regions this pass didn't scan, which a neighbor's
+    /// tile read. Nothing else would make the next pass retry them.
+    fn mark_failed(
+        &self,
+        chunks: impl Iterator<Item = (i32, i32)>,
+        scanned: &BTreeSet<(i32, i32)>,
+    ) -> Result<()> {
+        let mut regions: BTreeMap<(i32, i32), Vec<usize>> = BTreeMap::new();
+        for (cx, cz) in chunks {
+            let region = (cx.div_euclid(32), cz.div_euclid(32));
+            if !scanned.contains(&region) {
+                let i = cz.rem_euclid(32) * 32 + cx.rem_euclid(32);
+                regions.entry(region).or_default().push(i as usize);
+            }
+        }
+        for ((rx, rz), failed) in regions {
+            let (mut hashes, _) = self.load_state(rx, rz);
+            for i in failed {
+                hashes[i] = u64::MAX;
+            }
+            self.save_state(rx, rz, &hashes, None)?;
+            self.seen.lock().unwrap().remove(&(rx, rz));
         }
         Ok(())
     }
@@ -420,6 +459,16 @@ impl MapCtx {
             return Ok(None);
         }
         let region = Region::open(path, rx, rz)?;
+        if region.truncated() {
+            // Its chunks aren't gone. Look again once the file changes.
+            tracing::warn!(
+                "{}: {} is shorter than a region header. Keeping its tiles",
+                self.cfg.id,
+                path.display()
+            );
+            self.seen.lock().unwrap().insert((rx, rz), stamp);
+            return Ok(None);
+        }
         let mut raw = Vec::new();
         let mut hashes = vec![0u64; 1024];
         let mut dirty = Vec::new();
@@ -474,7 +523,10 @@ impl MapCtx {
             for cz in (z0 >> 4) - 1..(z0 >> 4) + 5 {
                 for cx in (x0 >> 4) - 1..(x0 >> 4) + 5 {
                     if let Err(e) = src.load(cx, cz) {
-                        tracing::warn!("{}: {e:#}", self.cfg.id);
+                        // The first says why. A lost file fails every chunk it has.
+                        if res.failed.is_empty() {
+                            tracing::warn!("{}: {e:#}", self.cfg.id);
+                        }
                         res.failed.insert((cx, cz));
                         tile_failed |= (cx - (x0 >> 4)) as u32 <= 3 && (cz - (z0 >> 4)) as u32 <= 3;
                     }
@@ -982,7 +1034,12 @@ impl<'a> ChunkSource<'a> {
                 .contains(&(rx, rz))
                 .then(|| {
                     let p = self.ctx.region_dir().join(format!("r.{rx}.{rz}.mca"));
-                    Region::open(&p, rx, rz).with_context(|| format!("opening {}", p.display()))
+                    let region = Region::open(&p, rx, rz)
+                        .with_context(|| format!("opening {}", p.display()))?;
+                    if region.truncated() {
+                        bail!("{} is shorter than a region header", p.display());
+                    }
+                    Ok(region)
                 })
                 .transpose()?;
             self.regions.insert((rx, rz), region);
@@ -1324,24 +1381,140 @@ mod tests {
         let map = base.join("a/maps/test");
         let first = snapshot(&map);
 
+        // The pass fails at the first batch that notices, and deletes nothing.
         let mut batches = 0;
-        let lost = ctx()
+        let err = ctx()
             .render(&pool, true, |_| {
                 batches += 1;
                 if batches == 1 {
                     std::fs::rename(&world, &moved).unwrap();
                 }
             })
-            .unwrap();
-        assert!(batches > 1, "only {batches} batches");
-        assert!(lost.stats.failed_chunks > 0);
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("doesn't exist"), "{err:#}");
+        assert_eq!(batches, 2);
         assert_eq!(snapshot(&map), first, "a lost world deleted tiles");
 
-        // The chunks that failed render again once the world is back.
+        // Saved state still describes the tiles on disk, so once the world is
+        // back there's nothing left to redo.
         std::fs::rename(&moved, &world).unwrap();
-        assert!(ctx().render(&pool, false, |_| {}).unwrap().stats.chunks > 0);
+        ctx().render(&pool, false, |_| {}).unwrap();
         assert_eq!(snapshot(&map), first);
         assert_eq!(ctx().render(&pool, false, |_| {}).unwrap().stats.chunks, 0);
+
+        // An upgrade pass that loses the world doesn't count as finished, and
+        // picks up again once the world is back.
+        let manifest_path = map.join("map.json");
+        let older = |path: &Path| read_manifest(path).unwrap()["renderVersion"].as_u64();
+        let mut manifest = read_manifest(&manifest_path).unwrap();
+        manifest["renderVersion"] = (RENDER_VERSION - 1).into();
+        std::fs::write(&manifest_path, manifest.to_string()).unwrap();
+        let mut batches = 0;
+        ctx()
+            .render(&pool, false, |_| {
+                batches += 1;
+                if batches == 1 {
+                    std::fs::rename(&world, &moved).unwrap();
+                }
+            })
+            .unwrap_err();
+        assert_eq!(older(&manifest_path), Some(RENDER_VERSION as u64 - 1));
+        assert_eq!(
+            hires_paths(&snapshot(&map)),
+            hires_paths(&first),
+            "an upgrade that lost the world deleted hires tiles"
+        );
+        std::fs::rename(&moved, &world).unwrap();
+        ctx().render(&pool, false, |_| {}).unwrap();
+        assert_eq!(older(&manifest_path), Some(RENDER_VERSION as u64));
+        assert_eq!(snapshot(&map), first);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn truncated_region_files_keep_their_tiles() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let base = temp_dir("truncated");
+        let world = base.join("world");
+        copy_dir(&fixture("26.2").join("region"), &world.join("region"));
+        let ctx = MapCtx::with_baker(
+            map_config(&world),
+            &base.join("a"),
+            Baker::new(AssetFiles::new()),
+        )
+        .unwrap();
+        ctx.render(&pool, false, |_| {}).unwrap();
+        let map = base.join("a/maps/test");
+        let first = snapshot(&map);
+
+        for e in std::fs::read_dir(world.join("region")).unwrap().flatten() {
+            std::fs::File::create(e.path()).unwrap();
+        }
+        let up = ctx.render(&pool, false, |_| {}).unwrap();
+        assert_eq!(up.stats.chunks, 0);
+        assert_eq!(snapshot(&map), first, "zero-byte regions deleted tiles");
+
+        copy_dir(&fixture("26.2").join("region"), &world.join("region"));
+        assert_eq!(ctx.render(&pool, false, |_| {}).unwrap().stats.chunks, 0);
+        assert_eq!(snapshot(&map), first);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A region this pass doesn't scan, because it hasn't changed, can still fail
+    /// when a neighbor's tile reads it. It has to be retried like any other.
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_neighbors_are_retried() {
+        use std::os::unix::fs::PermissionsExt;
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let base = temp_dir("unreadable");
+        let world = base.join("world");
+        copy_dir(&fixture("26.2").join("region"), &world.join("region"));
+        let render = |data: &str, full: bool| {
+            MapCtx::with_baker(
+                map_config(&world),
+                &base.join(data),
+                Baker::new(AssetFiles::new()),
+            )
+            .unwrap()
+            .render(&pool, full, |_| {})
+            .unwrap()
+        };
+        render("a", false);
+
+        let locked = world.join("region/r.0.0.mca");
+        let chmod = |mode| {
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+        chmod(0o000);
+        if std::fs::File::open(&locked).is_ok() {
+            // Root reads anything, so there's nothing to test.
+            chmod(0o644);
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+        // Chunk (31, 1) of region -1,0 borders region 0,0.
+        swap_chunk(&world.join("region/r.-1.0.mca"), 32 + 31, 2 * 32 + 30);
+        assert!(render("a", false).stats.failed_chunks > 0);
+
+        chmod(0o644);
+        assert!(render("a", false).stats.chunks > 0);
+        assert_eq!(
+            snapshot(&base.join("a/maps/test")),
+            {
+                render("clean", true);
+                snapshot(&base.join("clean/maps/test"))
+            },
+            "the failed chunks weren't retried"
+        );
 
         let _ = std::fs::remove_dir_all(&base);
     }
