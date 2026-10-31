@@ -1593,12 +1593,12 @@ mod tests {
         let live = ctx("a");
         live.render(&pool, false, |_| {}).unwrap();
 
-        // Three jobs, in the order -1,1 then -1,-1 then 1,1. The middle one's
-        // tile -1,-1 reads region 0,0 for its halo, and region 0,0's scan waits
-        // on the last job, since 1,1 is its neighbor.
+        // Three jobs, in the order -1,1 then -1,0 then 1,1. The middle one's tile
+        // -1,0 reads region 0,0 for its halo along a whole side, and region 0,0's
+        // scan waits on the last job, since 1,1 is its neighbor.
         swap_chunk(&region.join("r.-1.1.mca"), 32 + 1, 2 * 32 + 2);
         swap_chunk(&region.join("r.1.1.mca"), 32 + 1, 2 * 32 + 2);
-        swap_chunk(&region.join("r.-1.-1.mca"), 29 * 32 + 29, 30 * 32 + 30);
+        swap_chunk(&region.join("r.-1.0.mca"), 32 + 29, 2 * 32 + 30);
         let middle = region.join("r.0.0.mca");
         let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
         std::fs::File::options()
