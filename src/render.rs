@@ -35,6 +35,8 @@ pub struct MapCtx {
     seen: Mutex<HashMap<(i32, i32), (u64, u64)>>,
     /// What's on disk, once read, so manifests don't list directories.
     index: Mutex<Option<MapIndex>>,
+    /// Regions left out of passes for now, so each is only logged once.
+    skipped: Mutex<BTreeSet<(i32, i32)>>,
     batch_tiles: usize,
 }
 
@@ -162,6 +164,7 @@ impl MapCtx {
             settings,
             seen: Mutex::new(HashMap::new()),
             index: Mutex::new(None),
+            skipped: Mutex::new(BTreeSet::new()),
             batch_tiles: BATCH_TILES_PER_THREAD,
         })
     }
@@ -174,8 +177,8 @@ impl MapCtx {
     /// rather than empty. A dimension nobody has visited has no region files
     /// and nothing rendered from it, which is fine. A world that restarts from
     /// nothing has region files again by its first save, so this only holds up
-    /// a real reset for that long. `clear` is an operator asking for the wipe.
-    fn source_regions(&self, clear: bool) -> Result<Vec<(i32, i32, PathBuf)>> {
+    /// a real reset for that long.
+    fn source_regions(&self) -> Result<Vec<(i32, i32, PathBuf)>> {
         let world = &self.cfg.world;
         match std::fs::metadata(world) {
             Ok(_) => {}
@@ -188,13 +191,12 @@ impl MapCtx {
         }
         let dir = self.region_dir();
         let regions = list_regions(&dir)?;
-        if regions.is_empty() && !clear && !self.stored_regions()?.is_empty() {
+        if regions.is_empty() && !self.stored_regions()?.is_empty() {
             bail!(
                 "{} has no region files, but this map was rendered from some. Keeping its tiles. \
-                 If the world really is empty, stop the server and run \
-                 `tealmap render --map {} --full` to clear them",
+                 If the world is gone for good, stop the server and delete {}",
                 dir.display(),
-                self.cfg.id
+                self.out.display()
             );
         }
         Ok(regions)
@@ -215,7 +217,7 @@ impl MapCtx {
     ) -> Result<Update> {
         let t0 = Instant::now();
         // Before anything is deleted: a lost mount must not read as a deleted world.
-        let regions = self.source_regions(full)?;
+        let regions = self.source_regions()?;
         // Batches keep this version in the manifest until the pass ends, so a
         // forced full pass that stops early runs as a full pass again.
         let prev = self.stored_version()?;
@@ -331,7 +333,7 @@ impl MapCtx {
             // If the whole world has gone, every batch left would fail too, and
             // this pass mustn't count as finished: stop here.
             if results.iter().any(|r| !r.failed.is_empty())
-                && let Err(e) = self.source_regions(false)
+                && let Err(e) = self.source_regions()
             {
                 // Scans still waiting on a neighbor won't be saved now, and
                 // they're what would have retried their failed chunks.
@@ -451,8 +453,30 @@ impl MapCtx {
         Ok(lod_changed)
     }
 
+    /// Leaves a region it can't read out of this pass, keeping its tiles, so one
+    /// bad file doesn't stop the rest of the map from updating. A full pass won't
+    /// come back for it, and the same bytes returning would look unchanged, so
+    /// then its saved hashes have to ask for the render.
+    fn skip_region(&self, rx: i32, rz: i32, full: bool, why: &str) -> Result<Option<RegionScan>> {
+        if self.skipped.lock().unwrap().insert((rx, rz)) {
+            tracing::warn!("{}: {why}. Keeping its tiles", self.cfg.id);
+        }
+        if full {
+            let (old, _) = self.load_state(rx, rz);
+            let hashes: Vec<u64> = old
+                .iter()
+                .map(|&h| if h == 0 { 0 } else { u64::MAX })
+                .collect();
+            self.save_state(rx, rz, &hashes, None)?;
+        }
+        Ok(None)
+    }
+
     fn scan_region(&self, rx: i32, rz: i32, path: &Path, full: bool) -> Result<Option<RegionScan>> {
-        let meta = std::fs::metadata(path)?;
+        let meta = match std::fs::metadata(path) {
+            Ok(meta) => meta,
+            Err(e) => return self.skip_region(rx, rz, full, &format!("{}: {e}", path.display())),
+        };
         let mtime = meta
             .modified()?
             .duration_since(UNIX_EPOCH)
@@ -470,26 +494,17 @@ impl MapCtx {
             self.seen.lock().unwrap().insert((rx, rz), stamp);
             return Ok(None);
         }
-        let region = Region::open(path, rx, rz)?;
+        let region = match Region::open(path, rx, rz) {
+            Ok(region) => region,
+            Err(e) => return self.skip_region(rx, rz, full, &format!("{e:#}")),
+        };
         if region.truncated() {
-            // Its chunks aren't gone. Look again once the file changes.
-            tracing::warn!(
-                "{}: {} is shorter than a region header. Keeping its tiles",
-                self.cfg.id,
-                path.display()
-            );
-            // A full pass won't come back for it, and the same bytes returning
-            // would look unchanged, so its saved hashes have to ask for the render.
-            if full {
-                let hashes: Vec<u64> = old
-                    .iter()
-                    .map(|&h| if h == 0 { 0 } else { u64::MAX })
-                    .collect();
-                self.save_state(rx, rz, &hashes, None)?;
-            }
+            // Looked at again once the file changes.
             self.seen.lock().unwrap().insert((rx, rz), stamp);
-            return Ok(None);
+            let why = format!("{} is shorter than a region header", path.display());
+            return self.skip_region(rx, rz, full, &why);
         }
+        self.skipped.lock().unwrap().remove(&(rx, rz));
         let mut raw = Vec::new();
         let mut hashes = vec![0u64; 1024];
         let mut dirty = Vec::new();
@@ -1019,6 +1034,8 @@ struct ChunkSource<'a> {
     /// The region files this pass found. Any other region has no chunks.
     present: &'a BTreeSet<(i32, i32)>,
     regions: HashMap<(i32, i32), Option<Region>>,
+    /// Why a listed region wouldn't open, so a job only tries once.
+    unavailable: HashMap<(i32, i32), String>,
     chunks: HashMap<(i32, i32), Option<Chunk>>,
     raw: Vec<u8>,
     buf: Vec<u8>,
@@ -1031,6 +1048,7 @@ impl<'a> ChunkSource<'a> {
             ctx,
             present,
             regions: HashMap::new(),
+            unavailable: HashMap::new(),
             chunks: HashMap::new(),
             raw: Vec::new(),
             buf: Vec::new(),
@@ -1047,22 +1065,31 @@ impl<'a> ChunkSource<'a> {
             return Ok(());
         }
         let (rx, rz) = (cx.div_euclid(32), cz.div_euclid(32));
+        if let Some(why) = self.unavailable.get(&(rx, rz)) {
+            bail!("{why}");
+        }
         if !self.regions.contains_key(&(rx, rz)) {
             // A listed region that won't open is unavailable, not empty: its
             // chunks fail, its tiles stay, and the next pass tries again.
-            let region = self
-                .present
-                .contains(&(rx, rz))
-                .then(|| {
-                    let p = self.ctx.region_dir().join(format!("r.{rx}.{rz}.mca"));
-                    let region = Region::open(&p, rx, rz)
-                        .with_context(|| format!("opening {}", p.display()))?;
+            let region = if self.present.contains(&(rx, rz)) {
+                let p = self.ctx.region_dir().join(format!("r.{rx}.{rz}.mca"));
+                let opened = Region::open(&p, rx, rz).and_then(|region| {
                     if region.truncated() {
                         bail!("{} is shorter than a region header", p.display());
                     }
                     Ok(region)
-                })
-                .transpose()?;
+                });
+                match opened {
+                    Ok(region) => Some(region),
+                    Err(e) => {
+                        let why = format!("{e:#}");
+                        self.unavailable.insert((rx, rz), why.clone());
+                        bail!("{why}");
+                    }
+                }
+            } else {
+                None
+            };
             self.regions.insert((rx, rz), region);
         }
         let chunk = match &mut self.regions.get_mut(&(rx, rz)).expect("just inserted") {
@@ -1349,15 +1376,17 @@ mod tests {
         assert!(!base.join("fresh/maps/test/map.json").exists());
 
         // A world directory with nothing in it, as when a mount's source goes
-        // missing, only clears the map when an operator asks for it.
+        // missing, keeps the map even when an operator runs every map with --full.
         for with_region_dir in [false, true] {
             std::fs::create_dir_all(&world).unwrap();
             if with_region_dir {
                 std::fs::create_dir_all(world.join("region")).unwrap();
             }
-            let err = format!("{:#}", render("a", false).unwrap_err());
-            assert!(err.contains("no region files"), "{err}");
-            assert_eq!(snapshot(&map), first);
+            for full in [false, true] {
+                let err = format!("{:#}", render("a", full).unwrap_err());
+                assert!(err.contains("no region files"), "{err}");
+                assert_eq!(snapshot(&map), first);
+            }
         }
         // With nothing rendered from it, that's a dimension nobody has visited.
         render("unvisited", false).unwrap();
@@ -1369,9 +1398,10 @@ mod tests {
         assert_eq!(render("a", false).unwrap().stats.chunks, 0);
         assert_eq!(snapshot(&map), first);
 
-        // Emptied on purpose, with or without a region directory left behind.
+        // Gone for good: the error's advice, deleting the map's folder, works.
         std::fs::remove_dir_all(world.join("region")).unwrap();
-        render("a", true).unwrap();
+        std::fs::remove_dir_all(&map).unwrap();
+        render("a", false).unwrap();
         assert!(snapshot(&map).keys().all(|k| !k.ends_with(".tmh")));
 
         let _ = std::fs::remove_dir_all(&base);
@@ -1548,6 +1578,19 @@ mod tests {
         // Chunk (31, 1) of region -1,0 borders region 0,0.
         swap_chunk(&world.join("region/r.-1.0.mca"), 32 + 31, 2 * 32 + 30);
         assert!(render("a", false).stats.failed_chunks > 0);
+
+        // It doesn't stop the rest of the map from updating while it's locked,
+        // on this pass or the ones after.
+        let map = base.join("a/maps/test");
+        let before = snapshot(&map);
+        swap_chunk(
+            &world.join("region/r.-1.-1.mca"),
+            29 * 32 + 29,
+            30 * 32 + 30,
+        );
+        assert!(render("a", false).stats.chunks > 0);
+        assert_ne!(snapshot(&map), before, "a locked region stopped the map");
+        assert_eq!(render("a", false).stats.chunks, 0);
 
         chmod(0o644);
         assert!(render("a", false).stats.chunks > 0);
