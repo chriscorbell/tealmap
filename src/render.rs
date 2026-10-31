@@ -170,11 +170,22 @@ impl MapCtx {
         self.cfg.world.join("region")
     }
 
-    /// The world's region files, or an error if it looks like the world is
-    /// unavailable rather than empty. A world that restarts from nothing has
-    /// region files again by its first save, so this only holds up a real
-    /// reset for that long. `clear` is an operator asking for the wipe.
+    /// The world's region files, or an error if the world looks unavailable
+    /// rather than empty. A dimension nobody has visited has no region files
+    /// and nothing rendered from it, which is fine. A world that restarts from
+    /// nothing has region files again by its first save, so this only holds up
+    /// a real reset for that long. `clear` is an operator asking for the wipe.
     fn source_regions(&self, clear: bool) -> Result<Vec<(i32, i32, PathBuf)>> {
+        let world = &self.cfg.world;
+        match std::fs::metadata(world) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => bail!(
+                "{} doesn't exist. A map's `world` is the dimension directory that contains \
+                 region/: world/dimensions/minecraft/overworld on 26.x, world on 1.21 and older",
+                world.display()
+            ),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", world.display())),
+        }
         let dir = self.region_dir();
         let regions = list_regions(&dir)?;
         if regions.is_empty() && !clear && !self.stored_regions()?.is_empty() {
@@ -281,7 +292,7 @@ impl MapCtx {
             let results: Vec<RegionResult> = pool.install(|| {
                 batch
                     .par_iter()
-                    .map(|((rx, rz), set)| self.render_region(*rx, *rz, set))
+                    .map(|((rx, rz), set)| self.render_region(*rx, *rz, set, &present))
                     .collect::<Result<Vec<_>>>()
             })?;
             let lod = self.build_lods(pool, &results)?;
@@ -442,9 +453,10 @@ impl MapCtx {
         rx: i32,
         rz: i32,
         tiles: &BTreeSet<(i32, i32)>,
+        present: &BTreeSet<(i32, i32)>,
     ) -> Result<RegionResult> {
         let mut res = RegionResult::default();
-        let mut src = ChunkSource::new(self);
+        let mut src = ChunkSource::new(self, present);
         let mut volume = Volume::new();
         let mut mesher = Mesher::new();
         let mut gz = Vec::new();
@@ -931,6 +943,8 @@ pub fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
 /// Decoded chunks for one region job, loaded on demand and evicted by row.
 struct ChunkSource<'a> {
     ctx: &'a MapCtx,
+    /// The region files this pass found. Any other region has no chunks.
+    present: &'a BTreeSet<(i32, i32)>,
     regions: HashMap<(i32, i32), Option<Region>>,
     chunks: HashMap<(i32, i32), Option<Chunk>>,
     raw: Vec<u8>,
@@ -939,9 +953,10 @@ struct ChunkSource<'a> {
 }
 
 impl<'a> ChunkSource<'a> {
-    fn new(ctx: &'a MapCtx) -> Self {
+    fn new(ctx: &'a MapCtx, present: &'a BTreeSet<(i32, i32)>) -> Self {
         ChunkSource {
             ctx,
+            present,
             regions: HashMap::new(),
             chunks: HashMap::new(),
             raw: Vec::new(),
@@ -959,15 +974,20 @@ impl<'a> ChunkSource<'a> {
             return Ok(());
         }
         let (rx, rz) = (cx.div_euclid(32), cz.div_euclid(32));
-        let region = self.regions.entry((rx, rz)).or_insert_with(|| {
-            let p = self.ctx.region_dir().join(format!("r.{rx}.{rz}.mca"));
-            if p.exists() {
-                Region::open(&p, rx, rz).ok()
-            } else {
-                None
-            }
-        });
-        let chunk = match region {
+        if !self.regions.contains_key(&(rx, rz)) {
+            // A listed region that won't open is unavailable, not empty: its
+            // chunks fail, its tiles stay, and the next pass tries again.
+            let region = self
+                .present
+                .contains(&(rx, rz))
+                .then(|| {
+                    let p = self.ctx.region_dir().join(format!("r.{rx}.{rz}.mca"));
+                    Region::open(&p, rx, rz).with_context(|| format!("opening {}", p.display()))
+                })
+                .transpose()?;
+            self.regions.insert((rx, rz), region);
+        }
+        let chunk = match &mut self.regions.get_mut(&(rx, rz)).expect("just inserted") {
             None => None,
             Some(r) => {
                 let (lx, lz) = (cx.rem_euclid(32) as usize, cz.rem_euclid(32) as usize);
@@ -1246,18 +1266,24 @@ mod tests {
             assert!(err.contains("doesn't exist"), "{err}");
             assert_eq!(snapshot(&map), first, "full = {full}");
         }
-        // A map nothing has rendered fails too, without publishing a manifest.
+        // A wrong path fails too, without publishing a manifest.
         assert!(render("fresh", false).is_err());
         assert!(!base.join("fresh/maps/test/map.json").exists());
 
-        // An empty directory, as when a mount's source goes missing, only
-        // clears the map when an operator asks for it.
-        std::fs::create_dir_all(world.join("region")).unwrap();
-        let err = format!("{:#}", render("a", false).unwrap_err());
-        assert!(err.contains("no region files"), "{err}");
-        assert_eq!(snapshot(&map), first);
-        // An empty world with nothing rendered from it is fine.
-        render("empty", false).unwrap();
+        // A world directory with nothing in it, as when a mount's source goes
+        // missing, only clears the map when an operator asks for it.
+        for with_region_dir in [false, true] {
+            std::fs::create_dir_all(&world).unwrap();
+            if with_region_dir {
+                std::fs::create_dir_all(world.join("region")).unwrap();
+            }
+            let err = format!("{:#}", render("a", false).unwrap_err());
+            assert!(err.contains("no region files"), "{err}");
+            assert_eq!(snapshot(&map), first);
+        }
+        // With nothing rendered from it, that's a dimension nobody has visited.
+        render("unvisited", false).unwrap();
+        assert!(base.join("unvisited/maps/test/map.json").exists());
 
         // When the world comes back, nothing has changed and nothing re-renders.
         std::fs::remove_dir_all(&world).unwrap();
@@ -1265,11 +1291,57 @@ mod tests {
         assert_eq!(render("a", false).unwrap().stats.chunks, 0);
         assert_eq!(snapshot(&map), first);
 
-        // A world emptied on purpose.
+        // Emptied on purpose, with or without a region directory left behind.
         std::fs::remove_dir_all(world.join("region")).unwrap();
-        std::fs::create_dir_all(world.join("region")).unwrap();
         render("a", true).unwrap();
         assert!(snapshot(&map).keys().all(|k| !k.ends_with(".tmh")));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn losing_the_world_during_a_pass_keeps_the_map() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let base = temp_dir("mid-pass");
+        let world = base.join("world");
+        let moved = base.join("moved");
+        copy_dir(&fixture("26.2").join("region"), &world.join("region"));
+        // One region job per batch, so the pass has batches left when the world goes.
+        let ctx = || {
+            let mut ctx = MapCtx::with_baker(
+                map_config(&world),
+                &base.join("a"),
+                Baker::new(AssetFiles::new()),
+            )
+            .unwrap();
+            ctx.batch_tiles = 1;
+            ctx
+        };
+        ctx().render(&pool, false, |_| {}).unwrap();
+        let map = base.join("a/maps/test");
+        let first = snapshot(&map);
+
+        let mut batches = 0;
+        let lost = ctx()
+            .render(&pool, true, |_| {
+                batches += 1;
+                if batches == 1 {
+                    std::fs::rename(&world, &moved).unwrap();
+                }
+            })
+            .unwrap();
+        assert!(batches > 1, "only {batches} batches");
+        assert!(lost.stats.failed_chunks > 0);
+        assert_eq!(snapshot(&map), first, "a lost world deleted tiles");
+
+        // The chunks that failed render again once the world is back.
+        std::fs::rename(&moved, &world).unwrap();
+        assert!(ctx().render(&pool, false, |_| {}).unwrap().stats.chunks > 0);
+        assert_eq!(snapshot(&map), first);
+        assert_eq!(ctx().render(&pool, false, |_| {}).unwrap().stats.chunks, 0);
 
         let _ = std::fs::remove_dir_all(&base);
     }

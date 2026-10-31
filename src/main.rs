@@ -16,7 +16,7 @@ mod world;
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
 #[command(version, about = "A fast 3D web map for Minecraft worlds")]
@@ -67,38 +67,55 @@ fn main() -> Result<()> {
             if maps.is_empty() {
                 bail!("no matching map in {}", cli.config.display());
             }
-            for m in maps {
-                let ctx = render::MapCtx::new(m.clone(), &cfg.data_dir)?;
-                let up = ctx.render(&pool, full, |_| {})?;
-                let s = &up.stats;
-                tracing::info!(
-                    "{}: {} regions, {} changed chunks, {} tiles ({} empty), {:.1} MB, {} vertices, {} failed chunks, {:.2}s",
-                    m.id,
-                    s.regions,
-                    s.chunks,
-                    s.tiles,
-                    s.empty_tiles,
-                    s.bytes as f64 / 1e6,
-                    s.vertices,
-                    s.failed_chunks,
-                    s.seconds
-                );
-                let unknown = ctx.reg.unknown();
-                if !unknown.is_empty() {
-                    let names: Vec<&str> =
-                        unknown.iter().take(12).map(|(n, _)| n.as_str()).collect();
-                    tracing::info!(
-                        "{}: {} block states, {} blocks without models (shown as fallback cubes): {}{}",
-                        m.id,
-                        ctx.reg.len(),
-                        unknown.len(),
-                        names.join(", "),
-                        if unknown.len() > 12 { ", …" } else { "" }
-                    );
+            // One map's problem shouldn't stop the others from rendering.
+            let mut failed = 0;
+            for m in &maps {
+                if let Err(e) = render_map(m, &cfg.data_dir, &pool, full) {
+                    tracing::error!("{}: {e:#}", m.id);
+                    failed += 1;
                 }
+            }
+            if failed > 0 {
+                bail!("{failed} of {} maps failed to render", maps.len());
             }
         }
         Cmd::Serve => serve::run(cfg, pool)?,
+    }
+    Ok(())
+}
+
+fn render_map(
+    m: &config::MapConfig,
+    data_dir: &Path,
+    pool: &rayon::ThreadPool,
+    full: bool,
+) -> Result<()> {
+    let ctx = render::MapCtx::new(m.clone(), data_dir)?;
+    let up = ctx.render(pool, full, |_| {})?;
+    let s = &up.stats;
+    tracing::info!(
+        "{}: {} regions, {} changed chunks, {} tiles ({} empty), {:.1} MB, {} vertices, {} failed chunks, {:.2}s",
+        m.id,
+        s.regions,
+        s.chunks,
+        s.tiles,
+        s.empty_tiles,
+        s.bytes as f64 / 1e6,
+        s.vertices,
+        s.failed_chunks,
+        s.seconds
+    );
+    let unknown = ctx.reg.unknown();
+    if !unknown.is_empty() {
+        let names: Vec<&str> = unknown.iter().take(12).map(|(n, _)| n.as_str()).collect();
+        tracing::info!(
+            "{}: {} block states, {} blocks without models (shown as fallback cubes): {}{}",
+            m.id,
+            ctx.reg.len(),
+            unknown.len(),
+            names.join(", "),
+            if unknown.len() > 12 { ", …" } else { "" }
+        );
     }
     Ok(())
 }
