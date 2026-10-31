@@ -889,28 +889,7 @@ export class MapEngine {
       this.onCamera({ x: t.x, y: t.y, z: t.z })
     }
 
-    if (now - this.lastStats > 1000) {
-      const levels = Array.from({ length: (this.manifest?.lodLevels ?? 0) + 1 }, () => 0)
-      let pending = 0
-      for (const tile of this.tiles.values()) {
-        if (tile.drawn) levels[tile.level]++
-        if (tile.state === 'loading') pending++
-      }
-      this.onStats({
-        fps: (this.frames * 1000) / (now - this.lastStats),
-        frameMs: this.frames ? this.frameMsAcc / this.frames : 0,
-        gpuMs: this.gpuTimer?.p95() ?? null,
-        calls: this.drawCalls,
-        triangles: this.triangles,
-        levels,
-        pending,
-        downloadedMB: this.downloaded / 1e6,
-        gpuMB: this.renderer.gpuBytes / 1e6,
-      })
-      this.frames = 0
-      this.frameMsAcc = 0
-      this.lastStats = now
-    }
+    if (now - this.lastStats > 1000) this.reportStats(now)
 
     // With nothing to do, stop asking for frames, so an idle map costs no power.
     // A slow timer keeps planning, for retries and expiring tiles.
@@ -918,9 +897,35 @@ export class MapEngine {
       if (++this.idleFrames > IDLE_FRAMES) {
         this.asleep = true
         cancelAnimationFrame(this.raf)
+        // The last report may have tiles still loading. No more come while asleep,
+        // and the loading bar would run on until the next time the map wakes.
+        this.reportStats(now)
         this.sleepTimer = window.setTimeout(this.sleepTick, SLEEP_MS)
       }
     } else this.idleFrames = 0
+  }
+
+  private reportStats(now: number) {
+    const levels = Array.from({ length: (this.manifest?.lodLevels ?? 0) + 1 }, () => 0)
+    let pending = 0
+    for (const tile of this.tiles.values()) {
+      if (tile.drawn) levels[tile.level]++
+      if (tile.state === 'loading') pending++
+    }
+    this.onStats({
+      fps: (this.frames * 1000) / Math.max(now - this.lastStats, 1),
+      frameMs: this.frames ? this.frameMsAcc / this.frames : 0,
+      gpuMs: this.gpuTimer?.p95() ?? null,
+      calls: this.drawCalls,
+      triangles: this.triangles,
+      levels,
+      pending,
+      downloadedMB: this.downloaded / 1e6,
+      gpuMB: this.renderer.gpuBytes / 1e6,
+    })
+    this.frames = 0
+    this.frameMsAcc = 0
+    this.lastStats = now
   }
 
   /** Builds this frame's draw list, nearest tiles first, and draws it. */

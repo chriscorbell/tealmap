@@ -268,7 +268,12 @@ button {
   inset: 0;
   width: 30%;
   background: linear-gradient(90deg, transparent, var(--accent), transparent);
-  animation: sweep 1.2s ease-in-out infinite;
+  animation: sweep 1.2s ease-in-out infinite paused;
+}
+
+/* Only runs while it shows: an idle map shouldn't spend anything on a hidden bar. */
+.progress.on::after {
+  animation-play-state: running;
 }
 
 .error {
