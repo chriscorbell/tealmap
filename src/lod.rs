@@ -123,6 +123,7 @@ pub fn from_volume(v: &Volume, reg: &Registry, min_y: i32, max_y: i32) -> Grid {
     let mut g = Grid::empty(N, h, min_y);
     let infos = reg.snapshot();
     let hidden = reg.id(HIDDEN_NAME, &mut []);
+    let water = reg.id("minecraft:water", &mut []);
     // Bottom up, so each column ends with the biome of its top block.
     for vy in 1..v.h.saturating_sub(1) {
         let wy = v.y0 + vy as i32;
@@ -134,9 +135,17 @@ pub fn from_volume(v: &Volume, reg: &Registry, min_y: i32, max_y: i32) -> Grid {
             for x in 0..N {
                 let (vx, vz) = (x + 1, z + 1);
                 let id = v.block(vx, vy, vz);
-                if id == AIR || !infos[id as usize].lod_counts {
+                if id == AIR {
                     continue;
                 }
+                // A plant under water is water at this scale. As air, it would
+                // leave a dark pocket in the sea.
+                let info = infos[id as usize];
+                let id = match (info.lod_counts, info.has_water()) {
+                    (true, _) => id,
+                    (false, true) => water,
+                    (false, false) => continue,
+                };
                 let col = z * N + x;
                 // Removed blocks stay solid here. As air, they'd expose the
                 // underside of everything above them.
@@ -209,6 +218,7 @@ pub fn downsample(src: &Grid, reg: &Registry, min_solid: u8, level: u32) -> Grid
                         None => votes.push((s, weight)),
                     }
                 }
+                let mut buried_surface = !votes.is_empty();
                 if solid >= min_solid {
                     // Anything visible beats rock that's out of sight.
                     let state = if votes.is_empty() {
@@ -216,11 +226,21 @@ pub fn downsample(src: &Grid, reg: &Registry, min_solid: u8, level: u32) -> Grid
                     } else {
                         pick(&votes, &infos, reg)
                     };
+                    buried_surface &= reg.get(state).is_fluid();
                     out.states[col * h + y] = if level >= REAL_FLUID_HEIGHT_LEVEL {
                         fluid_at_real_height(state, &columns, y, &infos, reg)
                     } else {
                         state
                     };
+                }
+                // This voxel lost a solid child to water above it, or to too few
+                // children. If only hidden rock is left under it, that child was
+                // the surface, and without it there'd be a hole: it moves down.
+                if buried_surface && y > 0 && out.states[col * h + y - 1] == hidden {
+                    votes.retain(|v| !infos[v.0 as usize].is_fluid());
+                    if !votes.is_empty() {
+                        out.states[col * h + y - 1] = pick(&votes, &infos, reg);
+                    }
                 }
             }
             // The biome of the child column with the most visible voxels.
@@ -627,6 +647,24 @@ mod tests {
         assert_eq!(fluid_ninths(reg.get(up.states[0])), 4);
         // Finer levels keep the voxel full.
         assert_eq!(downsample(&g2, &reg, 2, 1).states[0], water);
+    }
+
+    #[test]
+    fn a_surface_that_loses_its_vote_moves_down_instead_of_leaving_a_hole() {
+        let reg = Registry::new(Baker::new(AssetFiles::new()));
+        let sand = reg.id("minecraft:sand", &mut []);
+        let water = reg.id("minecraft:water", &mut []);
+        let hidden = reg.id(HIDDEN_NAME, &mut []);
+        // Bottom voxel all hidden rock. In the voxel above, one column has sand
+        // and everything else is water, so water wins it.
+        let mut g = Grid::empty(2, 4, 0);
+        for c in 0..4 {
+            g.states[c * 4..c * 4 + 2].fill(hidden);
+            g.states[c * 4 + 2..c * 4 + 4].fill(water);
+        }
+        g.states[2] = sand;
+        let d = downsample(&g, &reg, 2, 1);
+        assert_eq!(d.states, vec![sand, water]);
     }
 
     #[test]

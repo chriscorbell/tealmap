@@ -17,7 +17,7 @@ use std::sync::Mutex;
 use std::time::{Instant, UNIX_EPOCH};
 
 /// Bump when output for the same input changes; forces a full re-render.
-pub const RENDER_VERSION: u32 = 4;
+pub const RENDER_VERSION: u32 = 5;
 const STATE_MAGIC: &[u8; 4] = b"TMS2";
 /// State from before it remembered the region file: just hashes.
 const OLD_STATE_MAGIC: &[u8; 4] = b"TMS1";
@@ -455,7 +455,7 @@ impl MapCtx {
                 continue;
             }
             let path = dir.join(format!("{tx}_{tz}.tmh"));
-            let filled = volume.fill(x0, z0, &self.settings, &|cx, cz| src.get(cx, cz));
+            let filled = volume.fill(x0, z0, &self.settings, &self.reg, &|cx, cz| src.get(cx, cz));
             let encoded = if filled {
                 mesher.mesh(&volume, &self.reg, &self.settings)
             } else {
