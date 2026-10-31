@@ -10,6 +10,7 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use futures_util::Stream;
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
@@ -26,6 +27,8 @@ struct AppState {
     maps_dir: PathBuf,
     maps: Arc<Vec<serde_json::Value>>,
     events: broadcast::Sender<String>,
+    /// Gzipped viewer assets by path, for the ones worth compressing.
+    gzipped: Arc<HashMap<String, Vec<u8>>>,
 }
 
 pub fn run(cfg: Config, pool: rayon::ThreadPool) -> Result<()> {
@@ -39,6 +42,15 @@ pub fn run(cfg: Config, pool: rayon::ThreadPool) -> Result<()> {
         maps_dir: cfg.data_dir.join("maps"),
         maps: Arc::new(maps),
         events: tx.clone(),
+        // Debug builds read the viewer from disk, so it can change under a running server.
+        gzipped: Arc::new(if cfg!(debug_assertions) {
+            HashMap::new()
+        } else {
+            gzip_assets(
+                Viewer::iter()
+                    .filter_map(|p| Some((p.to_string(), Viewer::get(&p)?.data.into_owned()))),
+            )
+        }),
     };
 
     // Render loop on its own thread; rendering itself runs on the rayon pool.
@@ -192,7 +204,56 @@ async fn map_file(
     (h, body).into_response()
 }
 
-async fn viewer(uri: Uri) -> Response {
+/// Gzips the text assets once, at their smallest, since they never change
+/// while the server runs and every first visit downloads them.
+fn gzip_assets(files: impl Iterator<Item = (String, Vec<u8>)>) -> HashMap<String, Vec<u8>> {
+    let mut compressor = libdeflater::Compressor::new(libdeflater::CompressionLvl::best());
+    files
+        .filter(|(path, _)| {
+            let mime = mime_guess::from_path(path).first_or_octet_stream();
+            let kind = mime.essence_str();
+            kind.starts_with("text/")
+                || kind.ends_with("javascript")
+                || kind.ends_with("json")
+                || kind.ends_with("+xml")
+        })
+        .filter_map(|(path, data)| {
+            let mut gz = vec![0; compressor.gzip_compress_bound(data.len())];
+            let n = compressor.gzip_compress(&data, &mut gz).ok()?;
+            gz.truncate(n);
+            (n < data.len()).then_some((path, gz))
+        })
+        .collect()
+}
+
+/// Whether the client takes gzip, per its Accept-Encoding header. A wildcard
+/// only speaks for codings the header doesn't name.
+fn accepts_gzip(headers: &HeaderMap) -> bool {
+    let Some(accepted) = headers
+        .get(header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return false;
+    };
+    let mut wildcard = false;
+    for coding in accepted.split(',') {
+        let mut parts = coding.split(';').map(str::trim);
+        let name = parts.next().unwrap_or("");
+        let refused = parts.any(|p| {
+            p.split_once('=').is_some_and(|(k, q)| {
+                k.trim().eq_ignore_ascii_case("q")
+                    && q.trim().parse::<f32>().is_ok_and(|q| q == 0.0)
+            })
+        });
+        if name.eq_ignore_ascii_case("gzip") {
+            return !refused;
+        }
+        wildcard |= name == "*" && !refused;
+    }
+    wildcard
+}
+
+async fn viewer(State(s): State<AppState>, uri: Uri, req_headers: HeaderMap) -> Response {
     let path = uri.path().trim_start_matches('/');
     let (file, path) = match Viewer::get(path) {
         Some(f) => (f, path),
@@ -214,12 +275,71 @@ async fn viewer(uri: Uri) -> Response {
         "no-cache"
     };
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static(cache));
+    if let Some(gz) = s.gzipped.get(path) {
+        h.insert(header::VARY, HeaderValue::from_static("accept-encoding"));
+        if accepts_gzip(&req_headers) {
+            h.insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+            return (h, gz.clone()).into_response();
+        }
+    }
     (h, file.data.into_owned()).into_response()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gzip_negotiation() {
+        let accepts = |v: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(header::ACCEPT_ENCODING, HeaderValue::from_str(v).unwrap());
+            accepts_gzip(&h)
+        };
+        assert!(accepts("gzip"));
+        assert!(accepts("gzip, deflate, br, zstd"));
+        assert!(accepts("br;q=1.0, GZIP;q=0.5"));
+        assert!(accepts("*"));
+        assert!(!accepts("br"));
+        assert!(!accepts("identity"));
+        assert!(!accepts("gzip;q=0"));
+        assert!(!accepts("gzip; q=0.0, br"));
+        assert!(!accepts("gzip;Q=0"));
+        assert!(!accepts("gzip;q=0, *;q=1"));
+        assert!(!accepts("*;q=1, gzip;q=0"));
+        assert!(!accepts("*;q=0"));
+        assert!(!accepts_gzip(&HeaderMap::new()));
+    }
+
+    #[test]
+    fn only_text_that_shrinks_is_gzipped() {
+        let text = b"const tealmap = 1;\n".repeat(200);
+        let gz = gzip_assets(
+            [
+                ("assets/a.js", text.clone()),
+                ("assets/a.css", text.clone()),
+                ("index.html", text.clone()),
+                ("favicon.svg", text.clone()),
+                ("x.png", text.clone()),
+                ("tiny.css", b"a".to_vec()),
+            ]
+            .into_iter()
+            .map(|(p, d)| (p.to_string(), d)),
+        );
+        let mut names: Vec<_> = gz.keys().map(String::as_str).collect();
+        names.sort();
+        assert_eq!(
+            names,
+            ["assets/a.css", "assets/a.js", "favicon.svg", "index.html"]
+        );
+        let mut out = Vec::new();
+        std::io::Read::read_to_end(
+            &mut flate2::read::GzDecoder::new(&gz["assets/a.js"][..]),
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(out, text);
+    }
 
     #[test]
     fn path_allowlist() {
