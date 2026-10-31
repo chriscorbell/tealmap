@@ -48,6 +48,7 @@ export interface CameraState {
 const BG = [0x0b / 255, 0x14 / 255, 0x16 / 255]
 const TILE = 64
 const MAX_INFLIGHT = 32
+const NEAR = 2
 /** Tiles swap with a dissolve: the incoming one draws the pixels the outgoing one drops. */
 const FADE_MS = 200
 const UPLOAD_BYTES_PER_FRAME = 12e6
@@ -81,6 +82,8 @@ interface Tile {
   tops: Int16Array | null
   lastWanted: number
   drawn: boolean
+  /** Whether it has ever been drawn. */
+  shown: boolean
   /** Start of the current dissolve in or out, 0 when settled. */
   fadeStart: number
   /** Camera distance, for drawing nearest first. */
@@ -89,6 +92,12 @@ interface Tile {
 
 /** A number per tile: coordinates of any map fit, and it hashes faster than a string. */
 const key = (level: number, x: number, z: number) => ((x + 0x200000) * 0x400000 + (z + 0x200000)) * 16 + level
+/** Whether two tiles cover any of the same ground. */
+const overlap = (a: Tile, b: Tile) => {
+  const [fine, coarse] = a.level < b.level ? [a, b] : [b, a]
+  const up = coarse.level - fine.level
+  return fine.x >> up === coarse.x && fine.z >> up === coarse.z
+}
 const CHILD_OFFSETS = [[0, 0], [1, 0], [0, 1], [1, 1]]
 const EMPTY_KIDS: [number, number, number][] = []
 
@@ -182,6 +191,7 @@ export class MapEngine {
   private gpuTimer: GpuTimer | null = null
 
   private canvas: HTMLCanvasElement
+  private disposed = false
   private asleep = false
   private sleepTimer = 0
   private idleFrames = 0
@@ -217,7 +227,7 @@ export class MapEngine {
     this.renderer = new Renderer(gl)
     gl.clearColor(BG[0], BG[1], BG[2], 1)
 
-    this.camera = new PerspectiveCamera(55, 1, 2, 120000)
+    this.camera = new PerspectiveCamera(55, 1, NEAR, 120000)
     this.controls = new MapControls(this.camera, canvas)
     this.controls.enableDamping = true
     this.controls.dampingFactor = 0.12
@@ -245,6 +255,8 @@ export class MapEngine {
   }
 
   dispose() {
+    this.disposed = true
+    this.generation++
     cancelAnimationFrame(this.raf)
     clearTimeout(this.sleepTimer)
     window.removeEventListener('resize', this.resize)
@@ -253,7 +265,7 @@ export class MapEngine {
     this.clearTiles()
     this.workers.dispose()
     this.controls.dispose()
-    this.gl.getExtension('WEBGL_lose_context')?.loseContext()
+    this.renderer.dispose()
   }
 
   private resize = () => {
@@ -270,6 +282,7 @@ export class MapEngine {
 
   /** Loads a map. `view` restores a camera position (e.g. from the URL). */
   async setMap(map: MapInfo, view?: { x: number; z: number; dist: number; az: number; polar: number }) {
+    if (this.disposed) return
     const gen = ++this.generation
     this.clearTiles()
     this.map = map
@@ -618,15 +631,36 @@ export class MapEngine {
     }
     for (const [x, z] of this.roots) visit(m.lodLevels, x, z, false)
 
-    // Swap what's drawn, dissolving tiles in and out.
+    // Swap what's drawn. A dissolve hands pixels from one tile to another, so it
+    // only runs between tiles that overlap, or the first time a tile appears. A
+    // tile that's only crossing the edge of the view switches at once; dissolving
+    // it would show the background through it.
+    const on: Tile[] = []
+    const off: Tile[] = []
     for (const t of this.tiles.values()) {
-      const on = draw.has(t)
-      if (on !== t.drawn) {
-        t.drawn = on
-        t.fadeStart = now
-        this.fading.add(t)
-      }
+      if (draw.has(t) !== t.drawn) (t.drawn ? off : on).push(t)
     }
+    const dissolve = (t: Tile) => {
+      t.fadeStart = now
+      this.fading.add(t)
+    }
+    const switchNow = (t: Tile) => {
+      t.fadeStart = 0
+      this.fading.delete(t)
+    }
+    for (const t of on) {
+      if (!t.shown || off.some((o) => overlap(t, o))) dissolve(t)
+      else switchNow(t)
+    }
+    for (const t of off) {
+      if (on.some((o) => overlap(t, o))) dissolve(t)
+      else switchNow(t)
+    }
+    for (const t of on) {
+      t.drawn = true
+      t.shown = true
+    }
+    for (const t of off) t.drawn = false
     this.visible = [...draw]
     for (const t of this.fading) if (!t.drawn && t.mesh) this.visible.push(t)
     this.visible.sort((a, b) => a.distance - b.distance)
@@ -682,6 +716,7 @@ export class MapEngine {
       tops: null,
       lastWanted: now,
       drawn: false,
+      shown: false,
       fadeStart: 0,
       distance: 0,
     }
@@ -784,6 +819,7 @@ export class MapEngine {
   // ---------------------------------------------------------------- frame
 
   private sleepTick = () => {
+    if (this.disposed) return
     this.plan(performance.now())
     if (this.planWants || this.dirty) this.wake()
     else this.sleepTimer = window.setTimeout(this.sleepTick, SLEEP_MS)
@@ -792,7 +828,7 @@ export class MapEngine {
   private wake = () => {
     clearTimeout(this.sleepTimer)
     this.idleFrames = 0
-    if (!this.asleep) return
+    if (!this.asleep || this.disposed) return
     this.asleep = false
     this.raf = requestAnimationFrame(this.frame)
   }
@@ -800,6 +836,16 @@ export class MapEngine {
   private frame = (now: number) => {
     this.raf = requestAnimationFrame(this.frame)
     const moved = this.controls.update()
+
+    // Nothing is closer than the top of the world, so the near plane can follow
+    // the camera up. Depth precision depends on it: at a whole-map view, a near
+    // plane of 2 can't tell a water surface from a seabed 15 blocks under it.
+    const clearance = this.camera.position.y - (this.manifest?.maxY ?? 320)
+    const near = Math.max(NEAR, clearance / 2)
+    if (near !== this.camera.near) {
+      this.camera.near = near
+      this.camera.updateProjectionMatrix()
+    }
 
     // Keep the orbit target on the terrain surface.
     const t = this.controls.target
@@ -882,16 +928,15 @@ export class MapEngine {
     const r = this.renderer
     const cam = this.camera.position
     const camera = [cam.x, cam.y, cam.z]
-    const dissolve = (t: Tile) => {
-      if (!t.fadeStart) return 1
-      const k = Math.min(1, (now - t.fadeStart) / FADE_MS)
-      return t.drawn ? k : -k
-    }
+    // Coming in, a tile draws the pixels below k. Going out, it drops them.
+    const progress = (t: Tile) => (t.fadeStart ? Math.min(1, (now - t.fadeStart) / FADE_MS) : 1)
+    const appear = (t: Tile) => (t.fadeStart && t.drawn ? progress(t) : 1)
+    const fade = (t: Tile) => (t.fadeStart && !t.drawn ? progress(t) : 0)
     r.begin()
     r.startPass(Pass.Opaque)
-    for (const t of this.visible) if (!t.fadeStart) r.add(Pass.Opaque, t.mesh!, camera, false, 1)
+    for (const t of this.visible) if (!t.fadeStart) r.add(Pass.Opaque, t.mesh!, camera, false, 1, 0)
     r.startPass(Pass.OpaqueFade)
-    for (const t of this.visible) if (t.fadeStart) r.add(Pass.OpaqueFade, t.mesh!, camera, false, dissolve(t))
+    for (const t of this.visible) if (t.fadeStart) r.add(Pass.OpaqueFade, t.mesh!, camera, false, appear(t), fade(t))
     r.startPass(Pass.Cutout)
     for (const t of this.visible) {
       // Leaf faces that touch other leaves only show up close; past LEAF_NEAR the
@@ -900,10 +945,14 @@ export class MapEngine {
       const dx = Math.max(t.x * size - cam.x, 0, cam.x - (t.x + 1) * size)
       const dz = Math.max(t.z * size - cam.z, 0, cam.z - (t.z + 1) * size)
       const near = Math.hypot(dx, dz)
-      r.add(Pass.Cutout, t.mesh!, camera, near < LEAF_NEAR, dissolve(t), near < PLANT_NEAR)
+      r.add(Pass.Cutout, t.mesh!, camera, near < LEAF_NEAR, appear(t), fade(t), near < PLANT_NEAR)
     }
+    // Blending needs the far tiles first.
     r.startPass(Pass.Translucent)
-    for (const t of this.visible) r.add(Pass.Translucent, t.mesh!, camera, false, dissolve(t))
+    for (let i = this.visible.length - 1; i >= 0; i--) {
+      const t = this.visible[i]
+      r.add(Pass.Translucent, t.mesh!, camera, false, appear(t), fade(t))
+    }
 
     // The view without its translation; positions reach the shader camera-relative.
     this.camera.updateMatrixWorld()

@@ -196,7 +196,19 @@ const instrument = () => {
         if (f.calls > 0) {
           // Waiting for the GPU keeps frames from queueing up and stalling in bursts,
           // so each frame's time is its own.
-          P.gl.readPixels(0, 0, 1, 1, P.gl.RGBA, P.gl.UNSIGNED_BYTE, P.pixel)
+          if (P.holeCheck) {
+            // The share of the middle of the screen showing background. Anything
+            // more than the odd pixel over mapped terrain is a hole.
+            const gl = P.gl
+            const [w, h] = [Math.floor(gl.drawingBufferWidth * 0.4), Math.floor(gl.drawingBufferHeight * 0.4)]
+            if (P.holePixels?.length !== w * h * 4) P.holePixels = new Uint8Array(w * h * 4)
+            gl.readPixels(Math.floor(gl.drawingBufferWidth * 0.3), Math.floor(gl.drawingBufferHeight * 0.3), w, h, gl.RGBA, gl.UNSIGNED_BYTE, P.holePixels)
+            let n = 0
+            for (let i = 0; i < P.holePixels.length; i += 4) {
+              if (Math.abs(P.holePixels[i] - 0x0b) <= 3 && Math.abs(P.holePixels[i + 1] - 0x14) <= 3 && Math.abs(P.holePixels[i + 2] - 0x16) <= 3) n++
+            }
+            f.hole = n / (w * h)
+          } else P.gl.readPixels(0, 0, 1, 1, P.gl.RGBA, P.gl.UNSIGNED_BYTE, P.pixel)
           f.total = performance.now() - t
           f.at = t
           if (P.recording) P.frames.push(f)
@@ -473,6 +485,26 @@ async function main() {
         }
       })()`)),
     }
+  }
+
+  // Zooming far in and out swaps tiles fastest, which is where a dissolve can
+  // leave a hole. Frame times don't count here: this pass reads pixels back.
+  if (!args.nopath) {
+    const [x, z] = views[0]
+    // Start from a settled view, so tiles still arriving don't count as holes.
+    await ev(`window.tealmap.goTo({ x: ${x}, z: ${z}, dist: 22000, az: 35, polar: 35 })`)
+    await settle()
+    await ev('(window.__bench.holeCheck = true, 0)')
+    const raw = await record(
+      600,
+      `(i) => {
+        const k = i / 600
+        t.goTo({ x: ${x} + 500 * Math.sin(k * 6), z: ${z} + 400 * Math.sin(k * 4), dist: 12000 + 10000 * Math.cos(k * 12), az: 35 + 15 * Math.sin(k * 8), polar: 35 + 6 * Math.sin(k * 5) })
+      }`,
+    )
+    await ev('(window.__bench.holeCheck = false, 0)')
+    const holes = raw.frames.map((f) => f.hole).filter((v) => v !== undefined)
+    result.holes = { frames: holes.length, framesOver1Percent: holes.filter((v) => v > 0.01).length, worstShare: round(Math.max(0, ...holes), 4) }
   }
 
   result.heapMB = await ev('+((performance.memory?.usedJSHeapSize ?? 0) / 1e6).toFixed(0)')
