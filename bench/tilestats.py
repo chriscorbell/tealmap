@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Quad statistics of a rendered map: counts per level, group and face direction,
-heights, table sizes and how many quads greedy merging could remove.
+heights and table sizes.
 
     bench/tilestats.py <map dir> [--sample N]
 """
@@ -21,16 +21,43 @@ def direction(t):
     if nx and not ny and not nz: return 4 if nx < 0 else 5
     return 6
 
-def full_face(t):
-    xs, ys, zs = t[0::3][:4], t[1::3][:4], t[2::3][:4]
-    for c in (xs, ys, zs):
-        if not (min(c) in (64, 128) and max(c) in (64, 128)): return False
-    return True
-
 def read(path):
     with open(path, 'rb') as f: raw = f.read()
     b = gzip.decompress(raw)
-    assert b[:4] == b'TMH2'
+    if b[:4] == b'TMH2': return read2(raw, b)
+    assert b[:4] == b'TMH3'
+    ox, oy, oz = struct.unpack_from('<iii', b, 4)
+    streams = struct.unpack_from('<28I', b, 20)
+    nt, np_ = struct.unpack_from('<II', b, 132)
+    o = 140
+    field = lambda k, i: b[o+k*2*nt+i] | b[o+k*2*nt+nt+i] << 8
+    templates = [tuple(field(k, i) for k in range(22)) for i in range(nt)]
+    o += nt*44
+    colors = [b[o+i] | b[o+np_+i] << 8 | b[o+2*np_+i] << 16 for i in range(np_)]
+    o += np_*3
+    quads = []
+    counts = [0, 0, 0, 0]
+    for s_, n in enumerate(streams):
+        g, d = s_ // 7, s_ % 7
+        counts[g] += n
+        pl, vl, ul, wl, hl, tl, cl = o, o+2*n, o+4*n, o+5*n, o+6*n, o+7*n, o+9*n
+        o += 11*n
+        p = v = u = 0
+        for i in range(n):
+            dp = b[pl+i] | b[pl+n+i] << 8
+            dv = b[vl+i] | b[vl+n+i] << 8
+            du = b[ul+i]
+            new_plane = dp != 0 or i == 0
+            p += dp
+            v = dv if new_plane else v + dv
+            u = du if (new_plane or dv != 0) else u + du
+            if d in (2, 3): x, y, z = u, v, p
+            elif d in (4, 5): x, y, z = p, v, u
+            else: x, y, z = u, p, v
+            quads.append((g, x, y, z, b[tl+i] | b[tl+n+i] << 8, b[cl+i] | b[cl+n+i] << 8))
+    return dict(raw=len(raw), size=len(b), counts=counts, nt=nt, np=np_, templates=templates, colors=colors, quads=quads, origin=(ox, oy, oz))
+
+def read2(raw, b):
     ox, oy, oz = struct.unpack_from('<iii', b, 4)
     counts = struct.unpack_from('<4I', b, 20)
     nt, np_ = struct.unpack_from('<II', b, 36)
@@ -56,42 +83,9 @@ def read(path):
                     q += 1
     return dict(raw=len(raw), size=len(b), counts=counts, nt=nt, np=np_, templates=templates, colors=colors, quads=quads, origin=(ox, oy, oz))
 
-def greedy(quads, templates, colors, ignore_rotation):
-    """Greedy-merges full cube faces in each plane. Returns merged quad count."""
-    planes = collections.defaultdict(dict)
-    rest = 0
-    for (g, x, y, z, ti, ci) in quads:
-        t = templates[ti]
-        d = direction(t)
-        if d == 6 or not full_face(t):
-            rest += 1
-            continue
-        c = colors[ci] & 0xffffff
-        layer = t[20]
-        key = (layer, c, g) if ignore_rotation else (layer, c, g, t[12:20])
-        if d < 2: p, u, v = y, x, z
-        elif d < 4: p, u, v = z, x, y
-        else: p, u, v = x, z, y
-        planes[(d, p)][(u, v)] = key
-    merged = rest
-    for cells in planes.values():
-        seen = set()
-        for (u, v) in sorted(cells):
-            if (u, v) in seen: continue
-            k = cells[(u, v)]
-            w = 1
-            while (u+w, v) in cells and (u+w, v) not in seen and cells[(u+w, v)] == k: w += 1
-            h = 1
-            while all((u+i, v+h) in cells and (u+i, v+h) not in seen and cells[(u+i, v+h)] == k for i in range(w)): h += 1
-            for i in range(w):
-                for j in range(h): seen.add((u+i, v+j))
-            merged += 1
-    return merged
-
 ap = argparse.ArgumentParser()
 ap.add_argument('dir')
 ap.add_argument('--sample', type=int, default=150)
-ap.add_argument('--greedy', type=int, default=30)
 a = ap.parse_args()
 random.seed(7)
 levels = {'0': []}
@@ -119,9 +113,3 @@ for l in sorted(levels):
     print('  by group: ' + '  '.join(f"{GROUPS[g]} {by_g[g]/max(total,1)*100:.1f}%" for g in range(4)))
     print('  by dir:   ' + '  '.join(f"{DIRS[d]} {by_d[d]/max(total,1)*100:.1f}%" for d in range(7)))
     print('  by y:     ' + '  '.join(f"{y}:{c/max(total,1)*100:.0f}%" for y, c in sorted(ys.items())))
-    gt = tiles[:a.greedy]
-    q = sum(len(t['quads']) for t in gt)
-    if q:
-        g1 = sum(greedy(t['quads'], t['templates'], t['colors'], False) for t in gt)
-        g2 = sum(greedy(t['quads'], t['templates'], t['colors'], True) for t in gt)
-        print(f"  greedy over {len(gt)} tiles: exact template {g1/q*100:.0f}% of quads remain; ignoring rotation {g2/q*100:.0f}% remain")

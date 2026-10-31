@@ -11,17 +11,20 @@ use anyhow::{Context, Result};
 use rayon::prelude::*;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Instant, UNIX_EPOCH};
 
 /// Bump when output for the same input changes; forces a full re-render.
-pub const RENDER_VERSION: u32 = 3;
-const STATE_MAGIC: &[u8; 4] = b"TMS1";
+pub const RENDER_VERSION: u32 = 4;
+const STATE_MAGIC: &[u8; 4] = b"TMS2";
+/// State from before it remembered the region file: just hashes.
+const OLD_STATE_MAGIC: &[u8; 4] = b"TMS1";
 /// Hires tiles per render thread in each batch of a pass, about 20 seconds
 /// of work.
 const BATCH_TILES_PER_THREAD: usize = 256;
+const NO_STAMP: (u64, u64) = (u64::MAX, u64::MAX);
 
 pub struct MapCtx {
     pub cfg: MapConfig,
@@ -30,7 +33,59 @@ pub struct MapCtx {
     pub settings: Settings,
     /// Region file (mtime, size) seen at the last successful scan.
     seen: Mutex<HashMap<(i32, i32), (u64, u64)>>,
+    /// What's on disk, once read, so manifests don't list directories.
+    index: Mutex<Option<MapIndex>>,
     batch_tiles: usize,
+}
+
+/// Which tiles exist.
+#[derive(Default)]
+struct MapIndex {
+    /// Hires tile mask per region, with bit `(tz % 8) * 8 + tx % 8`.
+    hires: BTreeMap<(i32, i32), u64>,
+    /// LOD tiles with a mesh, per level (index 0 is level 1).
+    lod: Vec<BTreeSet<(i32, i32)>>,
+    /// The manifest last written, to skip writing an identical one.
+    written: Option<Vec<u8>>,
+    render_version: Option<Option<u32>>,
+}
+
+impl MapIndex {
+    fn set_hires(&mut self, tx: i32, tz: i32, exists: bool) {
+        let region = (tx.div_euclid(8), tz.div_euclid(8));
+        let bit = 1u64 << (tz.rem_euclid(8) * 8 + tx.rem_euclid(8));
+        let mask = self.hires.entry(region).or_default();
+        if exists {
+            *mask |= bit;
+        } else {
+            *mask &= !bit;
+            if *mask == 0 {
+                self.hires.remove(&region);
+            }
+        }
+    }
+
+    /// LOD nodes that sit over a hires tile but have no mesh, sorted.
+    fn lod_missing(&self) -> Vec<[i32; 3]> {
+        let mut out = Vec::new();
+        let mut nodes: BTreeSet<(i32, i32)> = BTreeSet::new();
+        for (&(rx, rz), &mask) in &self.hires {
+            for bit in (0..64).filter(|b| mask >> b & 1 == 1) {
+                nodes.insert((rx * 8 + (bit & 7), rz * 8 + (bit >> 3)));
+            }
+        }
+        for level in 1..=lod::LEVELS {
+            nodes = nodes.iter().map(|&(x, z)| (x >> 1, z >> 1)).collect();
+            let meshes = &self.lod[level as usize - 1];
+            out.extend(
+                nodes
+                    .iter()
+                    .filter(|n| !meshes.contains(n))
+                    .map(|&(x, z)| [level as i32, x, z]),
+            );
+        }
+        out
+    }
 }
 
 #[derive(Default, Debug, Serialize, Clone)]
@@ -106,6 +161,7 @@ impl MapCtx {
             out,
             settings,
             seen: Mutex::new(HashMap::new()),
+            index: Mutex::new(None),
             batch_tiles: BATCH_TILES_PER_THREAD,
         })
     }
@@ -137,6 +193,12 @@ impl MapCtx {
             // Output from older versions that this one no longer writes.
             let _ = std::fs::remove_dir_all(self.out.join("lowres"));
         }
+        if prev != Some(RENDER_VERSION) {
+            // Another version's LOD sources can't feed this one's tiles.
+            for level in 1..=lod::LEVELS {
+                let _ = std::fs::remove_dir_all(self.out.join("lod").join(format!("src{level}")));
+            }
+        }
         let fresh = !self.out.join("map.json").exists();
         self.write_textures(full || fresh)?;
         if fresh {
@@ -157,7 +219,7 @@ impl MapCtx {
         let mut scans = scans;
         for (rx, rz) in self.stored_regions()? {
             if !present.contains(&(rx, rz)) {
-                let old = self.load_state(rx, rz);
+                let (old, _) = self.load_state(rx, rz);
                 let dirty = (0..1024).filter(|&i| old[i] != 0).collect();
                 scans.push(RegionScan {
                     rx,
@@ -208,6 +270,7 @@ impl MapCtx {
             let mut up = Update::default();
             up.add(&results, &lod);
             pass.add(&results, &lod);
+            self.update_index(&results, &lod);
             failed.extend(results.iter().flat_map(|r| r.failed.iter().copied()));
             finished.extend(batch.iter().map(|j| j.0));
             rendered += batch.iter().map(|j| j.1.len()).sum::<usize>();
@@ -255,8 +318,10 @@ impl MapCtx {
                 ok = false;
             }
         }
-        self.save_state(s.rx, s.rz, &hashes)?;
-        if ok && let Some(st) = s.stamp {
+        // A failed chunk leaves no stamp, so the region is scanned again.
+        let stamp = s.stamp.filter(|_| ok);
+        self.save_state(s.rx, s.rz, &hashes, stamp)?;
+        if let Some(st) = stamp {
             self.seen.lock().unwrap().insert((s.rx, s.rz), st);
         }
         Ok(())
@@ -281,7 +346,7 @@ impl MapCtx {
             .collect();
         let mut lod_changed = Vec::new();
         for level in 1..=lod::LEVELS {
-            let built: Vec<(i32, i32, bool)> = pool.install(|| {
+            let built: Vec<LodBuild> = pool.install(|| {
                 dirty
                     .par_iter()
                     .map_init(
@@ -293,12 +358,14 @@ impl MapCtx {
             lod_changed.extend(
                 built
                     .iter()
-                    .filter(|b| b.2)
-                    .map(|&(x, z, _)| [level as i32, x, z]),
+                    .filter(|b| b.mesh_changed)
+                    .map(|b| [level as i32, b.x, b.z]),
             );
+            // A tile whose source came out the same changes nothing above it.
             dirty = built
                 .iter()
-                .flat_map(|&(x, z, _)| lod::tiles_using_source(x, z))
+                .filter(|b| b.source_changed)
+                .flat_map(|b| lod::tiles_using_source(b.x, b.z))
                 .collect();
         }
         Ok(lod_changed)
@@ -317,7 +384,12 @@ impl MapCtx {
         }
         // Full renders still compare against saved state, so chunks that have
         // since disappeared get their stale tiles cleared too.
-        let old = self.load_state(rx, rz);
+        let (old, saved_stamp) = self.load_state(rx, rz);
+        // Saved state remembers the file, so a restart doesn't reread the world.
+        if !full && saved_stamp == Some(stamp) {
+            self.seen.lock().unwrap().insert((rx, rz), stamp);
+            return Ok(None);
+        }
         let region = Region::open(path, rx, rz)?;
         let mut raw = Vec::new();
         let mut hashes = vec![0u64; 1024];
@@ -394,19 +466,18 @@ impl MapCtx {
                 .then(|| lod::hires_source(&volume, &self.reg, self.cfg.min_y, self.cfg.max_y))
                 .flatten();
             let source_path = lod::source_path(&self.out, 1, tx, tz);
-            match &source {
-                Some(g) => lod::save_source(&source_path, g, &self.reg)?,
-                None if source_path.exists() => std::fs::remove_file(&source_path)?,
-                None => {}
+            if lod::write_source(&source_path, source.as_ref(), &self.reg)? {
+                res.sources.push((tx, tz));
             }
-            res.sources.push((tx, tz));
             match encoded {
                 Some(data) => {
                     res.vertices += vertex_count(&data);
                     gzip_into(&data, &mut gz);
-                    write_atomic(&path, &gz)?;
                     res.bytes += gz.len() as u64;
-                    res.tiles.push((tx, tz));
+                    // An unchanged tile keeps its file, so caches stay good.
+                    if write_if_changed(&path, &gz)? {
+                        res.tiles.push((tx, tz));
+                    }
                 }
                 None => {
                     res.empty += 1;
@@ -429,7 +500,7 @@ impl MapCtx {
         z: i32,
         volume: &mut Volume,
         mesher: &mut Mesher,
-    ) -> Result<(i32, i32, bool)> {
+    ) -> Result<LodBuild> {
         let (tile, parent) = lod::build_tile(
             &self.out,
             &self.reg,
@@ -442,12 +513,11 @@ impl MapCtx {
             mesher,
         )?;
         let path = lod::tile_path(&self.out, level, x, z);
-        let changed = match tile {
+        let mesh_changed = match tile {
             Some(data) => {
                 let mut gz = Vec::new();
                 gzip_into(&data, &mut gz);
-                write_atomic(&path, &gz)?;
-                true
+                write_if_changed(&path, &gz)?
             }
             None if path.exists() => {
                 std::fs::remove_file(&path)?;
@@ -455,43 +525,65 @@ impl MapCtx {
             }
             None => false,
         };
-        if level < lod::LEVELS {
-            let src = lod::source_path(&self.out, level + 1, x, z);
-            match parent {
-                Some(g) => lod::save_source(&src, &g, &self.reg)?,
-                None if src.exists() => std::fs::remove_file(&src)?,
-                None => {}
-            }
-        }
-        Ok((x, z, changed))
+        let source_changed = level < lod::LEVELS
+            && lod::write_source(
+                &lod::source_path(&self.out, level + 1, x, z),
+                parent.as_ref(),
+                &self.reg,
+            )?;
+        Ok(LodBuild {
+            x,
+            z,
+            mesh_changed,
+            source_changed,
+        })
     }
 
     fn state_path(&self, rx: i32, rz: i32) -> PathBuf {
         self.out.join("state").join(format!("{rx}_{rz}.bin"))
     }
 
-    fn load_state(&self, rx: i32, rz: i32) -> Vec<u64> {
+    /// A region's saved chunk hashes, and the (mtime, size) of the file they
+    /// describe if it was read cleanly. State is magic, stamp, then hashes; a
+    /// stamp of all ones means there isn't one.
+    fn load_state(&self, rx: i32, rz: i32) -> (Vec<u64>, Option<(u64, u64)>) {
         let mut out = vec![0u64; 1024];
-        if let Ok(b) = std::fs::read(self.state_path(rx, rz))
-            && b.len() == 4 + 1024 * 8
-            && &b[..4] == STATE_MAGIC
-        {
-            for (i, c) in b[4..].chunks_exact(8).enumerate() {
+        let mut stamp = None;
+        if let Ok(b) = std::fs::read(self.state_path(rx, rz)) {
+            let hashes = if b.len() == 4 + 16 + 1024 * 8 && &b[..4] == STATE_MAGIC {
+                let at = |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+                stamp = Some((at(4), at(12))).filter(|&s| s != NO_STAMP);
+                &b[20..]
+            } else if b.len() == 4 + 1024 * 8 && &b[..4] == OLD_STATE_MAGIC {
+                &b[4..]
+            } else {
+                &[]
+            };
+            for (i, c) in hashes.chunks_exact(8).enumerate() {
                 out[i] = u64::from_le_bytes(c.try_into().unwrap());
             }
         }
-        out
+        (out, stamp)
     }
 
-    fn save_state(&self, rx: i32, rz: i32, hashes: &[u64]) -> Result<()> {
+    fn save_state(
+        &self,
+        rx: i32,
+        rz: i32,
+        hashes: &[u64],
+        stamp: Option<(u64, u64)>,
+    ) -> Result<()> {
         let path = self.state_path(rx, rz);
         if hashes.iter().all(|&h| h == 0) {
             let _ = std::fs::remove_file(&path);
             return Ok(());
         }
         std::fs::create_dir_all(path.parent().unwrap())?;
-        let mut b = Vec::with_capacity(4 + 1024 * 8);
+        let mut b = Vec::with_capacity(4 + 16 + 1024 * 8);
         b.extend_from_slice(STATE_MAGIC);
+        let (mtime, size) = stamp.unwrap_or(NO_STAMP);
+        b.extend_from_slice(&mtime.to_le_bytes());
+        b.extend_from_slice(&size.to_le_bytes());
         for h in hashes {
             b.extend_from_slice(&h.to_le_bytes());
         }
@@ -519,14 +611,59 @@ impl MapCtx {
     /// The render version of the map's tiles and state. A map with neither
     /// is new, so it counts as current.
     fn stored_version(&self) -> Result<Option<u32>> {
-        let listed = std::fs::read(self.out.join("map.json"))
-            .ok()
-            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-            .and_then(|v| v["renderVersion"].as_u64());
-        Ok(match listed {
-            Some(v) => Some(v as u32),
+        let mut guard = self.index.lock().unwrap();
+        let index = self.index_mut(&mut guard);
+        if let Some(v) = index.render_version {
+            return Ok(v);
+        }
+        let listed = read_manifest(&self.out.join("map.json"))
+            .and_then(|v| v["renderVersion"].as_u64())
+            .map(|v| v as u32);
+        let v = match listed {
+            Some(v) => Some(v),
             None => self.stored_regions()?.is_empty().then_some(RENDER_VERSION),
+        };
+        index.render_version = Some(v);
+        Ok(v)
+    }
+
+    /// The index, read from disk the first time.
+    fn index_mut<'g>(&self, guard: &'g mut Option<MapIndex>) -> &'g mut MapIndex {
+        guard.get_or_insert_with(|| {
+            let mut index = MapIndex {
+                hires: hires_masks(&self.out.join("hires")).into_iter().collect(),
+                lod: vec![BTreeSet::new(); lod::LEVELS as usize],
+                ..Default::default()
+            };
+            for [l, x, z] in lod_tiles(&self.out.join("lod")) {
+                index.lod[l as usize - 1].insert((x, z));
+            }
+            index
         })
+    }
+
+    /// Records what a batch changed on disk.
+    fn update_index(&self, results: &[RegionResult], lod_changed: &[[i32; 3]]) {
+        let mut guard = self.index.lock().unwrap();
+        let index = self.index_mut(&mut guard);
+        for r in results {
+            for &(x, z) in &r.tiles {
+                let path = self
+                    .out
+                    .join("hires")
+                    .join(format!("{}_{}", x.div_euclid(8), z.div_euclid(8)))
+                    .join(format!("{x}_{z}.tmh"));
+                index.set_hires(x, z, path.exists());
+            }
+        }
+        for &[l, x, z] in lod_changed {
+            let set = &mut index.lod[l as usize - 1];
+            if lod::tile_path(&self.out, l as u32, x, z).exists() {
+                set.insert((x, z));
+            } else {
+                set.remove(&(x, z));
+            }
+        }
     }
 
     fn write_textures(&self, force: bool) -> Result<()> {
@@ -540,6 +677,20 @@ impl MapCtx {
     }
 
     fn write_manifest(&self, render_version: Option<u32>) -> Result<()> {
+        let mut guard = self.index.lock().unwrap();
+        let index = self.index_mut(&mut guard);
+        let hires: Vec<[i64; 4]> = index
+            .hires
+            .iter()
+            .map(|(&(rx, rz), &mask)| {
+                [
+                    rx as i64,
+                    rz as i64,
+                    (mask & 0xffff_ffff) as i64,
+                    (mask >> 32) as i64,
+                ]
+            })
+            .collect();
         let manifest = serde_json::json!({
             "id": self.cfg.id,
             "name": self.cfg.display_name(),
@@ -549,21 +700,40 @@ impl MapCtx {
             "maxY": self.cfg.max_y,
             "tileSize": TILE,
             "textures": self.reg.baker.textures.count(),
-            "hires": hires_masks(&self.out.join("hires")),
-            "lod": lod_tiles(&self.out.join("lod")),
+            "hires": hires,
+            "lodMissing": index.lod_missing(),
             "lodLevels": lod::LEVELS,
         });
-        write_atomic(
-            &self.out.join("map.json"),
-            serde_json::to_string(&manifest)?.as_bytes(),
-        )
+        let json = serde_json::to_vec(&manifest)?;
+        index.render_version = Some(render_version);
+        if index.written.as_deref() == Some(&json) {
+            return Ok(());
+        }
+        let mut gz = Vec::new();
+        gzip_into(&json, &mut gz);
+        write_atomic(&self.out.join("map.json"), &gz)?;
+        index.written = Some(json);
+        Ok(())
     }
 }
 
-/// Which hires tiles exist, per region: `[rx, rz, low 32 bits, high 32 bits]`
-/// of a 64-bit mask with bit `(tz % 8) * 8 + tx % 8`. Lets the viewer request
-/// hires tiles without waiting for lowres data.
-fn hires_masks(dir: &Path) -> Vec<[i64; 4]> {
+/// A map's manifest as written, gzipped or from an older version in plain JSON.
+fn read_manifest(path: &Path) -> Option<serde_json::Value> {
+    let raw = std::fs::read(path).ok()?;
+    if raw.starts_with(&[0x1f, 0x8b]) {
+        let mut json = Vec::new();
+        flate2::read::GzDecoder::new(&raw[..])
+            .read_to_end(&mut json)
+            .ok()?;
+        serde_json::from_slice(&json).ok()
+    } else {
+        serde_json::from_slice(&raw).ok()
+    }
+}
+
+/// Which hires tiles are on disk, as a mask per region with bit
+/// `(tz % 8) * 8 + tx % 8`.
+fn hires_masks(dir: &Path) -> Vec<((i32, i32), u64)> {
     let mut out = Vec::new();
     let Ok(rd) = std::fs::read_dir(dir) else {
         return out;
@@ -588,15 +758,9 @@ fn hires_masks(dir: &Path) -> Vec<[i64; 4]> {
             }
         }
         if mask != 0 {
-            out.push([
-                rx as i64,
-                rz as i64,
-                (mask & 0xffff_ffff) as i64,
-                (mask >> 32) as i64,
-            ]);
+            out.push(((rx, rz), mask));
         }
     }
-    out.sort_unstable();
     out
 }
 
@@ -680,6 +844,14 @@ struct RegionResult {
     vertices: u64,
 }
 
+/// What building one LOD tile changed.
+struct LodBuild {
+    x: i32,
+    z: i32,
+    mesh_changed: bool,
+    source_changed: bool,
+}
+
 /// Tiles whose volume (tile plus one-block halo) includes chunk (cx, cz).
 fn tiles_touching(cx: i32, cz: i32) -> impl Iterator<Item = (i32, i32)> {
     let span = |c: i32| {
@@ -693,8 +865,9 @@ fn tiles_touching(cx: i32, cz: i32) -> impl Iterator<Item = (i32, i32)> {
 }
 
 fn vertex_count(tile: &[u8]) -> u64 {
-    (0..4)
-        .map(|g| u32::from_le_bytes(tile[20 + g * 4..24 + g * 4].try_into().unwrap()) as u64 * 4)
+    tile[20..132]
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()) as u64 * 4)
         .sum()
 }
 
@@ -713,6 +886,15 @@ pub fn gzip_into(data: &[u8], out: &mut Vec<u8>) {
         let n = c.gzip_compress(data, out).expect("the bound fits");
         out.truncate(n);
     });
+}
+
+/// Writes a file unless it already holds exactly `data`. Returns whether it did.
+pub fn write_if_changed(path: &Path, data: &[u8]) -> Result<bool> {
+    if std::fs::read(path).is_ok_and(|old| old == data) {
+        return Ok(false);
+    }
+    write_atomic(path, data)?;
+    Ok(true)
 }
 
 pub fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
@@ -865,8 +1047,7 @@ mod tests {
 
     /// The hires tiles the map's manifest lists, as snapshot paths.
     fn listed_hires(map: &Path) -> BTreeSet<String> {
-        let manifest: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(map.join("map.json")).unwrap()).unwrap();
+        let manifest = read_manifest(&map.join("map.json")).unwrap();
         let mut listed = BTreeSet::new();
         for e in manifest["hires"].as_array().unwrap() {
             let v: Vec<i64> = e

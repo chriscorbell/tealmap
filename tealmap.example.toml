@@ -16,5 +16,7 @@ world = "/worlds/main/world/dimensions/minecraft/overworld"
 version = "26.2"
 # Optional: mod jars to read biome definitions from (e.g. Terralith).
 # mods = "/worlds/main/mods"
-# Optional: unlit blocks below this y and below the ocean floor aren't rendered.
+# Optional: blocks with no sky light below this y and the ocean floor aren't
+# rendered. Nor are faces with no light at all, at any y, under the ocean floor.
+# Set this below the world's bottom to render everything.
 # remove_caves_below_y = 55

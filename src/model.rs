@@ -77,20 +77,115 @@ pub enum Tint {
 /// plus 64, 4 UVs (u, v) in 1/4096 texture, and a texture layer.
 pub type Template = [u16; 21];
 
-#[derive(Clone, Debug)]
-pub struct Quad {
-    /// Its template's id in [`Baker::template`]. Equal shapes share an id.
-    pub template: u32,
-    /// The lowest and highest corner offset in y, as stored in the template.
-    pub y_range: (u16, u16),
-    pub layer: Layer,
-    pub cull: Option<u8>,
-    /// Direction to sample light from, the face normal snapped to an axis.
-    pub light_dir: u8,
-    pub tinted: bool,
-    pub shade: f32,
-    /// Corner positions in block units, kept to test whether a quad covers a face.
-    pos: [[f32; 3]; 4],
+/// How a template behaves when neighboring faces merge.
+#[derive(Clone, Copy, Debug)]
+pub struct TemplateInfo {
+    /// The direction it faces: a block face, or [`DIR_OTHER`].
+    pub dir: u8,
+    /// Spans a whole block along u or v, so neighbors can merge along it.
+    pub merge_u: bool,
+    pub merge_v: bool,
+    /// What a viewer needs to stretch it, as stored in a tile: bits 0-3 say which
+    /// corners sit at the far end of u, bits 4-7 the same for v, and the rest are
+    /// (u, v) texture steps per block along u then v, as 2-bit codes.
+    pub stretch: u16,
+}
+
+/// A template that isn't axis-aligned, like a plant's crossed faces.
+pub const DIR_OTHER: u8 = 6;
+const UV_SCALE: i32 = 4096;
+
+/// The block axes a face's merging runs along, as (u, v).
+pub fn merge_axes(dir: u8) -> (usize, usize) {
+    match dir {
+        NORTH | SOUTH => (0, 1),
+        WEST | EAST => (2, 1),
+        _ => (0, 2),
+    }
+}
+
+impl TemplateInfo {
+    fn new(t: &Template) -> Self {
+        let dir = template_dir(t);
+        let mut info = TemplateInfo {
+            dir,
+            merge_u: false,
+            merge_v: false,
+            stretch: 0,
+        };
+        if dir == DIR_OTHER {
+            return info;
+        }
+        let (u, v) = merge_axes(dir);
+        let extent = |a: usize| {
+            let c = [t[a], t[3 + a], t[6 + a], t[9 + a]];
+            (*c.iter().min().unwrap(), *c.iter().max().unwrap(), c)
+        };
+        let ((u0, u1, us), (v0, v1, vs)) = (extent(u), extent(v));
+        if u0 == u1 || v0 == v1 {
+            return info;
+        }
+        // Only a true rectangle stretches: every corner at one end of each axis,
+        // and one corner in each of the four positions.
+        let mut at = [None; 4];
+        let mut stretch = 0;
+        for k in 0..4 {
+            if (us[k] != u0 && us[k] != u1) || (vs[k] != v0 && vs[k] != v1) {
+                return info;
+            }
+            let (far_u, far_v) = (us[k] == u1, vs[k] == v1);
+            stretch |= (far_u as u16) << k | (far_v as u16) << (4 + k);
+            at[far_u as usize + 2 * far_v as usize] = Some(k);
+        }
+        let [Some(c00), Some(c10), Some(c01), Some(c11)] = at else {
+            return info;
+        };
+        let uv = |k: usize| [t[12 + k * 2] as i32, t[13 + k * 2] as i32];
+        let sub = |a: [i32; 2], b: [i32; 2]| [a[0] - b[0], a[1] - b[1]];
+        let (per_u, per_v) = (sub(uv(c10), uv(c00)), sub(uv(c01), uv(c00)));
+        if sub(uv(c11), uv(c01)) != per_u {
+            return info;
+        }
+        // Textures repeat, so a merged quad keeps its pattern only if each block
+        // spans a whole texture or stays put along each texture axis.
+        let whole = |d: [i32; 2]| d.iter().all(|&x| x == 0 || x.abs() == UV_SCALE);
+        const BLOCK: u16 = 64;
+        info.merge_u = u1 - u0 == BLOCK && whole(per_u);
+        info.merge_v = v1 - v0 == BLOCK && whole(per_v);
+        if info.merge_u || info.merge_v {
+            let code = |x: i32| (x.signum() + 1) as u16;
+            info.stretch = stretch
+                | code(per_u[0]) << 8
+                | code(per_u[1]) << 10
+                | code(per_v[0]) << 12
+                | code(per_v[1]) << 14;
+        }
+        info
+    }
+}
+
+/// The face direction of a template, from its corners' winding.
+fn template_dir(t: &Template) -> u8 {
+    let p = |k: usize| [t[k * 3] as i32, t[k * 3 + 1] as i32, t[k * 3 + 2] as i32];
+    let (o, a, b) = (p(0), p(1), p(2));
+    let (a, b) = (
+        [a[0] - o[0], a[1] - o[1], a[2] - o[2]],
+        [b[0] - o[0], b[1] - o[1], b[2] - o[2]],
+    );
+    let n = [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ];
+    match n {
+        [0, y, 0] if y < 0 => DOWN,
+        [0, y, 0] if y > 0 => UP,
+        [0, 0, z] if z < 0 => NORTH,
+        [0, 0, z] if z > 0 => SOUTH,
+        [x, 0, 0] if x < 0 => WEST,
+        [x, 0, 0] if x > 0 => EAST,
+        _ => DIR_OTHER,
+    }
 }
 
 /// What [`Baker::quad`] needs to bake a quad.
@@ -105,6 +200,22 @@ pub struct QuadShape {
     pub light_dir: u8,
     pub tinted: bool,
     pub shade: f32,
+}
+
+#[derive(Clone, Debug)]
+pub struct Quad {
+    /// Its template's id in [`Baker::template`]. Equal shapes share an id.
+    pub template: u32,
+    /// The lowest and highest corner offset in y, as stored in the template.
+    pub y_range: (u16, u16),
+    pub layer: Layer,
+    pub cull: Option<u8>,
+    /// Direction to sample light from, the face normal snapped to an axis.
+    pub light_dir: u8,
+    pub tinted: bool,
+    pub shade: f32,
+    /// Corner positions in block units, kept to test whether a quad covers a face.
+    pos: [[f32; 3]; 4],
 }
 
 /// A corner coordinate relative to its anchor block, in 1/64 block plus 64,
@@ -165,6 +276,11 @@ impl BlockInfo {
     #[inline]
     pub fn is_fluid(&self) -> bool {
         self.flags & (F_WATER | F_LAVA) != 0
+    }
+    /// The first weighted variant's quads.
+    #[inline]
+    pub fn first_variant(&self) -> &[Quad] {
+        self.variants.first().map_or(&[], |v| &v.quads)
     }
     /// Picks a weighted variant deterministically from a block position.
     #[inline]
@@ -253,7 +369,7 @@ pub struct Baker {
     blockstates: DashMap<String, Option<Arc<Value>>>,
     models: DashMap<String, Option<Arc<RawModel>>>,
     template_ids: DashMap<Template, u32>,
-    templates: boxcar::Vec<Template>,
+    templates: boxcar::Vec<(Template, TemplateInfo)>,
 }
 
 // Resolved models are only used while baking, so plain borrowed Arcs suffice.
@@ -289,12 +405,8 @@ impl Baker {
         }
         tpl[20] = q.tex;
         let ys = [tpl[1], tpl[4], tpl[7], tpl[10]];
-        let template = *self
-            .template_ids
-            .entry(tpl)
-            .or_insert_with(|| self.templates.push(tpl) as u32);
         Quad {
-            template,
+            template: self.intern(tpl),
             y_range: (*ys.iter().min().unwrap(), *ys.iter().max().unwrap()),
             layer: q.layer,
             cull: q.cull,
@@ -305,8 +417,19 @@ impl Baker {
         }
     }
 
+    fn intern(&self, t: Template) -> u32 {
+        *self
+            .template_ids
+            .entry(t)
+            .or_insert_with(|| self.templates.push((t, TemplateInfo::new(&t))) as u32)
+    }
+
     pub fn template(&self, id: u32) -> &Template {
-        &self.templates[id as usize]
+        &self.templates[id as usize].0
+    }
+
+    pub fn template_info(&self, id: u32) -> TemplateInfo {
+        self.templates[id as usize].1
     }
 
     fn blockstate(&self, name: &str) -> Option<Arc<Value>> {
@@ -565,6 +688,23 @@ impl Baker {
 
     /// Bakes one block state. `props` are the state's properties, sorted by key.
     pub fn bake_state(&self, name: &str, props: &[(String, String)]) -> BlockInfo {
+        if name == HIDDEN_NAME {
+            return BlockInfo {
+                visible: false,
+                always_culled: true,
+                lod_counts: true,
+                lod_volume: 0,
+                lod_full_form: std::sync::OnceLock::new(),
+                name: name.to_owned(),
+                key: String::new(),
+                variants: Vec::new(),
+                total_weight: 0,
+                occludes: 0x3f,
+                tint: Tint::Fixed([0; 3]),
+                flags: 0,
+                fluid_level: 0,
+            };
+        }
         let short = split_id(name).1;
         let prop = |k: &str| prop(props, k);
         let mut flags = 0;
@@ -904,6 +1044,9 @@ pub struct Registry {
 }
 
 pub const AIR: u16 = 0;
+/// A LOD voxel that's solid but out of sight, like rock under the surface: it
+/// culls the faces around it and draws nothing.
+pub const HIDDEN_NAME: &str = "tealmap:hidden";
 
 impl Registry {
     pub fn new(baker: Baker) -> Self {
@@ -932,10 +1075,11 @@ impl Registry {
         }
         *self.ids.entry(key.clone()).or_insert_with(|| {
             let mut info = self.baker.bake_state(name, props);
-            info.lod_counts = info.visible
-                && (info.occludes != 0
-                    || info.is_fluid()
-                    || info.flags & (F_LEAVES | F_CULL_SAME) != 0);
+            info.lod_counts = name == HIDDEN_NAME
+                || info.visible
+                    && (info.occludes != 0
+                        || info.is_fluid()
+                        || info.flags & (F_LEAVES | F_CULL_SAME) != 0);
             info.lod_volume = if info.occludes == 0x3f || info.is_fluid() {
                 8
             } else {

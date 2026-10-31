@@ -28,6 +28,8 @@ const { values: args } = parseArgs({
     software: { type: 'boolean', default: false },
     warm: { type: 'boolean', default: false },
     nopath: { type: 'boolean', default: false },
+    // Extra query parameters for the viewer, like farpx=2&msaa=0.
+    query: { type: 'string', default: '' },
   },
 })
 
@@ -50,6 +52,7 @@ const instrument = () => {
     gl: null,
     queries: [],
     gpu: [],
+    pixel: new Uint8Array(4),
   })
   new PerformanceObserver((l) => {
     for (const e of l.getEntries()) P.longTasks.push({ start: e.startTime, ms: e.duration })
@@ -185,11 +188,19 @@ const instrument = () => {
         f.ms = performance.now() - t
         if (q) {
           P.gl.endQuery(P.ext.TIME_ELAPSED_EXT)
-          P.queries.push(q)
+          // Only frames that draw count; this also skips the harness's own rAFs.
+          if (f.calls > 0) P.queries.push(q)
+          else P.gl.deleteQuery(q)
         }
         P.current = null
-        f.at = t
-        if (P.recording) P.frames.push(f)
+        if (f.calls > 0) {
+          // Waiting for the GPU keeps frames from queueing up and stalling in bursts,
+          // so each frame's time is its own.
+          P.gl.readPixels(0, 0, 1, 1, P.gl.RGBA, P.gl.UNSIGNED_BYTE, P.pixel)
+          f.total = performance.now() - t
+          f.at = t
+          if (P.recording) P.frames.push(f)
+        }
       }
     })
 }
@@ -272,7 +283,8 @@ async function main() {
   const onNet = (m) => {
     if (m.method === 'Network.requestWillBeSent') {
       net.requests++
-      net.inflight.add(m.params.requestId)
+      // The live-update stream never finishes.
+      if (!m.params.request.url.includes('/api/events')) net.inflight.add(m.params.requestId)
       net.byUrl.set(m.params.requestId, m.params.request.url)
     }
     if (m.method === 'Network.loadingFinished' || m.method === 'Network.loadingFailed') {
@@ -328,7 +340,7 @@ async function main() {
 
   const result = { label: args.label, dpr: Number(args.dpr), size: [Number(args.width), Number(args.height)] }
   const [x0, z0, d0, a0, p0] = views[0]
-  const url = `${args.url}/?bench#${args.map}/${x0}/${z0}/${d0}/${a0}/${p0}`
+  const url = `${args.url}/?bench${args.query ? `&${args.query}` : ''}#${args.map}/${x0}/${z0}/${d0}/${a0}/${p0}`
   const t0 = performance.now()
   await send('Page.navigate', { url })
 
@@ -389,13 +401,14 @@ async function main() {
     })()`)
 
   const report = (raw) => {
-    const f = raw.frames.filter((x) => x.calls > 0)
+    const f = raw.frames
     const intervals = []
-    for (let i = 1; i < raw.frames.length; i++) intervals.push(raw.frames[i].at - raw.frames[i - 1].at)
+    for (let i = 1; i < f.length; i++) intervals.push(f[i].at - f[i - 1].at)
     const avg = (k) => round(f.reduce((a, x) => a + x[k], 0) / Math.max(f.length, 1), 1)
     return {
       drew: f.length,
       cpuMs: summarize(f.map((x) => x.ms)),
+      totalMs: summarize(f.map((x) => x.total)),
       gpuMs: summarize(raw.gpu),
       intervalMs: summarize(intervals),
       calls: avg('calls'),
