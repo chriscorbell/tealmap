@@ -127,9 +127,12 @@ export class Renderer {
   constructor(gl: WebGL2RenderingContext) {
     this.gl = gl
     this.multiDraw = gl.getExtension('WEBGL_multi_draw')
+    // A bigger screen shows more tiles at full detail. These are 64 and 16 MB on
+    // a 1080p screen or smaller, and up to twice that on anything larger.
     const maxSize = gl.getParameter(gl.MAX_TEXTURE_SIZE) as number
-    const quadHeight = Math.min(4096, maxSize)
-    const tableHeight = Math.min(2048, maxSize)
+    const screenScale = Math.min(2, Math.max(1, (screen.width * screen.height) / (1920 * 1080)))
+    const quadHeight = Math.min(Math.ceil(4096 * screenScale), maxSize)
+    const tableHeight = Math.min(Math.ceil(2048 * screenScale), maxSize)
     const storage = (unit: number, internal: number, w: number, h: number) => {
       const t = gl.createTexture()!
       gl.activeTexture(gl.TEXTURE0 + unit)

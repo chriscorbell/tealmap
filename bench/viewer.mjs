@@ -428,7 +428,18 @@ async function main() {
     const tv = performance.now()
     await ev(`window.tealmap.goTo(${set})`)
     const s = await settle()
-    await sleep(600)
+    // The orbit target eases onto the terrain; screenshots compare only once it's still.
+    await ev(`(async () => {
+      let still = 0
+      let y = NaN
+      for (let i = 0; i < 600 && still < 20; i++) {
+        await new Promise((r) => requestAnimationFrame(r))
+        const now = window.tealmap.controls.target.y
+        still = Math.abs(now - y) < 1e-4 ? still + 1 : 0
+        y = now
+      }
+    })()`)
+    await sleep(400)
     await shoot(`view${i}`)
     const raw = await record(Number(args.frames), `(i) => { t.goTo({x:${x},z:${z},dist:${d},az:${a} + (i % 2) * 0.002,polar:${p}}) }`)
     result.views.push({ view: views[i], settleMs: s === null ? null : round(s, 0), wireMB: round((net.bytes - before) / 1e6), ...report(raw) })

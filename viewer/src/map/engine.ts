@@ -281,6 +281,9 @@ export class MapEngine {
     // Subscribe first so an update published while loading isn't missed.
     this.listen()
     let manifest: Manifest
+    // A fresh server publishes each map once its first render starts, and the
+    // textures come with it. Asking for both at once saves a round trip.
+    let textures = fetch(`/maps/${map.id}/textures.bin`)
     for (;;) {
       const res = await fetch(`/maps/${map.id}/map.json`, { cache: 'no-cache' })
       if (gen !== this.generation) return
@@ -288,11 +291,10 @@ export class MapEngine {
         manifest = await res.json()
         break
       }
-      // A fresh server publishes each map once its first render starts.
       await new Promise((r) => setTimeout(r, 3000))
+      textures = fetch(`/maps/${map.id}/textures.bin`)
     }
-    const texRes = await fetch(`/maps/${map.id}/textures.bin`)
-    const texData = new Uint8Array(await texRes.arrayBuffer())
+    const texData = new Uint8Array(await (await textures).arrayBuffer())
     if (gen !== this.generation) return
     this.setManifest(manifest)
     this.renderer.setBlockTextures(texData, manifest.textures)
