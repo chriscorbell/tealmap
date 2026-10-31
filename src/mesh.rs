@@ -248,8 +248,36 @@ impl Volume {
         }
         self.caves_below = settings.remove_caves_below_y;
         self.remove_dark = settings.remove_caves_below_y > settings.min_y;
+        self.lower_floors_to_opaque(reg);
         self.build_lit();
         true
+    }
+
+    /// The game's ocean floor sits on anything solid, like ice or leaves. For
+    /// deciding what's buried, it has to be something you can't see through, or
+    /// a seabed under ice would count as underground.
+    fn lower_floors_to_opaque(&mut self, reg: &Registry) {
+        let infos = reg.snapshot();
+        for vz in 0..W {
+            for vx in 0..W {
+                let col = vz * W + vx;
+                let floor = self.floor[col];
+                if floor == i32::MIN {
+                    continue;
+                }
+                let mut vy = floor - 1 - self.y0;
+                while vy > 0 && vy < self.h as i32 {
+                    let id = self.blocks[self.idx(vx, vy as usize, vz)];
+                    if infos[id as usize].occludes == 0x3f {
+                        break;
+                    }
+                    vy -= 1;
+                }
+                if vy < self.h as i32 {
+                    self.floor[col] = vy + 1 + self.y0;
+                }
+            }
+        }
     }
 
     /// Copies a section's biome cells that overlap the volume.
@@ -654,6 +682,11 @@ impl Mesher {
                     }
                     let info = infos[id as usize];
                     if !info.visible || v.cave(vx, vy, vz) {
+                        // Solid rock out of sight still roofs what's under it.
+                        // Only air starts a new run.
+                        if border && info.occludes == 0x3f {
+                            self.open_above[col] = false;
+                        }
                         continue;
                     }
                     let wx = v.x0 + vx as i32 - 1;
@@ -744,7 +777,7 @@ impl Mesher {
                             biomes[v.biome(vx, vy, vz) as usize].water
                         };
                         let dark = |facing| v.dark_face(facing, vx, vy, vz);
-                        self.fluid(v, &infos, reg, i, lava, tex, base, color, &dark);
+                        self.fluid(v, &infos, reg, i, lava, tex, base, color, s.lod, &dark);
                     }
                 }
             }
@@ -859,6 +892,7 @@ impl Mesher {
         tex: u16,
         base: [i32; 3],
         color: [u8; 3],
+        lod: bool,
         dark: &dyn Fn(usize) -> bool,
     ) {
         let same = |n: usize| {
@@ -905,6 +939,10 @@ impl Mesher {
                 0xff
             } else if d == UP {
                 v.light[i].max(v.light[up])
+            } else if lod {
+                // A deep voxel of water loses all its sky light, but its surface
+                // is still in the open.
+                v.light[n].max(v.light[i]).max(v.light[up])
             } else {
                 v.light[n].max(v.light[i])
             };
@@ -1391,6 +1429,43 @@ mod tests {
         );
         assert!(east_covers(4), "the skirt covers two voxels");
         assert!(!east_covers(3), "faces below the skirt still cull");
+    }
+
+    #[test]
+    fn hidden_rock_keeps_the_bottom_of_the_world_from_growing_skirts() {
+        let reg = registry();
+        let stone = reg.id("minecraft:stone", &mut []);
+        let hidden = reg.id(crate::model::HIDDEN_NAME, &mut []);
+        // Stone on top, hidden rock under it, then one layer of stone at the
+        // bottom, in every column including the ring around the tile.
+        let h = 16;
+        let mut g = crate::lod::Grid::empty(W, h, 0);
+        for c in 0..W * W {
+            g.states[c * h] = stone;
+            g.states[c * h + 1..c * h + 10].fill(hidden);
+            g.states[c * h + 10] = stone;
+        }
+        let mut v = Volume::new();
+        assert!(v.fill_grid(&g, 0, 0, &reg, 2));
+        let s = Settings {
+            min_y: 0,
+            remove_caves_below_y: i32::MIN,
+            lod: true,
+        };
+        let tile = Mesher::new().mesh(&v, &reg, &s).unwrap();
+        let skirts = |y: u16| {
+            decode(&tile)
+                .iter()
+                .filter(|q| {
+                    q.dir >= NORTH as usize
+                        && q.dir <= EAST as usize
+                        && q.y <= y + 1
+                        && y + 1 < q.y + q.h
+                })
+                .count()
+        };
+        assert!(skirts(10) > 0, "the surface has skirts");
+        assert_eq!(skirts(0), 0, "the layer under the hidden rock has none");
     }
 
     #[test]

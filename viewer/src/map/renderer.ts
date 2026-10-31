@@ -110,6 +110,7 @@ export class Renderer {
   private programs: WebGLProgram[] = []
   private uniforms: Record<'viewProj' | 'cam' | 'firstDraw' | 'fogColor' | 'fogRange', WebGLUniformLocation | null>[] = []
   private blockTex: WebGLTexture | null = null
+  private poolTextures: WebGLTexture[]
   private index: WebGLBuffer
   private indexQuads = 0
   private quadRows: RowPool
@@ -140,10 +141,13 @@ export class Renderer {
       gl.texStorage2D(gl.TEXTURE_2D, 1, internal, w, h)
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST)
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST)
+      return t
     }
-    storage(0, gl.RG32UI, QUAD_ROW, quadHeight)
-    storage(1, gl.RGBA16UI, TABLE_ROW, tableHeight)
-    storage(2, gl.RGBA32F, DRAWS_PER_ROW * 2, DRAW_ROWS)
+    this.poolTextures = [
+      storage(0, gl.RG32UI, QUAD_ROW, quadHeight),
+      storage(1, gl.RGBA16UI, TABLE_ROW, tableHeight),
+      storage(2, gl.RGBA32F, DRAWS_PER_ROW * 2, DRAW_ROWS),
+    ]
     this.quadRows = new RowPool(quadHeight)
     this.tableRows = new RowPool(tableHeight)
 
@@ -181,6 +185,15 @@ export class Renderer {
     gl.enable(gl.DEPTH_TEST)
     gl.enable(gl.CULL_FACE)
     gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1)
+  }
+
+  /** Frees what this renderer holds. The context stays usable: a canvas only ever has one. */
+  dispose() {
+    const gl = this.gl
+    for (const t of this.poolTextures) gl.deleteTexture(t)
+    if (this.blockTex) gl.deleteTexture(this.blockTex)
+    for (const p of this.programs) gl.deleteProgram(p)
+    gl.deleteBuffer(this.index)
   }
 
   private growIndex(quads: number) {
@@ -284,9 +297,9 @@ export class Renderer {
   /**
    * Adds a tile's visible streams to the current pass. Streams that face away
    * from the camera are skipped: an east-facing wall can only be seen from east
-   * of it. `dissolve` is 1 when settled, 0..1 coming in, and -1..0 going out.
+   * of it. A pixel draws if its noise is below `appear` and not below `fade`.
    */
-  add(pass: Pass, m: Mesh, cam: ArrayLike<number>, leafInterior: boolean, dissolve: number, plants = true) {
+  add(pass: Pass, m: Mesh, cam: ArrayLike<number>, leafInterior: boolean, appear: number, fade: number, plants = true) {
     // Faces can reach past their tile; two voxels of slack cover it.
     const slack = 2 * m.scale
     const [ox, oy, oz] = m.origin
@@ -316,7 +329,8 @@ export class Renderer {
         dd[o + 3] = m.scale / 64
         dd[o + 4] = m.first[s]
         dd[o + 5] = m.tableBase
-        dd[o + 6] = dissolve
+        dd[o + 6] = appear
+        dd[o + 7] = fade
         this.drawn++
         this.triangles += n * 2
         this.passStart[pass + 1] = this.drawn
@@ -349,6 +363,11 @@ export class Renderer {
         gl.enable(gl.BLEND)
         gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA)
         gl.depthMask(false)
+        // Water wins ties against a seabed close under it. The offset is a few
+        // steps of depth buffer, which is nothing up close and only counts far
+        // away, where those steps are big enough to lose the seabed's distance.
+        gl.enable(gl.POLYGON_OFFSET_FILL)
+        gl.polygonOffset(0, -4)
       }
       if (this.multiDraw) {
         gl.uniform1i(u.firstDraw, start)
@@ -364,6 +383,7 @@ export class Renderer {
       if (pass === Pass.Translucent) {
         gl.disable(gl.BLEND)
         gl.depthMask(true)
+        gl.disable(gl.POLYGON_OFFSET_FILL)
       }
     }
     return { calls, triangles: this.triangles }

@@ -17,7 +17,7 @@ use std::sync::Mutex;
 use std::time::{Instant, UNIX_EPOCH};
 
 /// Bump when output for the same input changes; forces a full re-render.
-pub const RENDER_VERSION: u32 = 5;
+pub const RENDER_VERSION: u32 = 6;
 const STATE_MAGIC: &[u8; 4] = b"TMS2";
 /// State from before it remembered the region file: just hashes.
 const OLD_STATE_MAGIC: &[u8; 4] = b"TMS1";

@@ -63,7 +63,7 @@ export const vertexShader = /* glsl */ `
     int tp = base - 1 - int((w.y >> 13) & 8191u);
     vColor = vec3(texelFetch(uTables, ivec2(tp & 1023, tp >> 10), 0).rgb) / 255.0;
     #ifdef FADE
-      vDissolve = vec2(d1.z >= 0.0 ? d1.z : 1.0, d1.z < 0.0 ? -d1.z : 0.0);
+      vDissolve = d1.zw;
     #endif
   }
 `
