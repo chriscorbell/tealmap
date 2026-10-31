@@ -42,9 +42,15 @@ pub fn run(cfg: Config, pool: rayon::ThreadPool) -> Result<()> {
         maps_dir: cfg.data_dir.join("maps"),
         maps: Arc::new(maps),
         events: tx.clone(),
-        gzipped: Arc::new(gzip_assets(Viewer::iter().filter_map(|p| {
-            Some((p.to_string(), Viewer::get(&p)?.data.into_owned()))
-        }))),
+        // Debug builds read the viewer from disk, so it can change under a running server.
+        gzipped: Arc::new(if cfg!(debug_assertions) {
+            HashMap::new()
+        } else {
+            gzip_assets(
+                Viewer::iter()
+                    .filter_map(|p| Some((p.to_string(), Viewer::get(&p)?.data.into_owned()))),
+            )
+        }),
     };
 
     // Render loop on its own thread; rendering itself runs on the rayon pool.
