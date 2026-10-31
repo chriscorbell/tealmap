@@ -6,7 +6,7 @@ use crate::lod;
 use crate::mesh::{Mesher, Settings, TILE, Volume};
 use crate::model::{Baker, Registry};
 use crate::region::{Region, list_regions};
-use crate::world::{Chunk, decode_chunk};
+use crate::world::{Chunk, DecodeCache, decode_chunk};
 use anyhow::{Context, Result};
 use rayon::prelude::*;
 use serde::Serialize;
@@ -383,7 +383,7 @@ impl MapCtx {
                 continue;
             }
             let path = dir.join(format!("{tx}_{tz}.tmh"));
-            let filled = volume.fill(x0, z0, &|cx, cz| src.get(cx, cz));
+            let filled = volume.fill(x0, z0, &self.settings, &|cx, cz| src.get(cx, cz));
             let encoded = if filled {
                 mesher.mesh(&volume, &self.reg, &self.settings)
             } else {
@@ -391,15 +391,7 @@ impl MapCtx {
             };
             // The level 1 LOD source this tile leaves for its parent.
             let source = filled
-                .then(|| {
-                    lod::hires_source(
-                        &volume,
-                        &self.reg,
-                        &self.settings,
-                        self.cfg.min_y,
-                        self.cfg.max_y,
-                    )
-                })
+                .then(|| lod::hires_source(&volume, &self.reg, self.cfg.min_y, self.cfg.max_y))
                 .flatten();
             let source_path = lod::source_path(&self.out, 1, tx, tz);
             match &source {
@@ -411,11 +403,7 @@ impl MapCtx {
             match encoded {
                 Some(data) => {
                     res.vertices += vertex_count(&data);
-                    gz.clear();
-                    let mut enc =
-                        flate2::write::GzEncoder::new(&mut gz, flate2::Compression::new(6));
-                    enc.write_all(&data)?;
-                    enc.finish()?;
+                    gzip_into(&data, &mut gz);
                     write_atomic(&path, &gz)?;
                     res.bytes += gz.len() as u64;
                     res.tiles.push((tx, tz));
@@ -456,9 +444,9 @@ impl MapCtx {
         let path = lod::tile_path(&self.out, level, x, z);
         let changed = match tile {
             Some(data) => {
-                let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(6));
-                gz.write_all(&data)?;
-                write_atomic(&path, &gz.finish()?)?;
+                let mut gz = Vec::new();
+                gzip_into(&data, &mut gz);
+                write_atomic(&path, &gz)?;
                 true
             }
             None if path.exists() => {
@@ -710,6 +698,23 @@ fn vertex_count(tile: &[u8]) -> u64 {
         .sum()
 }
 
+thread_local! {
+    /// A compressor is big, so each thread keeps one. libdeflate's levels aren't
+    /// zlib's: this one is smaller than zlib's level 6 at a fraction of its time.
+    static COMPRESSOR: std::cell::RefCell<libdeflater::Compressor> = std::cell::RefCell::new(
+        libdeflater::Compressor::new(libdeflater::CompressionLvl::new(6).unwrap()),
+    );
+}
+
+/// Replaces `out` with `data` gzipped.
+pub fn gzip_into(data: &[u8], out: &mut Vec<u8>) {
+    COMPRESSOR.with_borrow_mut(|c| {
+        out.resize(c.gzip_compress_bound(data.len()), 0);
+        let n = c.gzip_compress(data, out).expect("the bound fits");
+        out.truncate(n);
+    });
+}
+
 pub fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -730,6 +735,7 @@ struct ChunkSource<'a> {
     chunks: HashMap<(i32, i32), Option<Chunk>>,
     raw: Vec<u8>,
     buf: Vec<u8>,
+    cache: DecodeCache,
 }
 
 impl<'a> ChunkSource<'a> {
@@ -740,6 +746,7 @@ impl<'a> ChunkSource<'a> {
             chunks: HashMap::new(),
             raw: Vec::new(),
             buf: Vec::new(),
+            cache: DecodeCache::default(),
         }
     }
 
@@ -765,8 +772,13 @@ impl<'a> ChunkSource<'a> {
             Some(r) => {
                 let (lx, lz) = (cx.rem_euclid(32) as usize, cz.rem_euclid(32) as usize);
                 if r.read_chunk(lx, lz, &mut self.raw, &mut self.buf)? {
-                    decode_chunk(&self.buf, &self.ctx.reg, self.ctx.cfg.min_y)
-                        .with_context(|| format!("chunk {cx},{cz}"))?
+                    decode_chunk(
+                        &self.buf,
+                        &self.ctx.reg,
+                        self.ctx.cfg.min_y,
+                        &mut self.cache,
+                    )
+                    .with_context(|| format!("chunk {cx},{cz}"))?
                 } else {
                     None
                 }
@@ -895,6 +907,7 @@ mod tests {
             let reg = bare_registry();
             let bedrock = reg.id("minecraft:bedrock", &mut []);
             let (mut full, mut single, mut min_section) = (0, 0, i32::MAX);
+            let mut cache = DecodeCache::default();
             let dir = fixture(version).join("region");
             for (rx, rz, path) in list_regions(&dir).unwrap() {
                 let region = Region::open(&path, rx, rz).unwrap();
@@ -906,7 +919,7 @@ mod tests {
                     {
                         continue;
                     }
-                    let Some(c) = decode_chunk(&buf, &reg, -64).unwrap() else {
+                    let Some(c) = decode_chunk(&buf, &reg, -64, &mut cache).unwrap() else {
                         continue;
                     };
                     full += 1;
@@ -915,7 +928,10 @@ mod tests {
                     // The bottom layer of the overworld is bedrock in every column.
                     let s = c.sections.iter().find(|s| s.y == -4).unwrap();
                     assert!(
-                        (0..256).all(|i| s.block(i) == bedrock),
+                        (0..256).all(|i| match &s.blocks {
+                            Some(b) => b[i] == bedrock,
+                            None => s.single == bedrock,
+                        }),
                         "{version}: y=-64 isn't all bedrock"
                     );
                 }

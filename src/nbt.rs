@@ -1,7 +1,7 @@
 //! Minimal, zero-copy NBT reader.
 //!
-//! Arrays and strings borrow from the input buffer, and callers can skip
-//! whole subtrees they don't need via [`read_root_filtered`].
+//! Arrays and strings borrow from the input buffer, and [`Reader`] walks the
+//! data without allocating, so callers pay only for the tags they read.
 
 use anyhow::{Result, bail};
 
@@ -55,45 +55,82 @@ impl<'a> Value<'a> {
         }
     }
 
-    pub fn as_list(&self) -> Option<&[Value<'a>]> {
-        match self {
-            Value::List(v) => Some(v),
-            _ => None,
-        }
-    }
-
     pub fn as_compound(&self) -> Option<&[(&'a [u8], Value<'a>)]> {
         match self {
             Value::Compound(v) => Some(v),
             _ => None,
         }
     }
-
-    pub fn as_bytes(&self) -> Option<&'a [u8]> {
-        match *self {
-            Value::ByteArray(b) => Some(b),
-            _ => None,
-        }
-    }
-
-    /// Long array decoded from big-endian. Returns an empty vec for other types.
-    pub fn long_array(&self) -> Vec<u64> {
-        match *self {
-            Value::LongArray(raw) => raw
-                .chunks_exact(8)
-                .map(|c| u64::from_be_bytes(c.try_into().unwrap()))
-                .collect(),
-            _ => Vec::new(),
-        }
-    }
 }
 
-struct Reader<'a> {
+/// A cursor over NBT data, for walking it without building a tree.
+pub struct Reader<'a> {
     buf: &'a [u8],
     pos: usize,
 }
 
 impl<'a> Reader<'a> {
+    pub fn new(buf: &'a [u8]) -> Self {
+        Reader { buf, pos: 0 }
+    }
+
+    /// Moves past the root tag and its name.
+    pub fn enter_root(&mut self) -> Result<()> {
+        if self.u8()? != 10 {
+            bail!("nbt: root is not a compound");
+        }
+        self.string()?;
+        Ok(())
+    }
+
+    /// The next entry of the current compound as (tag, name), or None at its end.
+    #[inline]
+    pub fn next_entry(&mut self) -> Result<Option<(u8, &'a [u8])>> {
+        let tag = self.u8()?;
+        if tag == 0 {
+            return Ok(None);
+        }
+        Ok(Some((tag, self.string()?)))
+    }
+
+    /// A list's element tag and length.
+    #[inline]
+    pub fn list_header(&mut self) -> Result<(u8, usize)> {
+        let elem = self.u8()?;
+        Ok((elem, self.len()?))
+    }
+
+    /// The payload of a byte array (tag 7) or a long array (tag 12), still in
+    /// file byte order.
+    #[inline]
+    pub fn array(&mut self, tag: u8) -> Result<&'a [u8]> {
+        let n = self.len()?;
+        match tag {
+            7 => self.take(n),
+            12 => self.take(n.checked_mul(8).ok_or_else(too_long)?),
+            _ => bail!("nbt: tag {tag} is not an array"),
+        }
+    }
+
+    /// Skips one payload and returns its raw bytes.
+    #[inline]
+    pub fn raw(&mut self, tag: u8) -> Result<&'a [u8]> {
+        let start = self.pos;
+        self.skip(tag, 1)?;
+        Ok(&self.buf[start..self.pos])
+    }
+
+    /// Skips one payload.
+    #[inline]
+    pub fn skip_payload(&mut self, tag: u8) -> Result<()> {
+        self.skip(tag, 1)
+    }
+
+    /// Parses one payload into a tree.
+    pub fn value(&mut self, tag: u8) -> Result<Value<'a>> {
+        self.payload(tag, 1)
+    }
+
     #[inline]
     fn take(&mut self, n: usize) -> Result<&'a [u8]> {
         let end = self.pos.checked_add(n).filter(|&e| e <= self.buf.len());
@@ -129,7 +166,7 @@ impl<'a> Reader<'a> {
         }
         Ok(n as usize)
     }
-    fn string(&mut self) -> Result<&'a [u8]> {
+    pub fn string(&mut self) -> Result<&'a [u8]> {
         let n = self.i16()? as u16 as usize;
         self.take(n)
     }
@@ -248,28 +285,8 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// Parses a root compound and keeps only the top-level keys accepted by `keep`.
-/// Everything else is skipped without allocating.
-pub fn read_root_filtered<'a>(buf: &'a [u8], keep: impl Fn(&[u8]) -> bool) -> Result<Value<'a>> {
-    let mut r = Reader { buf, pos: 0 };
-    if r.u8()? != 10 {
-        bail!("nbt: root is not a compound");
-    }
-    r.string()?;
-    let mut entries = Vec::new();
-    loop {
-        let t = r.u8()?;
-        if t == 0 {
-            break;
-        }
-        let name = r.string()?;
-        if keep(name) {
-            entries.push((name, r.payload(t, 1)?));
-        } else {
-            r.skip(t, 1)?;
-        }
-    }
-    Ok(Value::Compound(entries))
+fn too_long() -> anyhow::Error {
+    anyhow::anyhow!("nbt: array too long")
 }
 
 #[cfg(test)]
@@ -293,18 +310,34 @@ mod tests {
         b
     }
 
+    /// Walks a root compound, skipping `skip` and collecting the rest.
+    fn walk(data: &[u8]) -> Result<Vec<(Vec<u8>, Value<'_>)>> {
+        let mut r = Reader::new(data);
+        r.enter_root()?;
+        let mut out = Vec::new();
+        while let Some((tag, name)) = r.next_entry()? {
+            if name == b"skip" {
+                r.skip_payload(tag)?;
+            } else {
+                out.push((name.to_vec(), r.value(tag)?));
+            }
+        }
+        Ok(out)
+    }
+
     #[test]
-    fn filters_and_reads() {
+    fn walks_and_skips() {
         let data = sample();
-        let root = read_root_filtered(&data, |k| k != b"skip").unwrap();
-        assert_eq!(root.get("a").and_then(|v| v.as_i64()), Some(7));
-        assert!(root.get("skip").is_none());
-        assert_eq!(root.get("l").unwrap().long_array(), vec![1, u64::MAX]);
+        let entries = walk(&data).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].0, b"a");
+        assert_eq!(entries[0].1.as_i64(), Some(7));
+        assert!(matches!(entries[1].1, Value::LongArray(raw) if raw.len() == 16));
     }
 
     #[test]
     fn truncated_input_errors() {
         let data = sample();
-        assert!(read_root_filtered(&data[..data.len() - 5], |_| true).is_err());
+        assert!(walk(&data[..data.len() - 5]).is_err());
     }
 }

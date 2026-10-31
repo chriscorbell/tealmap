@@ -73,8 +73,28 @@ pub enum Tint {
     Fixed([u8; 3]),
 }
 
+/// A quad's shape as tiles store it: 4 corner offsets (x, y, z) in 1/64 block
+/// plus 64, 4 UVs (u, v) in 1/4096 texture, and a texture layer.
+pub type Template = [u16; 21];
+
 #[derive(Clone, Debug)]
 pub struct Quad {
+    /// Its template's id in [`Baker::template`]. Equal shapes share an id.
+    pub template: u32,
+    /// The lowest and highest corner offset in y, as stored in the template.
+    pub y_range: (u16, u16),
+    pub layer: Layer,
+    pub cull: Option<u8>,
+    /// Direction to sample light from, the face normal snapped to an axis.
+    pub light_dir: u8,
+    pub tinted: bool,
+    pub shade: f32,
+    /// Corner positions in block units, kept to test whether a quad covers a face.
+    pos: [[f32; 3]; 4],
+}
+
+/// What [`Baker::quad`] needs to bake a quad.
+pub struct QuadShape {
     /// Corner positions in block units (usually 0..1, may extend past the block).
     pub pos: [[f32; 3]; 4],
     /// Texture coordinates in texture units (0..1 spans one texture).
@@ -82,10 +102,15 @@ pub struct Quad {
     pub tex: u16,
     pub layer: Layer,
     pub cull: Option<u8>,
-    /// Direction to sample light from, the face normal snapped to an axis.
     pub light_dir: u8,
     pub tinted: bool,
     pub shade: f32,
+}
+
+/// A corner coordinate relative to its anchor block, in 1/64 block plus 64,
+/// so elements that reach a block past their own stay positive.
+fn offset(p: f32) -> u16 {
+    ((p * 64.0).round() + 64.0).clamp(0.0, 65535.0) as u16
 }
 
 pub struct Variant {
@@ -103,6 +128,19 @@ pub const F_UNKNOWN: u8 = 32;
 pub const F_LEAVES: u8 = 64;
 
 pub struct BlockInfo {
+    /// Draws something: it isn't air and has quads or a fluid.
+    pub visible: bool,
+    /// Six occluding neighbors cull everything it draws.
+    pub always_culled: bool,
+    /// Whether it takes up space at LOD scale: it has a full face, or it's
+    /// leaves, a fluid, or glass-like. Plants, torches and the like don't; at the
+    /// distances LOD is drawn at they're a couple of pixels at most.
+    pub lod_counts: bool,
+    /// Roughly how much of its space it fills, in eighths: a snow layer counts
+    /// its layers, a slab half, a full cube all of it.
+    pub lod_volume: u8,
+    /// The state a LOD voxel draws for it: a slab's double slab, else itself.
+    pub lod_full_form: std::sync::OnceLock<u16>,
     pub name: String,
     /// The registry key: name, then `|prop=value` for each sorted property.
     pub key: String,
@@ -127,11 +165,6 @@ impl BlockInfo {
     #[inline]
     pub fn is_fluid(&self) -> bool {
         self.flags & (F_WATER | F_LAVA) != 0
-    }
-    pub fn visible(&self) -> bool {
-        !self.is_air()
-            && (self.variants.iter().any(|v| !v.quads.is_empty())
-                || self.flags & (F_WATER | F_LAVA | F_WATERLOGGED) != 0)
     }
     /// Picks a weighted variant deterministically from a block position.
     #[inline]
@@ -219,6 +252,8 @@ pub struct Baker {
     pub biomes: Biomes,
     blockstates: DashMap<String, Option<Arc<Value>>>,
     models: DashMap<String, Option<Arc<RawModel>>>,
+    template_ids: DashMap<Template, u32>,
+    templates: boxcar::Vec<Template>,
 }
 
 // Resolved models are only used while baking, so plain borrowed Arcs suffice.
@@ -237,7 +272,41 @@ impl Baker {
             biomes,
             blockstates: DashMap::new(),
             models: DashMap::new(),
+            template_ids: DashMap::new(),
+            templates: boxcar::Vec::new(),
         }
+    }
+
+    /// Bakes a quad's shape into its template.
+    pub fn quad(&self, q: QuadShape) -> Quad {
+        let mut tpl = [0u16; 21];
+        for k in 0..4 {
+            for a in 0..3 {
+                tpl[k * 3 + a] = offset(q.pos[k][a]);
+            }
+            tpl[12 + k * 2] = (q.uv[k][0] * 4096.0).round().clamp(0.0, 65535.0) as u16;
+            tpl[13 + k * 2] = (q.uv[k][1] * 4096.0).round().clamp(0.0, 65535.0) as u16;
+        }
+        tpl[20] = q.tex;
+        let ys = [tpl[1], tpl[4], tpl[7], tpl[10]];
+        let template = *self
+            .template_ids
+            .entry(tpl)
+            .or_insert_with(|| self.templates.push(tpl) as u32);
+        Quad {
+            template,
+            y_range: (*ys.iter().min().unwrap(), *ys.iter().max().unwrap()),
+            layer: q.layer,
+            cull: q.cull,
+            light_dir: q.light_dir,
+            tinted: q.tinted,
+            shade: q.shade,
+            pos: q.pos,
+        }
+    }
+
+    pub fn template(&self, id: u32) -> &Template {
+        &self.templates[id as usize]
     }
 
     fn blockstate(&self, name: &str) -> Option<Arc<Value>> {
@@ -482,7 +551,7 @@ impl Baker {
             1.0
         };
 
-        Some(Quad {
+        Some(self.quad(QuadShape {
             pos: pos.map(|p| [p[0] / 16.0, p[1] / 16.0, p[2] / 16.0]),
             uv: uv.map(|c| [c[0] / 16.0, c[1] / 16.0]),
             tex,
@@ -491,7 +560,7 @@ impl Baker {
             light_dir: final_dir,
             tinted: face.tintindex.is_some(),
             shade,
-        })
+        }))
     }
 
     /// Bakes one block state. `props` are the state's properties, sorted by key.
@@ -559,6 +628,16 @@ impl Baker {
         }
 
         BlockInfo {
+            visible: flags & F_AIR == 0
+                && (variants.iter().any(|v| !v.quads.is_empty())
+                    || flags & (F_WATER | F_LAVA | F_WATERLOGGED) != 0),
+            always_culled: flags & (F_WATER | F_LAVA | F_WATERLOGGED) == 0
+                && variants
+                    .iter()
+                    .all(|v| v.quads.iter().all(|q| q.cull.is_some())),
+            lod_counts: false,
+            lod_volume: 0,
+            lod_full_form: std::sync::OnceLock::new(),
             name: name.to_owned(),
             key: String::new(),
             variants,
@@ -853,6 +932,17 @@ impl Registry {
         }
         *self.ids.entry(key.clone()).or_insert_with(|| {
             let mut info = self.baker.bake_state(name, props);
+            info.lod_counts = info.visible
+                && (info.occludes != 0
+                    || info.is_fluid()
+                    || info.flags & (F_LEAVES | F_CULL_SAME) != 0);
+            info.lod_volume = if info.occludes == 0x3f || info.is_fluid() {
+                8
+            } else {
+                key.split('|')
+                    .find_map(|part| part.strip_prefix("layers=")?.parse::<u32>().ok())
+                    .map_or(4, |n| n.clamp(1, 8) as u8)
+            };
             info.key = key;
             let id = self.blocks.push(info);
             if id > u16::MAX as usize {
@@ -880,6 +970,20 @@ impl Registry {
     #[inline]
     pub fn get(&self, id: u16) -> &BlockInfo {
         &self.blocks[id as usize]
+    }
+
+    /// Every state seen so far, indexed by id, for loops that would otherwise
+    /// go through [`Registry::get`] per block. Ids still being added elsewhere
+    /// read as air; nothing holds those ids yet.
+    pub fn snapshot(&self) -> Vec<&BlockInfo> {
+        let mut out = vec![self.get(AIR); self.blocks.count()];
+        for (id, b) in self.blocks.iter() {
+            if id >= out.len() {
+                out.resize(id + 1, self.get(AIR));
+            }
+            out[id] = b;
+        }
+        out
     }
 
     /// Block names that had no blockstate definition, with how many states each.
