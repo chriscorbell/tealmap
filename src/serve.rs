@@ -220,7 +220,8 @@ fn gzip_assets(files: impl Iterator<Item = (String, Vec<u8>)>) -> HashMap<String
         .collect()
 }
 
-/// Whether the client takes gzip, per its Accept-Encoding header.
+/// Whether the client takes gzip, per its Accept-Encoding header. A wildcard
+/// only speaks for codings the header doesn't name.
 fn accepts_gzip(headers: &HeaderMap) -> bool {
     let Some(accepted) = headers
         .get(header::ACCEPT_ENCODING)
@@ -228,15 +229,22 @@ fn accepts_gzip(headers: &HeaderMap) -> bool {
     else {
         return false;
     };
-    accepted.split(',').any(|coding| {
+    let mut wildcard = false;
+    for coding in accepted.split(',') {
         let mut parts = coding.split(';').map(str::trim);
         let name = parts.next().unwrap_or("");
         let refused = parts.any(|p| {
-            p.strip_prefix("q=")
-                .is_some_and(|q| q.parse::<f32>().is_ok_and(|q| q == 0.0))
+            p.split_once('=').is_some_and(|(k, q)| {
+                k.trim().eq_ignore_ascii_case("q")
+                    && q.trim().parse::<f32>().is_ok_and(|q| q == 0.0)
+            })
         });
-        (name.eq_ignore_ascii_case("gzip") || name == "*") && !refused
-    })
+        if name.eq_ignore_ascii_case("gzip") {
+            return !refused;
+        }
+        wildcard |= name == "*" && !refused;
+    }
+    wildcard
 }
 
 async fn viewer(State(s): State<AppState>, uri: Uri, req_headers: HeaderMap) -> Response {
@@ -290,6 +298,10 @@ mod tests {
         assert!(!accepts("identity"));
         assert!(!accepts("gzip;q=0"));
         assert!(!accepts("gzip; q=0.0, br"));
+        assert!(!accepts("gzip;Q=0"));
+        assert!(!accepts("gzip;q=0, *;q=1"));
+        assert!(!accepts("*;q=1, gzip;q=0"));
+        assert!(!accepts("*;q=0"));
         assert!(!accepts_gzip(&HeaderMap::new()));
     }
 
