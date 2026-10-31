@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 pub const LEVELS: u32 = 4;
 /// Minimum solid children (of 8) for a voxel to be solid, per level. A low
 /// bar keeps thin things (trunks, spikes, walls) from vanishing as levels
-/// compound; the screen-space test keeps the slight fattening under a pixel.
+/// compound; the screen-space test keeps the slight fattening to a few pixels.
 const MIN_SOLID: [u8; LEVELS as usize + 1] = [0, 2, 2, 2, 2];
 /// Columns per LOD tile side.
 pub const N: usize = TILE as usize;
@@ -214,7 +214,7 @@ const CHILDREN: [(usize, usize, usize); 8] = [
 
 /// Whether a block takes up space at LOD scale: it has a full face, or it's
 /// leaves, a fluid, or glass-like. Plants, torches and the like don't; at the
-/// distances LOD is drawn at they're under a pixel.
+/// distances LOD is drawn at they're a couple of pixels at most.
 fn counts(b: &crate::model::BlockInfo) -> bool {
     use crate::model::{F_CULL_SAME, F_LEAVES};
     b.visible() && (b.occludes != 0 || b.is_fluid() || b.flags & (F_LEAVES | F_CULL_SAME) != 0)

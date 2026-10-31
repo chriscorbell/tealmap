@@ -53,6 +53,8 @@ const MAX_INFLIGHT = 8
 const FADE_MS = 200
 const UPLOAD_BYTES_PER_FRAME = 12e6
 const LEAF_NEAR = 150
+/** Largest allowed on-screen size of a voxel, in CSS pixels, before refining. */
+const MAX_VOXEL_PX = 4
 /** Tiles not wanted for this long are dropped. */
 const KEEP_MS = 10_000
 
@@ -145,8 +147,6 @@ export class MapEngine {
   /** Tiles mid-dissolve. */
   private fading = new Set<Tile>()
 
-  /** Largest allowed on-screen size of a voxel, in CSS pixels, before refining. */
-  detail = 1
   /** Tiles waiting for their GPU upload. Each returns the bytes it uploads. */
   private uploads: (() => number)[] = []
   private justAdded: THREE.Group[] = []
@@ -320,12 +320,6 @@ export class MapEngine {
     this.dirty = true
   }
 
-  setDetail(px: number) {
-    this.detail = px
-    this.lastPlan = 0
-    this.dirty = true
-  }
-
   /** Debug summary of tile states per level. */
   debug() {
     const out: Record<string, Record<string, number>> = {}
@@ -482,7 +476,7 @@ export class MapEngine {
 
   /**
    * Picks what to draw: a quadtree walk from the coarsest tiles that refines
-   * wherever a voxel would cover more than `detail` pixels. A tile hands over
+   * wherever a voxel would cover more than MAX_VOXEL_PX pixels. A tile hands over
    * to its children only once all of them are loaded, so there are no holes.
    */
   private plan(now: number) {
@@ -520,7 +514,7 @@ export class MapEngine {
       if (!inView) return
       const d = Math.max(box.distanceToPoint(cam), 1)
       if (meshed(level, x, z) && needs(tile)) want.push({ level, x, z, d })
-      const kids = level > 0 && ((1 << level) * k) / d > this.detail ? this.children(level, x, z) : []
+      const kids = level > 0 && ((1 << level) * k) / d > MAX_VOXEL_PX ? this.children(level, x, z) : []
       if (kids.length) {
         if (kids.every(([l, kx, kz]) => settled(l, kx, kz))) {
           for (const [l, kx, kz] of kids) visit(l, kx, kz, true)
