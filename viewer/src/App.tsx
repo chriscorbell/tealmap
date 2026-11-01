@@ -145,14 +145,15 @@ export default function App() {
     // Startup, links pasted into the address bar and the Back button all come through here.
     const follow = () => {
       engine.cancelHashWrite()
-      // Going somewhere is what the list of places is for, however it happens.
-      if (panelRef.current === 'places') {
-        placesButtonRef.current?.focus()
-        setPanel(null)
-      }
       const { id, view, pin: linked } = parseHash(location.hash)
       const list = mapsRef.current
       const target = list.find((m) => m.id === id)
+      // Going somewhere is what the list of places is for, however it happens. The
+      // button goes too on a map with no places, so focus goes to the map instead.
+      if (panelRef.current === 'places') {
+        ;(target?.places?.length ? placesButtonRef.current : canvasRef.current)?.focus()
+        setPanel(null)
+      }
       setNotice(id && !target ? `There's no map called ${id}.` : null)
       if (!target && engine.mapId) return
       const pick = target ?? list[0]

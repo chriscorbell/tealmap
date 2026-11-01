@@ -618,7 +618,7 @@ button {
 }
 
 /* Too narrow for everything on one line. */
-@media (max-width: 460px) {
+@media (max-width: 500px) {
   .brand span {
     display: none;
   }
