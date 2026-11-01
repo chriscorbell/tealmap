@@ -39,6 +39,8 @@ services:
 
 Copy [`tealmap.example.toml`](tealmap.example.toml) to `tealmap.toml` and point each map's `world` at a dimension directory. To render once without serving, run `tealmap render`. Add `--full` to ignore saved state.
 
+If a map's world goes missing or has no region files left, tealmap logs an error and keeps the map's tiles until the world comes back. If the world is gone for good, stop the server, remove the map from the config, and delete its folder under `data/maps`. To start a map over from a world that's empty for now, delete its folder and keep it in the config.
+
 ## Develop
 
 ```sh

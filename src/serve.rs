@@ -69,8 +69,11 @@ pub fn run(cfg: Config, pool: rayon::ThreadPool) -> Result<()> {
                     }
                 })
                 .collect();
+            // What each map's last pass failed with, so a problem that lasts
+            // is logged once rather than every poll.
+            let mut failing: Vec<Option<String>> = vec![None; ctxs.len()];
             loop {
-                for ctx in &ctxs {
+                for (ctx, failing) in ctxs.iter().zip(&mut failing) {
                     let publish = |up: &Update| {
                         if !up.hires.is_empty() || !up.lod.is_empty() {
                             let msg = serde_json::json!({ "map": ctx.cfg.id, "update": up });
@@ -79,6 +82,9 @@ pub fn run(cfg: Config, pool: rayon::ThreadPool) -> Result<()> {
                     };
                     match ctx.render(&pool, false, publish) {
                         Ok(up) => {
+                            if failing.take().is_some() {
+                                tracing::info!("render {}: working again", ctx.cfg.id);
+                            }
                             if !up.hires.is_empty() || !up.lod.is_empty() {
                                 let s = &up.stats;
                                 tracing::info!(
@@ -90,7 +96,13 @@ pub fn run(cfg: Config, pool: rayon::ThreadPool) -> Result<()> {
                                 );
                             }
                         }
-                        Err(e) => tracing::error!("render {}: {e:#}", ctx.cfg.id),
+                        Err(e) => {
+                            let message = format!("{e:#}");
+                            if failing.as_ref() != Some(&message) {
+                                tracing::error!("render {}: {message}", ctx.cfg.id);
+                                *failing = Some(message);
+                            }
+                        }
                     }
                 }
                 std::thread::sleep(Duration::from_secs(render_cfg.poll_seconds.max(1)));
