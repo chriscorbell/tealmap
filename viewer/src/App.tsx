@@ -357,8 +357,9 @@ export default function App() {
         onContextMenu={(e) => e.preventDefault()}
         onPointerDown={press}
         onPointerMove={move}
-        // Zooming moves the camera, so what's in the fields is out of date.
-        onWheel={() => {
+        // Zooming moves the camera, so what's in the fields is out of date. Capturing,
+        // because the engine keeps the event from going any further.
+        onWheelCapture={() => {
           const active = document.activeElement
           if (active === xRef.current || active === zRef.current) (active as HTMLElement).blur()
         }}
