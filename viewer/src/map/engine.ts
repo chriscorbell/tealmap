@@ -420,6 +420,7 @@ export class MapEngine {
     if (this.disposed) return
     const gen = ++this.generation
     clearTimeout(this.refreshTimer)
+    this.keys.clear()
     this.clearTiles()
     this.map = map
     this.flight = null

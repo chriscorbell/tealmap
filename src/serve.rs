@@ -116,7 +116,7 @@ pub fn run(cfg: Config, pool: rayon::ThreadPool) -> Result<()> {
         .iter()
         .map(|m| {
             let mut info = serde_json::json!({ "id": m.id, "name": m.display_name() });
-            if let Some(start) = m.start {
+            if let Some(start) = &m.start {
                 info["start"] = serde_json::json!(start);
             }
             info

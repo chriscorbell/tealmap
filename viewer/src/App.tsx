@@ -77,10 +77,12 @@ export default function App() {
     el.style.visibility = onScreen ? 'visible' : 'hidden'
     if (!onScreen) return
     el.style.transform = `translate(${at.x}px, ${at.y}px)`
-    el.classList.toggle('below', at.y < 90)
+    const card = el.querySelector<HTMLElement>('.pin-card')
+    const above = (card?.offsetHeight ?? 0) + (el.querySelector<HTMLElement>('.pin-mark')?.offsetHeight ?? 0) + 14
+    el.classList.toggle('below', at.y < above)
     // Under the top bars, a card's buttons couldn't be reached.
     el.style.setProperty('--drop', `${Math.max(0, CARD_CLEAR_TOP - at.y)}px`)
-    const half = (el.querySelector<HTMLElement>('.pin-card')?.offsetWidth ?? 0) / 2
+    const half = (card?.offsetWidth ?? 0) / 2
     const nudge = Math.min(Math.max(at.x, half + CARD_MARGIN), width - half - CARD_MARGIN) - at.x
     el.style.setProperty('--nudge', `${nudge}px`)
   }, [])
@@ -181,6 +183,8 @@ export default function App() {
     // can share them with the map, which is most of what the page is.
     const keyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
+        // One thing per press: held down, it'd go on to take the pin as well.
+        if (e.repeat) return
         const menuOpen = menuRef.current
         if (menuOpen) {
           setMenu(false)

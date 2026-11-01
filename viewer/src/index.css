@@ -247,6 +247,11 @@ button {
     visibility 0s 0.22s;
 }
 
+.bar:has(.menu.open),
+.panel.open {
+  z-index: 4;
+}
+
 .panel.open {
   opacity: 1;
   transform: none;
