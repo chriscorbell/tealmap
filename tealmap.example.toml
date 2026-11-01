@@ -23,3 +23,9 @@ version = "26.2"
 # rendered. Nor are faces with no light at all, at any y, under the ocean floor.
 # Set this below the world's bottom to render everything.
 # remove_caves_below_y = 55
+
+# Optional: places the viewer can list and go to. Changing them doesn't take a render.
+# [[maps.places]]
+# name = "Spawn"
+# x = 0
+# z = 0

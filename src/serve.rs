@@ -119,6 +119,9 @@ pub fn run(cfg: Config, pool: rayon::ThreadPool) -> Result<()> {
             if let Some(start) = &m.start {
                 info["start"] = serde_json::json!(start);
             }
+            if !m.places.is_empty() {
+                info["places"] = serde_json::json!(m.places);
+            }
             info
         })
         .collect();

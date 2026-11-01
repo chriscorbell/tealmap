@@ -1198,6 +1198,7 @@ mod tests {
             min_y: -64,
             max_y: 320,
             start: None,
+            places: Vec::new(),
             remove_caves_below_y: 55,
         }
     }

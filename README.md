@@ -58,6 +58,6 @@ Append `?bench` to the viewer URL to render every frame and show the stats panel
 - Vanilla block models: variants, multipart, parent models, element and variant rotations, uvlock, and biome tints. Mod jars can supply biome colors.
 - Water and lava, waterlogging, saved sky and block light, and BlueMap-style cave removal.
 
-Not yet supported: block entities (chests, signs, beds), entities and players, markers, ambient occlusion, animated textures, resource packs, and mod block models. Blocks without a model render as magenta-checkered cubes.
+Not yet supported: block entities (chests, signs, beds), entities and players, markers drawn on the map, ambient occlusion, animated textures, resource packs, and mod block models. Blocks without a model render as magenta-checkered cubes.
 
 See [`docs/plan.md`](docs/plan.md) for the design and roadmap.

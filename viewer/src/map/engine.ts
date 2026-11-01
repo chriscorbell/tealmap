@@ -1,5 +1,6 @@
 import { Box3, Frustum, MathUtils, Matrix4, PerspectiveCamera, Vector3 } from 'three'
 import { MapControls } from 'three/examples/jsm/controls/MapControls.js'
+import type { Place } from '../Places'
 import { formatHash, type Pin, type View } from '../route'
 import type { MapStatus, Problem } from '../status'
 import { type Mesh, Pass, Renderer } from './renderer'
@@ -12,6 +13,7 @@ export interface MapInfo {
   status?: MapStatus
   /** Where the map starts and Home goes, as [x, z], if it's set. */
   start?: [number, number]
+  places?: Place[]
 }
 
 /** How the map being shown is doing, as far as the viewer can tell. */

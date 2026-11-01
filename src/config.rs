@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -39,9 +39,20 @@ pub struct MapConfig {
     /// Where the map starts and its Home button goes, as [x, z]. Defaults to the
     /// middle of what's rendered.
     pub start: Option<Vec<f64>>,
+    /// Named spots the viewer can list and go to.
+    #[serde(default)]
+    pub places: Vec<Place>,
     /// Skip unlit blocks below this y and the ocean floor (BlueMap's default is 55).
     #[serde(default = "default_caves")]
     pub remove_caves_below_y: i32,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct Place {
+    pub name: String,
+    pub x: f64,
+    pub z: f64,
 }
 
 /// Further than any Minecraft world goes.
@@ -101,6 +112,19 @@ impl Config {
                     m.min_y,
                     m.max_y
                 );
+            }
+            let mut names = HashSet::new();
+            for p in &m.places {
+                if p.name.trim().is_empty() {
+                    bail!("map {}: a place needs a name", m.id);
+                }
+                if !names.insert(&p.name) {
+                    bail!("map {}: place {:?} is listed twice", m.id, p.name);
+                }
+                // Written this way round so NaN fails too.
+                if !(p.x.abs() <= MAX_COORD && p.z.abs() <= MAX_COORD) {
+                    bail!("map {}: place {:?} is outside any world", m.id, p.name);
+                }
             }
             if let Some(start) = &m.start {
                 let [x, z] = start[..] else {
@@ -181,8 +205,21 @@ mod tests {
         assert!(error(&map("a", "start = [nan, 0]")).contains("outside"));
         assert!(error(&map("a", "start = [120, 64, -340]")).contains("no y"));
         assert!(error(&map("a", "start = [5]")).contains("no y"));
+        let place =
+            |name: &str, x: i64| format!("[[maps.places]]\nname = \"{name}\"\nx = {x}\nz = 0\n");
+        assert!(error(&map("a", &place(" ", 0))).contains("needs a name"));
+        let spawn_twice = format!("{}{}", place("Spawn", 0), place("Spawn", 1));
+        assert!(error(&map("a", &spawn_twice)).contains("twice"));
+        assert!(error(&map("a", &place("Far", 40_000_000))).contains("outside"));
+        let nan = "[[maps.places]]\nname = \"Nowhere\"\nx = nan\nz = 0\n";
+        assert!(error(&map("a", nan)).contains("outside"));
 
-        let good = format!("data_dir = \"/tmp/x\"\n{}{}", map("a", ""), map("b", ""));
+        let good = format!(
+            "data_dir = \"/tmp/x\"\n{}{}{}",
+            map("a", "start = [10, -20]"),
+            place("Spawn", 0),
+            map("b", "")
+        );
         let cfg: Config = toml::from_str(&good).unwrap();
         cfg.validate().unwrap();
     }

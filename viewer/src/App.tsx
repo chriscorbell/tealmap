@@ -1,9 +1,10 @@
-import { Activity, ChevronDown, CircleHelp, House, Layers, Navigation2 } from 'lucide-react'
+import { Activity, ChevronDown, CircleHelp, House, Layers, MapPinned, Navigation2 } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Coords } from './Coords'
 import { Help } from './Help'
 import { type CameraState, type LoadState, type MapInfo, MapEngine, type Stats, WebGL2Missing } from './map/engine'
 import { PinCard } from './PinCard'
+import { type Place, Places } from './Places'
 import { parseHash, type Pin } from './route'
 import { type MapStatus, statusLine } from './status'
 
@@ -11,6 +12,8 @@ import { type MapStatus, statusLine } from './status'
 const CLICK_SLOP = { mouse: 5, other: 10 }
 const CLICK_MS = 500
 const NOTICE_MS = 6000
+/** Going to a place from further away than this comes down to here, close enough to see it. */
+const PLACE_DIST = 400
 const RETRY_FIRST_MS = 1000
 const RETRY_LAST_MS = 30_000
 /** How far the pin's card stays from the screen's edges, in CSS pixels. */
@@ -47,7 +50,7 @@ export default function App() {
   const [stats, setStats] = useState<Stats | null>(null)
   const [pin, setPinState] = useState<Pin | null>(null)
   const [bench] = useState(() => new URLSearchParams(location.search).has('bench'))
-  const [panel, setPanel] = useState<'stats' | 'help' | null>(bench ? 'stats' : null)
+  const [panel, setPanel] = useState<'stats' | 'help' | 'places' | null>(bench ? 'stats' : null)
   const [menu, setMenu] = useState(false)
   /** Why the viewer can't run at all, or why the open map failed. */
   const [error, setError] = useState<string | null>(null)
@@ -260,6 +263,7 @@ export default function App() {
     history.pushState(null, '', `#${m.id}`)
     setPin(null)
     setCurrent(m)
+    setPanel((p) => (p === 'places' ? null : p))
     setError(null)
     engine.setMap(m).catch((e) => {
       console.error(e)
@@ -275,6 +279,14 @@ export default function App() {
     const x = Math.round(to.x ?? here.x)
     const z = Math.round(to.z ?? here.z)
     if (x !== here.x || z !== here.z) engine.jumpTo({ ...here, x, z })
+  }
+
+  const goToPlace = (place: Place) => {
+    setPanel(null)
+    const engine = engineRef.current
+    if (!engine?.loaded) return
+    const here = engine.view()
+    engine.jumpTo({ ...here, x: Math.round(place.x), z: Math.round(place.z), dist: Math.min(here.dist, PLACE_DIST) })
   }
 
   const linkHere = () => `${location.origin}${location.pathname}${engineRef.current?.hash() ?? ''}`
@@ -310,6 +322,7 @@ export default function App() {
     setPin(showing ? null : (engineRef.current?.pick(e.clientX, e.clientY) ?? null))
   }
 
+  const places = current?.places ?? []
   const loading = (stats?.pending ?? 0) > 0
   const line = error
     ? { text: error, alert: true }
@@ -386,6 +399,20 @@ export default function App() {
       </header>
 
       <div className="bar top-right">
+        {places.length > 0 && (
+          <button
+            className={`icon ${panel === 'places' ? 'active' : ''}`}
+            onClick={() => {
+              setMenu(false)
+              setPanel((p) => (p === 'places' ? null : 'places'))
+            }}
+            aria-label="Places"
+            aria-expanded={panel === 'places'}
+            title="Places"
+          >
+            <MapPinned size={16} />
+          </button>
+        )}
         <button
           className={`icon ${panel === 'help' ? 'active' : ''}`}
           onClick={() => {
@@ -430,6 +457,12 @@ export default function App() {
           <House size={16} />
         </button>
       </div>
+
+      {places.length > 0 && (
+        <section className={`panel ${panel === 'places' ? 'open' : ''}`} aria-hidden={panel !== 'places'}>
+          <Places key={current?.id} places={places} open={panel === 'places'} go={goToPlace} />
+        </section>
+      )}
 
       <section className={`panel ${panel === 'help' ? 'open' : ''}`} aria-hidden={panel !== 'help'}>
         <Help />
