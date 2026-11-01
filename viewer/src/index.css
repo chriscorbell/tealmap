@@ -129,7 +129,15 @@ button {
   background: rgba(255, 255, 255, 0.08);
 }
 
+.picker-name {
+  max-width: min(30vw, 320px);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .picker-button svg {
+  flex: none;
   color: var(--muted);
   transition: transform 0.25s var(--ease);
 }
@@ -259,6 +267,46 @@ button {
   transition:
     opacity 0.22s var(--ease),
     transform 0.22s var(--ease);
+}
+
+.places input {
+  width: 100%;
+  padding: 7px 9px;
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: 7px;
+  transition: background 0.15s;
+}
+
+.places input:focus {
+  outline: none;
+  background: rgba(45, 212, 191, 0.12);
+}
+
+.places ul {
+  max-height: min(50vh, 340px);
+  margin: 6px -6px -4px;
+  padding: 0;
+  overflow-y: auto;
+  list-style: none;
+}
+
+.places li button {
+  display: block;
+  width: 100%;
+  overflow-wrap: anywhere;
+  padding: 7px 8px;
+  text-align: left;
+  border-radius: 7px;
+  transition: background 0.15s;
+}
+
+.places li button:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.places p {
+  margin: 8px 0 0;
+  color: var(--muted);
 }
 
 .panel:has(.help) {
@@ -524,8 +572,24 @@ button {
     width: 44px;
   }
 
-  .menu button {
+  .menu button,
+  .places li button {
     padding: 14px 10px;
+  }
+
+  /* iOS zooms the page into any smaller field it focuses. */
+  .places input,
+  .coords input {
+    font-size: 16px;
+  }
+
+  /* That's wider per character, and the bar still has to fit a small phone. */
+  .coords input {
+    width: calc(6ch + 8px);
+  }
+
+  .places input {
+    padding: 13px 10px;
   }
 
   .coords input {
@@ -554,12 +618,27 @@ button {
 }
 
 /* Too narrow for everything on one line. */
-@media (max-width: 460px) {
+@media (max-width: 500px) {
   .brand span {
     display: none;
   }
 
+  .picker-name {
+    /* What the bar on the right leaves, with three 44 px buttons in it. */
+    max-width: calc(100vw - 280px);
+  }
+
   .bottom-right {
     bottom: 76px;
+  }
+}
+
+@media (max-width: 360px) {
+  .brand {
+    display: none;
+  }
+
+  .picker-name {
+    max-width: calc(100vw - 250px);
   }
 }

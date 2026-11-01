@@ -1,9 +1,10 @@
-import { Activity, ChevronDown, CircleHelp, House, Layers, Navigation2 } from 'lucide-react'
+import { Activity, ChevronDown, CircleHelp, House, Layers, MapPinned, Navigation2 } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Coords } from './Coords'
 import { Help } from './Help'
 import { type CameraState, type LoadState, type MapInfo, MapEngine, type Stats, WebGL2Missing } from './map/engine'
 import { PinCard } from './PinCard'
+import { type Place, Places } from './Places'
 import { parseHash, type Pin } from './route'
 import { type MapStatus, statusLine } from './status'
 
@@ -11,6 +12,8 @@ import { type MapStatus, statusLine } from './status'
 const CLICK_SLOP = { mouse: 5, other: 10 }
 const CLICK_MS = 500
 const NOTICE_MS = 6000
+/** Going to a place from further away than this comes down to here, close enough to see it. */
+const PLACE_DIST = 400
 const RETRY_FIRST_MS = 1000
 const RETRY_LAST_MS = 30_000
 /** How far the pin's card stays from the screen's edges, in CSS pixels. */
@@ -38,6 +41,7 @@ export default function App() {
   const compassRef = useRef<HTMLSpanElement>(null)
   const pickerRef = useRef<HTMLDivElement>(null)
   const pickerButtonRef = useRef<HTMLButtonElement>(null)
+  const placesButtonRef = useRef<HTMLButtonElement>(null)
   const markerRef = useRef<HTMLDivElement>(null)
   const pinRef = useRef<Pin | null>(null)
   const pressRef = useRef<{ id: number; x: number; y: number; at: number; kind: string } | null>(null)
@@ -47,7 +51,7 @@ export default function App() {
   const [stats, setStats] = useState<Stats | null>(null)
   const [pin, setPinState] = useState<Pin | null>(null)
   const [bench] = useState(() => new URLSearchParams(location.search).has('bench'))
-  const [panel, setPanel] = useState<'stats' | 'help' | null>(bench ? 'stats' : null)
+  const [panel, setPanel] = useState<'stats' | 'help' | 'places' | null>(bench ? 'stats' : null)
   const [menu, setMenu] = useState(false)
   /** Why the viewer can't run at all, or why the open map failed. */
   const [error, setError] = useState<string | null>(null)
@@ -144,6 +148,12 @@ export default function App() {
       const { id, view, pin: linked } = parseHash(location.hash)
       const list = mapsRef.current
       const target = list.find((m) => m.id === id)
+      // Going somewhere is what the list of places is for, however it happens. The
+      // button goes too on a map with no places, so focus goes to the map instead.
+      if (panelRef.current === 'places') {
+        ;(target?.places?.length ? placesButtonRef.current : canvasRef.current)?.focus()
+        setPanel(null)
+      }
       setNotice(id && !target ? `There's no map called ${id}.` : null)
       if (!target && engine.mapId) return
       const pick = target ?? list[0]
@@ -189,11 +199,15 @@ export default function App() {
         if (menuOpen) {
           setMenu(false)
           pickerButtonRef.current?.focus()
-        } else if (panelRef.current) setPanel(null)
+        } else if (panelRef.current) {
+          if (panelRef.current === 'places') placesButtonRef.current?.focus()
+          setPanel(null)
+        }
         else if (pinRef.current) setPin(null)
         return
       }
-      const typing = e.target instanceof HTMLElement && e.target.closest('input, textarea, select, [contenteditable]')
+      // In the list of places, the arrow keys scroll the list.
+      const typing = e.target instanceof HTMLElement && e.target.closest('input, textarea, select, [contenteditable], .places')
       if (typing || e.ctrlKey || e.metaKey || e.altKey) {
         // Whatever was held stops too, or the map would move under the typing.
         engine.releaseKeys()
@@ -260,6 +274,7 @@ export default function App() {
     history.pushState(null, '', `#${m.id}`)
     setPin(null)
     setCurrent(m)
+    setPanel((p) => (p === 'places' ? null : p))
     setError(null)
     engine.setMap(m).catch((e) => {
       console.error(e)
@@ -275,6 +290,17 @@ export default function App() {
     const x = Math.round(to.x ?? here.x)
     const z = Math.round(to.z ?? here.z)
     if (x !== here.x || z !== here.z) engine.jumpTo({ ...here, x, z })
+  }
+
+  const goToPlace = (place: Place) => {
+    setPanel(null)
+    // The search box is about to hide, and focus would fall off the page.
+    placesButtonRef.current?.focus()
+    const engine = engineRef.current
+    if (!engine) return
+    // A map still opening starts here instead, once it has.
+    const here = engine.loaded ? engine.view() : engine.homeView()
+    engine.jumpTo({ ...here, x: Math.round(place.x), z: Math.round(place.z), dist: Math.min(here.dist, PLACE_DIST) })
   }
 
   const linkHere = () => `${location.origin}${location.pathname}${engineRef.current?.hash() ?? ''}`
@@ -310,6 +336,7 @@ export default function App() {
     setPin(showing ? null : (engineRef.current?.pick(e.clientX, e.clientY) ?? null))
   }
 
+  const places = current?.places ?? []
   const loading = (stats?.pending ?? 0) > 0
   const line = error
     ? { text: error, alert: true }
@@ -365,7 +392,7 @@ export default function App() {
               aria-controls="maps"
               aria-label={`Map: ${current?.name ?? 'loading'}`}
             >
-              {current?.name ?? '…'}
+              <span className="picker-name">{current?.name ?? '…'}</span>
               <ChevronDown size={14} className={menu ? 'flip' : ''} />
             </button>
             <ul id="maps" className={`menu ${menu ? 'open' : ''}`}>
@@ -386,6 +413,25 @@ export default function App() {
       </header>
 
       <div className="bar top-right">
+        {places.length > 0 && (
+          <button
+            ref={placesButtonRef}
+            className={`icon ${panel === 'places' ? 'active' : ''}`}
+            // An Enter still held from choosing a place shouldn't open the list again.
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && e.repeat) e.preventDefault()
+            }}
+            onClick={() => {
+              setMenu(false)
+              setPanel((p) => (p === 'places' ? null : 'places'))
+            }}
+            aria-label="Places"
+            aria-expanded={panel === 'places'}
+            title="Places"
+          >
+            <MapPinned size={16} />
+          </button>
+        )}
         <button
           className={`icon ${panel === 'help' ? 'active' : ''}`}
           onClick={() => {
@@ -430,6 +476,12 @@ export default function App() {
           <House size={16} />
         </button>
       </div>
+
+      {places.length > 0 && (
+        <section className={`panel ${panel === 'places' ? 'open' : ''}`} aria-hidden={panel !== 'places'}>
+          <Places key={current?.id} places={places} open={panel === 'places'} go={goToPlace} />
+        </section>
+      )}
 
       <section className={`panel ${panel === 'help' ? 'open' : ''}`} aria-hidden={panel !== 'help'}>
         <Help />

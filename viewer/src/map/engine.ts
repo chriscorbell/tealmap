@@ -1,5 +1,6 @@
 import { Box3, Frustum, MathUtils, Matrix4, PerspectiveCamera, Vector3 } from 'three'
 import { MapControls } from 'three/examples/jsm/controls/MapControls.js'
+import type { Place } from '../Places'
 import { formatHash, type Pin, type View } from '../route'
 import type { MapStatus, Problem } from '../status'
 import { type Mesh, Pass, Renderer } from './renderer'
@@ -12,6 +13,7 @@ export interface MapInfo {
   status?: MapStatus
   /** Where the map starts and Home goes, as [x, z], if it's set. */
   start?: [number, number]
+  places?: Place[]
 }
 
 /** How the map being shown is doing, as far as the viewer can tell. */
@@ -426,6 +428,7 @@ export class MapEngine {
     this.flight = null
     // Nothing plans against the old map's manifest or textures while loading.
     this.manifest = null
+    this.bounds = null
     this.ready = false
     this.pendingUpdate = false
     this.autoView = !view
@@ -806,8 +809,11 @@ export class MapEngine {
     const here = this.flight?.to ?? this.view()
     if (to.x === here.x && to.z === here.z && to.dist === here.dist && to.az === here.az && to.polar === here.polar) return
     this.cancelHashWrite()
-    history.replaceState(null, '', this.hash())
-    history.pushState(null, '', formatHash(this.map.id, to, this.pin))
+    // Until a map opens, this only changes where it starts, so there's nothing to go back to.
+    if (this.ready) {
+      history.replaceState(null, '', this.hash())
+      history.pushState(null, '', formatHash(this.map.id, to, this.pin))
+    } else history.replaceState(null, '', formatHash(this.map.id, to, this.pin))
     this.flyTo(to)
   }
 
