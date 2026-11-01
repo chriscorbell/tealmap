@@ -23,7 +23,7 @@ version = "26.2"
 
 # A dimension with a roof, like the Nether, needs max_y below it, or all the map
 # shows is the roof. Blocks at max_y and above aren't rendered, so you look down
-# on a cut through the world. Changing it takes one `tealmap render --full`.
+# on a cut through the world. Changing it renders the map again.
 # [[maps]]
 # id = "nether"
 # name = "Nether"

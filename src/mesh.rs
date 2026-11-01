@@ -256,6 +256,11 @@ impl Volume {
         }
         self.caves_below = settings.remove_caves_below_y;
         self.remove_dark = settings.remove_caves_below_y > settings.min_y;
+        // A floor saved above the cut was on something that's gone now. From the cut
+        // down, the next step finds what the ground is here.
+        for floor in &mut self.floor {
+            *floor = (*floor).min(settings.max_y);
+        }
         self.lower_floors_to_opaque(reg);
         self.build_lit();
         true
@@ -1446,6 +1451,55 @@ mod tests {
         assert!(
             cut.iter().any(|&y| y < 100),
             "no caves under the cut: {cut:?}"
+        );
+    }
+
+    #[test]
+    fn a_cut_finds_the_floor_under_a_removed_roof() {
+        let reg = registry();
+        let stone = reg.id("minecraft:stone", &mut []);
+        // Stone up to a roof at y=127, with a shaft from y=41 up to the roof. The
+        // saved heightmap says the ground is on the roof, and no sky light gets in.
+        let sections = (0..8)
+            .map(|sy| {
+                let mut blocks = Box::new([stone; 4096]);
+                for (i, b) in blocks.iter_mut().enumerate() {
+                    let (x, z, y) = (i & 15, (i >> 4) & 15, sy * 16 + (i >> 8) as i32);
+                    if (4..12).contains(&x) && (4..12).contains(&z) && (41..127).contains(&y) {
+                        *b = 0;
+                    }
+                }
+                crate::world::Section {
+                    y: sy,
+                    blocks: Some(blocks),
+                    single: 0,
+                    biomes: [0; 64],
+                    light: None,
+                    uniform_light: 0,
+                    has_water: false,
+                }
+            })
+            .collect();
+        let chunk = crate::world::Chunk {
+            sections,
+            has_light: true,
+            ocean_floor: Some(Box::new([128; 256])),
+        };
+        let s = Settings {
+            min_y: 0,
+            max_y: 100,
+            remove_caves_below_y: 55,
+            lod: false,
+        };
+        let mut v = Volume::new();
+        assert!(v.fill(0, 0, &s, &reg, &|x, z| (x == 0 && z == 0).then_some(&chunk)));
+        let tile = Mesher::new().mesh(&v, &reg, &s).unwrap();
+        // Heights count from one block under min_y, so the floor at y=40 is 41.
+        assert!(
+            decode(&tile)
+                .iter()
+                .any(|q| q.dir == UP as usize && q.y == 41),
+            "cave removal took the floor of the shaft"
         );
     }
 

@@ -61,12 +61,12 @@ def section(cx, cz, sy):
 
 def chunk(cx, cz):
     sections = [section(cx, cz, sy) for sy in range(8)]
-    # 256 9-bit values, 7 to a long: the first free height over the roof, above -64.
+    # 256 9-bit values, 7 to a long: the first free height over the roof, above y=0.
     longs = []
     for i in range(0, 256, 7):
         v = 0
         for j in range(len(range(i, min(i + 7, 256)))):
-            v |= (128 + 64) << (j * 9)
+            v |= 128 << (j * 9)
         longs.append(v)
     return compound(
         tag(8, "Status", s("minecraft:full")),
