@@ -692,11 +692,15 @@ export class MapEngine {
     const delta = Math.atan2(Math.sin(angle - this.twist.angle), Math.cos(angle - this.twist.angle))
     this.twist.angle = angle
     this.twist.turned += delta
-    this.twist.engaged ||= Math.abs(this.twist.turned) > TWIST_START
+    if (!this.twist.engaged && Math.abs(this.twist.turned) > TWIST_START) {
+      this.twist.engaged = true
+      // The controls read the same fingers' midpoint as rotating and tilting. Twisting
+      // around one still finger moves that midpoint in a circle, so it's one or the
+      // other, and what they'd already started stops too.
+      this.controls.enableRotate = false
+      this.stopInertia()
+    }
     if (!this.twist.engaged || !this.ready) return
-    // The controls read the same fingers' midpoint as rotating and tilting. Twisting
-    // around one still finger moves that midpoint in a circle, so it's one or the other.
-    this.controls.enableRotate = false
     const t = this.controls.target
     const off = this.camera.position.clone().sub(t)
     const dist = off.length()
@@ -797,6 +801,7 @@ export class MapEngine {
     // Going nowhere isn't a step to go back from, and the map's edge stops a view.
     const b = this.bounds
     if (b) to = { ...to, x: Math.min(Math.max(to.x, b.minX), b.maxX), z: Math.min(Math.max(to.z, b.minZ), b.maxZ) }
+    to = { ...to, x: Math.round(to.x), z: Math.round(to.z) }
     const here = this.flight?.to ?? this.view()
     if (to.x === here.x && to.z === here.z && to.dist === here.dist && to.az === here.az && to.polar === here.polar) return
     this.cancelHashWrite()

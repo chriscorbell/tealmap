@@ -176,6 +176,7 @@ export default function App() {
     // write can replace the URL before it's read. hashchange covers the rest.
     window.addEventListener('popstate', follow)
     window.addEventListener('hashchange', follow)
+    const held = new Map<string, string>()
     // Typing and browser shortcuts keep their keys. Everything else on the page
     // can share them with the map, which is most of what the page is.
     const keyDown = (e: KeyboardEvent) => {
@@ -195,13 +196,21 @@ export default function App() {
         return
       }
       if (e.key === '?') {
-        if (!e.repeat) setPanel((p) => (p === 'help' ? null : 'help'))
+        if (!e.repeat) {
+          setMenu(false)
+          setPanel((p) => (p === 'help' ? null : 'help'))
+        }
         return
       }
       const code = keyCode(e)
+      if (!e.repeat) held.set(e.code, code)
       if (e.repeat ? engine.keyHeld(code) : engine.keyDown(code)) e.preventDefault()
     }
-    const keyUp = (e: KeyboardEvent) => engine.keyUp(keyCode(e))
+    // A key can say something else by the time it's released, if Shift changed.
+    const keyUp = (e: KeyboardEvent) => {
+      engine.keyUp(held.get(e.code) ?? keyCode(e))
+      held.delete(e.code)
+    }
     const leave = () => engine.releaseKeys()
     const focused = (e: FocusEvent) => {
       if (e.target instanceof HTMLElement && e.target.closest('input, textarea, select, [contenteditable]')) engine.releaseKeys()
@@ -237,6 +246,8 @@ export default function App() {
 
   const switchMap = (m: MapInfo) => {
     setMenu(false)
+    // The button just chosen is about to hide, and focus would fall off the page.
+    pickerButtonRef.current?.focus()
     const engine = engineRef.current
     if (!engine || m.id === current?.id) return
     setNotice(null)
@@ -246,8 +257,6 @@ export default function App() {
     setPin(null)
     setCurrent(m)
     setError(null)
-    // The button just chosen is about to hide, and focus would fall off the page.
-    pickerButtonRef.current?.focus()
     engine.setMap(m).catch((e) => {
       console.error(e)
       setError('This map couldn’t be opened.')
