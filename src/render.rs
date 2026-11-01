@@ -268,6 +268,9 @@ impl MapCtx {
         // same as before": every LOD tile this pass touches gets rebuilt.
         let outdated = prev != Some(RENDER_VERSION);
         if outdated {
+            // Saying so first: a pass stopped after this, with its height then put
+            // back, would otherwise look finished with its LOD sources gone.
+            self.write_manifest(prev)?;
             // Another version's LOD sources can't feed this one's tiles.
             for level in 1..=lod::LEVELS {
                 let _ = std::fs::remove_dir_all(self.out.join("lod").join(format!("src{level}")));
@@ -1614,6 +1617,19 @@ mod tests {
         assert!(render("a", 60).stats.chunks > 0);
         assert_eq!(render("a", 60).stats.chunks, 0);
         render("fresh", 60);
+        assert_eq!(snapshot(&map), snapshot(&base.join("fresh/maps/test")));
+
+        // A change stopped before its first batch, and then taken back, still renders.
+        let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut cfg = map_config(&world);
+            cfg.min_y = 0;
+            cfg.max_y = 80;
+            MapCtx::with_baker(cfg, &base.join("a"), Baker::new(AssetFiles::new()))
+                .unwrap()
+                .render_reporting(&pool, false, |_| panic!("stopping the pass"), |_| {})
+        }));
+        assert!(stopped.is_err());
+        render("a", 60);
         assert_eq!(snapshot(&map), snapshot(&base.join("fresh/maps/test")));
 
         // A manifest from before tiles were cut is a map with nothing cut off, so a

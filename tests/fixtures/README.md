@@ -1,4 +1,4 @@
-Small region files cut from real worlds, for tests. `subregion.py` made them:
+Small region files for tests. `subregion.py` cut the first two from real worlds:
 
 - `26.2/region/`: a 4×4-chunk corner of each of the four regions that meet at
   the origin of a Minecraft 26.2 (Fabric, Terralith) world. Tiles that cross

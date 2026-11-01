@@ -34,3 +34,5 @@ version = "26.2"
 # version = "26.2"
 # min_y = 0
 # max_y = 100
+# Cave removal can't tell what a cut opens up, so it's off here.
+# remove_caves_below_y = -64
