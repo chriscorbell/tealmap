@@ -130,7 +130,7 @@ button {
 }
 
 .picker-name {
-  max-width: min(36vw, 320px);
+  max-width: min(30vw, 320px);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
