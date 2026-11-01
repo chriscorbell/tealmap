@@ -1,4 +1,4 @@
-import { Box3, Frustum, MathUtils, Matrix4, PerspectiveCamera, Vector3 } from 'three'
+import { Box3, Frustum, MathUtils, Matrix4, PerspectiveCamera, Vector2, Vector3 } from 'three'
 import { MapControls } from 'three/examples/jsm/controls/MapControls.js'
 import type { Place } from '../Places'
 import { formatHash, type Pin, type View } from '../route'
@@ -99,7 +99,19 @@ const KEY_PAN = 0.9
 const KEY_TURN = 70
 const KEY_TILT = 45
 const KEY_ZOOM = 1.6
-const MAX_KEY_STEP_MS = 250
+/** Longest step anything timed takes in one frame, so a stall doesn't become a jump. */
+const MAX_STEP_MS = 250
+/** How far one notch of a scroll wheel zooms: this many times, over about a quarter of a second. */
+const ZOOM_PER_NOTCH = 1.5
+/** The share of the scrolling still to do that's spent per ZOOM_STEP_MS. */
+const ZOOM_STIFFNESS = 0.2
+const ZOOM_STEP_MS = 16.666
+/** Notches of scrolling too few to see, which end a glide. */
+const ZOOM_DONE = 1e-4
+/** Chrome reports a trackpad pinch as a scroll with ctrl held, of 100 * ln(scale). This makes the map follow the fingers. */
+const ZOOM_PINCH = 1 / Math.log(ZOOM_PER_NOTCH)
+/** How far away a point under the cursor can be and still hold still, in view distances. Past that it's near the horizon. */
+const ZOOM_REACH = 4
 /** How far two fingers have to twist before it counts as rotating, in radians. */
 const TWIST_START = 0.14
 /** Top-down, just off vertical so north stays up. */
@@ -134,6 +146,7 @@ interface Tile {
 
 /** A number per tile: coordinates of any map fit, and it hashes faster than a string. */
 const key = (level: number, x: number, z: number) => ((x + 0x200000) * 0x400000 + (z + 0x200000)) * 16 + level
+const reducedMotion = () => matchMedia('(prefers-reduced-motion: reduce)').matches
 /** Whether two tiles cover any of the same ground. */
 const overlap = (a: Tile, b: Tile) => {
   const [fine, coarse] = a.level < b.level ? [a, b] : [b, a]
@@ -251,6 +264,11 @@ export class MapEngine {
   private gpuTimer: GpuTimer | null = null
   private pin: Pin | null = null
   private flight: { from: View; to: View; start: number } | null = null
+  /** Notches of scrolling not yet spent, positive going out. */
+  private zoomLeft = 0
+  /** Where the cursor last scrolled, from -1 to 1 across the canvas. */
+  private readonly zoomAt = new Vector2()
+  private readonly zoomRay = new Vector3()
   /** Where to start once the map being opened has loaded. */
   private startView: View | undefined
   private point = new Vector3()
@@ -332,7 +350,9 @@ export class MapEngine {
     if (this.bench) this.gpuTimer = GpuTimer.create(gl)
     this.resize()
     window.addEventListener('resize', this.resize)
-    for (const event of ['pointerdown', 'wheel', 'touchstart']) canvas.addEventListener(event, this.wake, { passive: true })
+    for (const event of ['pointerdown', 'touchstart']) canvas.addEventListener(event, this.wake, { passive: true })
+    // Capturing, to get there before the controls, which would move the camera all at once.
+    canvas.addEventListener('wheel', this.wheel, { capture: true, passive: false })
     canvas.addEventListener('webglcontextlost', this.contextLost)
     canvas.addEventListener('webglcontextrestored', this.contextRestored)
     canvas.addEventListener('touchstart', this.twistMove, { passive: true })
@@ -351,7 +371,8 @@ export class MapEngine {
     clearTimeout(this.refreshTimer)
     clearTimeout(this.reconnectTimer)
     window.removeEventListener('resize', this.resize)
-    for (const event of ['pointerdown', 'wheel', 'touchstart']) this.canvas.removeEventListener(event, this.wake)
+    for (const event of ['pointerdown', 'touchstart']) this.canvas.removeEventListener(event, this.wake)
+    this.canvas.removeEventListener('wheel', this.wheel, { capture: true })
     this.canvas.removeEventListener('webglcontextlost', this.contextLost)
     this.canvas.removeEventListener('webglcontextrestored', this.contextRestored)
     for (const event of ['touchstart', 'touchmove', 'touchend', 'touchcancel']) this.canvas.removeEventListener(event, this.twistMove as EventListener)
@@ -426,6 +447,7 @@ export class MapEngine {
     this.clearTiles()
     this.map = map
     this.flight = null
+    this.zoomLeft = 0
     // Nothing plans against the old map's manifest or textures while loading.
     this.manifest = null
     this.bounds = null
@@ -656,8 +678,8 @@ export class MapEngine {
     this.keys.clear()
   }
 
-  private stepKeys(now: number) {
-    const dt = Math.min(now - (this.lastFrame || now - 16), MAX_KEY_STEP_MS) / 1000
+  private stepKeys(ms: number) {
+    const dt = ms / 1000
     const held = (...codes: string[]) => codes.some((c) => this.keys.has(c))
     const axis = (plus: string[], minus: string[]) => (held(...plus) ? 1 : 0) - (held(...minus) ? 1 : 0)
     const t = this.controls.target
@@ -675,6 +697,54 @@ export class MapEngine {
     dist *= Math.exp(axis(['Minus', 'NumpadSubtract'], ['Equal', 'NumpadAdd']) * KEY_ZOOM * dt)
     dist = MathUtils.clamp(dist, this.controls.minDistance, this.controls.maxDistance)
     this.placeCamera(x, z, dist, MathUtils.radToDeg(az), MathUtils.radToDeg(polar), t.y)
+    this.dirty = true
+  }
+
+  /** Adds scrolling to what's still to do. `stepZoom` spends it over the next frames. */
+  private wheel = (e: WheelEvent) => {
+    e.stopImmediatePropagation()
+    e.preventDefault()
+    if (!this.ready) return
+    let notches = e.deltaY
+    if (e.deltaMode === WheelEvent.DOM_DELTA_PIXEL) notches *= 0.01
+    else if (e.deltaMode === WheelEvent.DOM_DELTA_LINE) notches *= 0.33
+    if (e.ctrlKey) notches *= ZOOM_PINCH
+    // Starting from rest, the time since the last frame says nothing.
+    if (!this.zoomLeft) this.lastFrame = 0
+    this.zoomLeft += notches
+    const rect = this.canvas.getBoundingClientRect()
+    this.zoomAt.set(((e.clientX - rect.left) / rect.width) * 2 - 1, 1 - ((e.clientY - rect.top) / rect.height) * 2)
+    this.autoView = false
+    this.flight = null
+    this.wake()
+  }
+
+  /**
+   * Spends a share of the scrolling still to do. Everything scales around the point
+   * under the cursor, which moves the camera straight along the cursor's ray, so
+   * whatever is under the cursor stays there however tall it is.
+   */
+  private stepZoom(ms: number) {
+    const share = reducedMotion() ? 1 : 1 - (1 - ZOOM_STIFFNESS) ** (ms / ZOOM_STEP_MS)
+    const spent = this.zoomLeft * share
+    this.zoomLeft -= spent
+    if (Math.abs(this.zoomLeft) < ZOOM_DONE) this.zoomLeft = 0
+    const cam = this.camera.position
+    const t = this.controls.target
+    const dist = cam.distanceTo(t)
+    const wanted = dist * ZOOM_PER_NOTCH ** spent
+    const next = MathUtils.clamp(wanted, this.controls.minDistance, this.controls.maxDistance)
+    // At a limit, scrolling further is lost, so going back needn't undo it first.
+    if (next !== wanted) this.zoomLeft = 0
+    const scale = next / dist
+    this.camera.updateMatrixWorld()
+    const ray = this.zoomRay.set(this.zoomAt.x, this.zoomAt.y, 1).unproject(this.camera).sub(cam).normalize()
+    const height = cam.y - t.y
+    const reach = Math.min(ray.y < 0 ? height / -ray.y : Infinity, dist * ZOOM_REACH)
+    const x = cam.x + ray.x * reach
+    const z = cam.z + ray.z * reach
+    cam.set(x + (cam.x - x) * scale, t.y + height * scale, z + (cam.z - z) * scale)
+    t.set(x + (t.x - x) * scale, t.y, z + (t.z - z) * scale)
     this.dirty = true
   }
 
@@ -760,6 +830,7 @@ export class MapEngine {
 
   /** Stops a fling, so it doesn't carry the camera on from wherever it's sent next. */
   private stopInertia() {
+    this.zoomLeft = 0
     this.controls.enableDamping = false
     this.controls.update()
     this.controls.enableDamping = true
@@ -786,7 +857,7 @@ export class MapEngine {
     if (f && f.to.x === to.x && f.to.z === to.z && f.to.dist === to.dist && f.to.az === to.az && f.to.polar === to.polar) return
     const from = this.view()
     const far = Math.hypot(to.x - from.x, to.z - from.z) > 3 * Math.max(from.dist, to.dist)
-    if (far || !this.ready || matchMedia('(prefers-reduced-motion: reduce)').matches) return this.goTo(to)
+    if (far || !this.ready || reducedMotion()) return this.goTo(to)
     this.autoView = false
     this.stopInertia()
     this.flight = { from, to, start: 0 }
@@ -1332,8 +1403,10 @@ export class MapEngine {
 
   private frame = (now: number) => {
     this.raf = requestAnimationFrame(this.frame)
-    if (this.keys.size) this.stepKeys(now)
+    const ms = Math.min(now - (this.lastFrame || now - 16), MAX_STEP_MS)
     this.lastFrame = now
+    if (this.keys.size) this.stepKeys(ms)
+    if (this.zoomLeft) this.stepZoom(ms)
     if (this.flight) this.stepFlight(now)
     const moved = this.controls.update()
     this.clampTarget()
