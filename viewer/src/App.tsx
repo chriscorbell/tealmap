@@ -135,7 +135,6 @@ export default function App() {
 
     const open = (m: MapInfo, view: Parameters<MapEngine['setMap']>[1]) => {
       setCurrent(m)
-      setPanel((p) => (p === 'places' ? null : p))
       setError(null)
       engine.setMap(m, view).catch((e) => {
         console.error(e)
@@ -146,6 +145,11 @@ export default function App() {
     // Startup, links pasted into the address bar and the Back button all come through here.
     const follow = () => {
       engine.cancelHashWrite()
+      // Going somewhere is what the list of places is for, however it happens.
+      if (panelRef.current === 'places') {
+        placesButtonRef.current?.focus()
+        setPanel(null)
+      }
       const { id, view, pin: linked } = parseHash(location.hash)
       const list = mapsRef.current
       const target = list.find((m) => m.id === id)
