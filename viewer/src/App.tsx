@@ -1,77 +1,178 @@
 import { Activity, ChevronDown, Layers } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
+import { Coords } from './Coords'
 import { type CameraState, type MapInfo, MapEngine, type Stats } from './map/engine'
+import { PinCard } from './PinCard'
+import { parseHash, type Pin } from './route'
 
-function parseHash() {
-  const [id, ...nums] = location.hash.slice(1).split('/')
-  const v = nums.map(Number)
-  if (!id || v.length !== 5 || v.some((n) => !Number.isFinite(n))) return { id: id || null, view: undefined }
-  return { id, view: { x: v[0], z: v[1], dist: v[2], az: v[3], polar: v[4] } }
-}
+/** Moving less than this between press and release, in CSS pixels, counts as a click. */
+const CLICK_SLOP = { mouse: 5, other: 10 }
+const CLICK_MS = 500
+/** How far the pin's card stays from the screen's edges, in CSS pixels. */
+const CARD_MARGIN = 8
 
 export default function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const engineRef = useRef<MapEngine | null>(null)
+  const mapsRef = useRef<MapInfo[]>([])
+  const xRef = useRef<HTMLInputElement>(null)
+  const yRef = useRef<HTMLElement>(null)
+  const zRef = useRef<HTMLInputElement>(null)
+  const markerRef = useRef<HTMLDivElement>(null)
+  const pinRef = useRef<Pin | null>(null)
+  const pressRef = useRef<{ id: number; x: number; y: number; at: number; kind: string } | null>(null)
   const [maps, setMaps] = useState<MapInfo[]>([])
   const [current, setCurrent] = useState<MapInfo | null>(null)
   const [stats, setStats] = useState<Stats | null>(null)
-  const coordsRef = useRef<HTMLElement>(null)
+  const [pin, setPinState] = useState<Pin | null>(null)
   const [bench] = useState(() => new URLSearchParams(location.search).has('bench'))
   const [statsOpen, setStatsOpen] = useState(bench)
   const [menu, setMenu] = useState(false)
   const [error, setError] = useState<string | null>(null)
+
+  const placeMarker = () => {
+    const el = markerRef.current
+    const p = pinRef.current
+    const engine = engineRef.current
+    if (!el || !p || !engine) return
+    // On top of the block, not inside it.
+    const at = engine.project(p.x + 0.5, p.y + 1, p.z + 0.5)
+    el.style.visibility = at ? 'visible' : 'hidden'
+    if (!at) return
+    el.style.transform = `translate(${at.x}px, ${at.y}px)`
+    el.classList.toggle('below', at.y < 90)
+    const width = canvasRef.current!.clientWidth
+    const half = (el.querySelector<HTMLElement>('.pin-card')?.offsetWidth ?? 0) / 2
+    const nudge = Math.min(Math.max(at.x, half + CARD_MARGIN), width - half - CARD_MARGIN) - at.x
+    el.style.setProperty('--nudge', `${nudge}px`)
+  }
+
+  const setPin = (p: Pin | null) => {
+    pinRef.current = p
+    engineRef.current?.setPin(p)
+    setPinState(p)
+  }
+
+  // A new pin's marker exists once React has drawn it.
+  useEffect(placeMarker, [pin])
 
   useEffect(() => {
     const engine = new MapEngine(canvasRef.current!, {
       onStats: setStats,
       // Straight to the DOM: this runs every frame the camera moves.
       onCamera: (c: CameraState) => {
-        const values = coordsRef.current?.querySelectorAll('b')
-        if (values) [c.x, c.y, c.z].forEach((v, i) => (values[i].textContent = String(Math.round(v))))
+        // Don't type over someone typing.
+        if (xRef.current && document.activeElement !== xRef.current) xRef.current.value = String(Math.round(c.x))
+        if (zRef.current && document.activeElement !== zRef.current) zRef.current.value = String(Math.round(c.z))
+        if (yRef.current) yRef.current.textContent = String(Math.round(c.y))
+        placeMarker()
       },
       bench,
     })
     engineRef.current = engine
     ;(window as unknown as { tealmap: MapEngine }).tealmap = engine
+
+    const open = (m: MapInfo, view: Parameters<MapEngine['setMap']>[1]) => {
+      setCurrent(m)
+      engine.setMap(m, view).catch((e) => setError(String(e)))
+    }
+
+    // Startup, links pasted into the address bar and the Back button all come through here.
+    const follow = () => {
+      engine.cancelHashWrite()
+      const { id, view, pin: linked } = parseHash(location.hash)
+      const list = mapsRef.current
+      const target = list.find((m) => m.id === id)
+      setError(id && !target ? `There's no map called ${id}.` : null)
+      if (!target && engine.mapId) return
+      const pick = target ?? list[0]
+      if (!pick) return
+      if (pick.id !== engine.mapId) open(pick, target ? view : undefined)
+      else if (view) engine.flyTo(view)
+      setPin(target ? (linked ?? null) : null)
+    }
+
     fetch('/api/maps')
       .then((r) => r.json() as Promise<MapInfo[]>)
       .then((list) => {
+        mapsRef.current = list
         setMaps(list)
-        const { id, view } = parseHash()
-        const pick = list.find((m) => m.id === id) ?? list[0]
-        if (!pick) {
-          setError('No maps configured.')
-          return
-        }
-        setCurrent(pick)
-        engine.setMap(pick, pick.id === id ? view : undefined).catch((e) => setError(String(e)))
+        if (!list.length) setError('No maps configured.')
+        else follow()
       })
       .catch((e) => setError(String(e)))
-    const onHash = () => {
-      const { id, view } = parseHash()
-      if (view && id === engine.mapId) engine.goTo(view)
+    // popstate comes first, in the same task as the URL changing, so no pending
+    // write can replace the URL before it's read. hashchange covers the rest.
+    window.addEventListener('popstate', follow)
+    window.addEventListener('hashchange', follow)
+    const escape = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && pinRef.current) setPin(null)
     }
-    window.addEventListener('hashchange', onHash)
+    window.addEventListener('keydown', escape)
     return () => {
-      window.removeEventListener('hashchange', onHash)
+      window.removeEventListener('popstate', follow)
+      window.removeEventListener('hashchange', follow)
+      window.removeEventListener('keydown', escape)
       engine.dispose()
     }
   }, [bench])
 
   const switchMap = (m: MapInfo) => {
     setMenu(false)
-    if (m.id === current?.id) return
+    const engine = engineRef.current
+    if (!engine || m.id === current?.id) return
+    // A step the Back button undoes, like any other move to somewhere else.
+    history.replaceState(null, '', engine.hash() || location.hash)
+    history.pushState(null, '', `#${m.id}`)
+    setPin(null)
     setCurrent(m)
-    engineRef.current?.setMap(m).catch((e) => setError(String(e)))
+    engine.setMap(m).catch((e) => setError(String(e)))
+  }
+
+  const goToCoords = (to: { x?: number; z?: number }) => {
+    const engine = engineRef.current
+    if (!engine?.mapId) return
+    const here = engine.view()
+    engine.jumpTo({ ...here, x: Math.round(to.x ?? here.x), z: Math.round(to.z ?? here.z) })
+  }
+
+  const linkHere = () => `${location.origin}${location.pathname}${engineRef.current?.hash() ?? ''}`
+
+  const press = (e: React.PointerEvent) => {
+    // A second finger makes this a gesture, not a tap.
+    pressRef.current = pressRef.current
+      ? null
+      : e.button === 0
+        ? { id: e.pointerId, x: e.clientX, y: e.clientY, at: performance.now(), kind: e.pointerType }
+        : null
+  }
+
+  const release = (e: React.PointerEvent) => {
+    const p = pressRef.current
+    pressRef.current = null
+    if (!p || p.id !== e.pointerId) return
+    const slop = p.kind === 'mouse' ? CLICK_SLOP.mouse : CLICK_SLOP.other
+    if (Math.hypot(e.clientX - p.x, e.clientY - p.y) > slop || performance.now() - p.at > CLICK_MS) return
+    // The first click away from a pin only clears it, so a stray click can't lose your place.
+    setPin(pinRef.current ? null : (engineRef.current?.pick(e.clientX, e.clientY) ?? null))
   }
 
   const loading = (stats?.pending ?? 0) > 0
 
   return (
     <div className="app">
-      <canvas ref={canvasRef} className="map" onContextMenu={(e) => e.preventDefault()} />
+      <canvas
+        ref={canvasRef}
+        className="map"
+        onContextMenu={(e) => e.preventDefault()}
+        onPointerDown={press}
+        onPointerUp={release}
+        onPointerCancel={() => (pressRef.current = null)}
+      />
 
       <div className={`progress ${loading ? 'on' : ''}`} />
+
+      {pin && <PinCard key={`${pin.x}/${pin.y}/${pin.z}`} pin={pin} marker={markerRef} link={linkHere} close={() => setPin(null)} />}
 
       <header className="bar top-left">
         <div className="brand">
@@ -130,17 +231,7 @@ export default function App() {
         )}
       </section>
 
-      <footer ref={coordsRef} className="bar bottom-left coords">
-        <span>
-          x <b>0</b>
-        </span>
-        <span>
-          y <b>0</b>
-        </span>
-        <span>
-          z <b>0</b>
-        </span>
-      </footer>
+      <Coords x={xRef} y={yRef} z={zRef} go={goToCoords} link={linkHere} />
 
       {error && <div className="error">{error}</div>}
     </div>

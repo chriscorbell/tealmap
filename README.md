@@ -46,7 +46,7 @@ cargo run --release -- -c tealmap.toml serve   # API on :8200
 cd viewer && pnpm install && pnpm dev           # viewer with hot reload, proxies /api and /maps
 ```
 
-Append `?bench` to the viewer URL to render every frame and show the stats panel. The URL hash (`#map/x/z/distance/azimuth/polar`) stores the camera.
+Append `?bench` to the viewer URL to render every frame and show the stats panel. The URL hash (`#map/x/z/distance/azimuth/polar`, then `/x/y/z` if a block is pinned) stores the camera.
 
 `bench/viewer.mjs` drives the viewer in headless Chrome on a real GPU and reports load, frame and GPU times. `bench/tilestats.py` breaks a rendered map down by level, group and face direction.
 

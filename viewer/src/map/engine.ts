@@ -1,5 +1,6 @@
-import { Box3, Frustum, MathUtils, Matrix4, PerspectiveCamera } from 'three'
+import { Box3, Frustum, MathUtils, Matrix4, PerspectiveCamera, Vector3 } from 'three'
 import { MapControls } from 'three/examples/jsm/controls/MapControls.js'
+import { formatHash, type Pin, type View } from '../route'
 import { type Mesh, Pass, Renderer } from './renderer'
 import { NO_TOP } from './tile'
 import type { Request, Response } from './worker'
@@ -66,6 +67,10 @@ const KEEP_MS = 10_000
 /** Idle frames before the loop sleeps, and how often it wakes to plan. */
 const IDLE_FRAMES = 30
 const SLEEP_MS = 1000
+/** How long the camera takes to move to somewhere nearby. */
+const FLY_MS = 600
+/** Longest a ray goes looking for terrain, in steps. */
+const PICK_STEPS = 4000
 
 interface Tile {
   key: number
@@ -189,6 +194,9 @@ export class MapEngine {
   private onCamera: (c: CameraState) => void
   private hashTimer = 0
   private gpuTimer: GpuTimer | null = null
+  private pin: Pin | null = null
+  private flight: { from: View; to: View; start: number } | null = null
+  private point = new Vector3()
 
   private canvas: HTMLCanvasElement
   private disposed = false
@@ -239,6 +247,7 @@ export class MapEngine {
     this.controls.zoomToCursor = true
     this.controls.addEventListener('start', () => {
       this.autoView = false
+      this.flight = null
     })
     this.controls.addEventListener('change', () => {
       this.dirty = true
@@ -259,6 +268,7 @@ export class MapEngine {
     this.generation++
     cancelAnimationFrame(this.raf)
     clearTimeout(this.sleepTimer)
+    clearTimeout(this.hashTimer)
     window.removeEventListener('resize', this.resize)
     for (const event of ['pointerdown', 'wheel', 'touchstart']) this.canvas.removeEventListener(event, this.wake)
     this.events?.close()
@@ -281,11 +291,12 @@ export class MapEngine {
   }
 
   /** Loads a map. `view` restores a camera position (e.g. from the URL). */
-  async setMap(map: MapInfo, view?: { x: number; z: number; dist: number; az: number; polar: number }) {
+  async setMap(map: MapInfo, view?: View) {
     if (this.disposed) return
     const gen = ++this.generation
     this.clearTiles()
     this.map = map
+    this.flight = null
     // Nothing plans against the old map's manifest or textures while loading.
     this.manifest = null
     this.ready = false
@@ -438,11 +449,97 @@ export class MapEngine {
     return this.map?.id ?? null
   }
 
-  goTo(v: { x: number; z: number; dist: number; az: number; polar: number }) {
+  goTo(v: View) {
+    this.autoView = false
+    this.flight = null
     this.placeCamera(v.x, v.z, v.dist, v.az, v.polar)
     this.lastPlan = 0
     this.dirty = true
     this.wake()
+  }
+
+  /** Moves to a view, easing there when it's near enough to see where it's going. */
+  flyTo(to: View) {
+    const f = this.flight
+    if (f && f.to.x === to.x && f.to.z === to.z && f.to.dist === to.dist && f.to.az === to.az && f.to.polar === to.polar) return
+    const from = this.view()
+    const far = Math.hypot(to.x - from.x, to.z - from.z) > 3 * Math.max(from.dist, to.dist)
+    if (far || !this.ready || matchMedia('(prefers-reduced-motion: reduce)').matches) return this.goTo(to)
+    this.autoView = false
+    this.flight = { from, to, start: 0 }
+    this.wake()
+  }
+
+  /** Drops a pending URL write, which would overwrite a location just navigated to. */
+  cancelHashWrite() {
+    clearTimeout(this.hashTimer)
+    this.hashTimer = 0
+  }
+
+  /** Moves to a view as a step the browser's Back button undoes. */
+  jumpTo(to: View) {
+    if (!this.map) return
+    this.cancelHashWrite()
+    history.replaceState(null, '', this.hash())
+    history.pushState(null, '', formatHash(this.map.id, to, this.pin))
+    this.flyTo(to)
+  }
+
+  /** Marks a block in the URL. Drawing the marker is up to the page. */
+  setPin(pin: Pin | null) {
+    this.pin = pin
+    this.scheduleHash()
+  }
+
+  /** The URL hash for what's on screen now, without waiting for the address bar. */
+  hash() {
+    return this.map ? formatHash(this.map.id, this.view(), this.pin) : ''
+  }
+
+  /** The block under a point on the canvas, from the terrain loaded there. */
+  pick(clientX: number, clientY: number): Pin | null {
+    const m = this.manifest
+    if (!m) return null
+    const rect = this.canvas.getBoundingClientRect()
+    const o = this.camera.position
+    const dir = this.point
+      .set(((clientX - rect.left) / rect.width) * 2 - 1, 1 - ((clientY - rect.top) / rect.height) * 2, 0.5)
+      .unproject(this.camera)
+      .sub(o)
+      .normalize()
+    const hit = (t: number) => {
+      const y = o.y + dir.y * t
+      const h = this.heightAt(o.x + dir.x * t, o.z + dir.z * t)
+      return h !== null && y <= h
+    }
+    // Nothing is above the top of the world, so start there.
+    let t = o.y > m.maxY ? (dir.y < 0 ? (m.maxY - o.y) / dir.y : Infinity) : 0
+    if (t === Infinity) return null
+    let before = t
+    for (let i = 0; i < PICK_STEPS && !hit(t); i++) {
+      if (o.y + dir.y * t < m.minY) return null
+      before = t
+      // Steps stay under a block nearby and grow with distance, where a block is under a pixel.
+      t += Math.max(0.5, t * 0.002)
+      if (i === PICK_STEPS - 1) return null
+    }
+    let after = t
+    for (let i = 0; i < 12; i++) {
+      const mid = (before + after) / 2
+      if (hit(mid)) after = mid
+      else before = mid
+    }
+    const x = o.x + dir.x * after
+    const z = o.z + dir.z * after
+    const h = this.heightAt(x, z)
+    return h === null ? null : { x: Math.floor(x), y: h - 1, z: Math.floor(z) }
+  }
+
+  /** Where a point in the world is on the canvas, or null if it's behind the camera. */
+  project(x: number, y: number, z: number): { x: number; y: number } | null {
+    const p = this.point.set(x, y, z).project(this.camera)
+    if (p.z > 1) return null
+    return { x: ((p.x + 1) / 2) * this.canvas.clientWidth, y: ((1 - p.y) / 2) * this.canvas.clientHeight }
   }
 
   /** Debug summary of tile states per level. */
@@ -456,10 +553,10 @@ export class MapEngine {
     return { ...out, target: this.controls.target.toArray().map(Math.round) }
   }
 
-  private placeCamera(x: number, z: number, dist: number, azDeg: number, polarDeg: number) {
+  private placeCamera(x: number, z: number, dist: number, azDeg: number, polarDeg: number, atY?: number) {
     const az = (azDeg * Math.PI) / 180
     const polar = (polarDeg * Math.PI) / 180
-    const y = this.heightAt(x, z) ?? 64
+    const y = atY ?? this.heightAt(x, z) ?? 64
     this.controls.target.set(x, y, z)
     this.camera.position.set(
       x + dist * Math.sin(polar) * Math.sin(az),
@@ -485,12 +582,12 @@ export class MapEngine {
     }
   }
 
+  /** Writes the camera to the URL at most every 400 ms, so a long move can't hold it back. */
   private scheduleHash() {
-    clearTimeout(this.hashTimer)
+    if (this.hashTimer) return
     this.hashTimer = window.setTimeout(() => {
-      if (!this.map) return
-      const v = this.view()
-      history.replaceState(null, '', `#${this.map.id}/${v.x}/${v.z}/${v.dist}/${v.az}/${v.polar}`)
+      this.hashTimer = 0
+      if (this.ready) history.replaceState(null, '', this.hash())
     }, 400)
   }
 
@@ -833,8 +930,22 @@ export class MapEngine {
     this.raf = requestAnimationFrame(this.frame)
   }
 
+  private stepFlight(now: number) {
+    const f = this.flight!
+    f.start ||= now
+    const p = Math.min(1, (now - f.start) / FLY_MS)
+    const e = 1 - (1 - p) ** 3
+    const mix = (a: number, b: number) => a + (b - a) * e
+    // Around the short way.
+    const az = f.from.az + (((f.to.az - f.from.az + 540) % 360) - 180) * e
+    this.placeCamera(mix(f.from.x, f.to.x), mix(f.from.z, f.to.z), mix(f.from.dist, f.to.dist), az, mix(f.from.polar, f.to.polar), this.controls.target.y)
+    this.dirty = true
+    if (p === 1) this.flight = null
+  }
+
   private frame = (now: number) => {
     this.raf = requestAnimationFrame(this.frame)
+    if (this.flight) this.stepFlight(now)
     const moved = this.controls.update()
 
     // Nothing is closer than the top of the world, so the near plane can follow

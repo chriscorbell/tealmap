@@ -26,12 +26,21 @@ body,
   overflow: hidden;
 }
 
-button {
+button,
+input {
   font: inherit;
   color: inherit;
   background: none;
   border: 0;
+}
+
+button {
   cursor: pointer;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
 }
 
 .app {
@@ -185,9 +194,14 @@ button {
   background: rgba(255, 255, 255, 0.06);
 }
 
-.icon.active {
+.icon.active,
+.icon.copied {
   color: var(--accent);
   background: rgba(45, 212, 191, 0.1);
+}
+
+.icon.failed {
+  color: #fca5a5;
 }
 
 .panel {
@@ -234,17 +248,98 @@ button {
 }
 
 .coords {
-  gap: 14px;
-  padding: 7px 12px;
+  gap: 10px;
+  padding: 3px 3px 3px 12px;
   color: var(--muted);
   font-family: ui-monospace, 'SF Mono', Menlo, monospace;
   font-size: 12px;
 }
 
-.coords b {
+.coords b,
+.pin-coords b {
   font-weight: 500;
   color: var(--text);
   font-variant-numeric: tabular-nums;
+}
+
+.coords label {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.coords input {
+  width: 8ch;
+  padding: 3px 4px;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  border-radius: 5px;
+  transition: background 0.15s;
+}
+
+.coords input:hover {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.coords input:focus {
+  outline: none;
+  background: rgba(45, 212, 191, 0.12);
+}
+
+.pin {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 0;
+  height: 0;
+  will-change: transform;
+}
+
+.pin-mark {
+  position: absolute;
+  left: -14px;
+  bottom: 0;
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  color: var(--accent);
+  filter: drop-shadow(0 2px 3px rgba(0, 0, 0, 0.6));
+  transform-origin: bottom center;
+  animation: drop 0.32s var(--ease) both;
+}
+
+.pin-card {
+  position: absolute;
+  bottom: 34px;
+  left: var(--nudge, 0px);
+  translate: -50% 0;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  width: max-content;
+  padding: 3px 3px 3px 10px;
+  color: var(--muted);
+  font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+  font-size: 12px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.28);
+  animation: rise 0.25s var(--ease) both;
+}
+
+.pin.below .pin-card {
+  top: 8px;
+  bottom: auto;
+}
+
+.pin-coords {
+  margin-right: 4px;
+  white-space: nowrap;
 }
 
 .progress {
@@ -292,6 +387,13 @@ button {
 @keyframes enter {
   from {
     opacity: 0;
+  }
+}
+
+@keyframes drop {
+  from {
+    opacity: 0;
+    transform: translateY(-10px) scale(0.8);
   }
 }
 
