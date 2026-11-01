@@ -57,6 +57,11 @@ button {
   outline: none;
 }
 
+.map:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
 .bar {
   position: absolute;
   z-index: 2;
@@ -149,16 +154,21 @@ button {
   opacity: 0;
   transform: translateY(-4px) scale(0.98);
   transform-origin: top left;
-  pointer-events: none;
+  /* Hidden, not just transparent, so Tab can't land on it. After the fade. */
+  visibility: hidden;
   transition:
     opacity 0.18s var(--ease),
-    transform 0.18s var(--ease);
+    transform 0.18s var(--ease),
+    visibility 0s 0.18s;
 }
 
 .menu.open {
   opacity: 1;
   transform: none;
-  pointer-events: auto;
+  visibility: visible;
+  transition:
+    opacity 0.18s var(--ease),
+    transform 0.18s var(--ease);
 }
 
 .menu button {
@@ -190,6 +200,13 @@ button {
     color 0.2s;
 }
 
+.compass {
+  display: grid;
+  place-items: center;
+  color: var(--accent);
+  will-change: transform;
+}
+
 .icon:hover {
   color: var(--text);
   background: rgba(255, 255, 255, 0.06);
@@ -208,6 +225,9 @@ button {
 .panel {
   position: absolute;
   z-index: 2;
+  /* A short, wide screen has to be able to reach all of it. */
+  max-height: calc(100dvh - 76px);
+  overflow-y: auto;
   top: 62px;
   right: 14px;
   width: 220px;
@@ -220,16 +240,70 @@ button {
   opacity: 0;
   transform: translateY(-6px) scale(0.98);
   transform-origin: top right;
-  pointer-events: none;
+  visibility: hidden;
   transition:
     opacity 0.22s var(--ease),
-    transform 0.22s var(--ease);
+    transform 0.22s var(--ease),
+    visibility 0s 0.22s;
+}
+
+.bar:has(.menu.open),
+.panel.open {
+  z-index: 4;
 }
 
 .panel.open {
   opacity: 1;
   transform: none;
-  pointer-events: auto;
+  visibility: visible;
+  transition:
+    opacity 0.22s var(--ease),
+    transform 0.22s var(--ease);
+}
+
+.panel:has(.help) {
+  width: 290px;
+}
+
+.help dl {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+}
+
+.help dl div {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.help h2 {
+  margin: 10px 0 6px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.help h2:first-child {
+  margin-top: 0;
+}
+
+.help dt {
+  font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.help dd {
+  margin: 0;
+  color: var(--muted);
+}
+
+.bottom-right {
+  bottom: 14px;
+  right: 14px;
+  flex-direction: column;
+  animation-delay: 0.2s;
 }
 
 .stats {
@@ -290,6 +364,8 @@ button {
 
 .pin {
   position: absolute;
+  /* Over the bars, so a pin's buttons can always be reached. */
+  z-index: 3;
   top: 0;
   left: 0;
   width: 0;
@@ -434,5 +510,56 @@ button {
   *::after {
     animation: none !important;
     transition: none !important;
+  }
+}
+
+/* Fingers need bigger targets than a pointer does. */
+@media (pointer: coarse) {
+  .icon,
+  .picker-button {
+    height: 44px;
+  }
+
+  .icon {
+    width: 44px;
+  }
+
+  .menu button {
+    padding: 14px 10px;
+  }
+
+  .coords input {
+    padding: 13px 4px;
+  }
+
+  .panel {
+    top: 72px;
+    max-height: calc(100dvh - 86px);
+  }
+
+  .status {
+    top: 72px;
+  }
+
+  .pin-mark {
+    left: -22px;
+    width: 44px;
+    height: 44px;
+    place-items: end center;
+  }
+
+  .pin-card {
+    bottom: 50px;
+  }
+}
+
+/* Too narrow for everything on one line. */
+@media (max-width: 460px) {
+  .brand span {
+    display: none;
+  }
+
+  .bottom-right {
+    bottom: 76px;
   }
 }

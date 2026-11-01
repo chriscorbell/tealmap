@@ -36,10 +36,16 @@ pub struct MapConfig {
     pub min_y: i32,
     #[serde(default = "default_max_y")]
     pub max_y: i32,
+    /// Where the map starts and its Home button goes, as [x, z]. Defaults to the
+    /// middle of what's rendered.
+    pub start: Option<Vec<f64>>,
     /// Skip unlit blocks below this y and the ocean floor (BlueMap's default is 55).
     #[serde(default = "default_caves")]
     pub remove_caves_below_y: i32,
 }
+
+/// Further than any Minecraft world goes.
+const MAX_COORD: f64 = 30_000_000.0;
 
 fn default_listen() -> String {
     "0.0.0.0:8200".into()
@@ -95,6 +101,15 @@ impl Config {
                     m.min_y,
                     m.max_y
                 );
+            }
+            if let Some(start) = &m.start {
+                let [x, z] = start[..] else {
+                    bail!("map {}: start is [x, z], with no y", m.id);
+                };
+                // Written this way round so NaN fails too.
+                if !(x.abs() <= MAX_COORD && z.abs() <= MAX_COORD) {
+                    bail!("map {}: start is outside any world", m.id);
+                }
             }
             if m.max_y - m.min_y > 1000 {
                 bail!(
@@ -162,6 +177,10 @@ mod tests {
         assert!(error(&map("a", "min_y = 10\nmax_y = 10")).contains("must be below"));
         assert!(error(&map("a", "min_y = 0\nmax_y = 2000")).contains("over 1000"));
         assert!(error(&map("a/b", "")).contains("only letters"));
+        assert!(error(&map("a", "start = [40000000, 0]")).contains("outside"));
+        assert!(error(&map("a", "start = [nan, 0]")).contains("outside"));
+        assert!(error(&map("a", "start = [120, 64, -340]")).contains("no y"));
+        assert!(error(&map("a", "start = [5]")).contains("no y"));
 
         let good = format!("data_dir = \"/tmp/x\"\n{}{}", map("a", ""), map("b", ""));
         let cfg: Config = toml::from_str(&good).unwrap();

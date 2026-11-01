@@ -1197,6 +1197,7 @@ mod tests {
             mods: None,
             min_y: -64,
             max_y: 320,
+            start: None,
             remove_caves_below_y: 55,
         }
     }
