@@ -254,6 +254,8 @@ impl MapCtx {
             if !present.contains(&(rx, rz)) {
                 let (old, _) = self.load_state(rx, rz);
                 let dirty = (0..1024).filter(|&i| old[i] != 0).collect();
+                // If the same file comes back, as from a restore, it's new again.
+                self.seen.lock().unwrap().remove(&(rx, rz));
                 scans.push(RegionScan {
                     rx,
                     rz,
@@ -1478,6 +1480,39 @@ mod tests {
         std::fs::rename(&moved, &world).unwrap();
         ctx().render(&pool, false, |_| {}).unwrap();
         assert_eq!(older(&manifest_path), Some(RENDER_VERSION as u64));
+        assert_eq!(snapshot(&map), first);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_region_restored_unchanged_renders_again() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let base = temp_dir("restored");
+        let world = base.join("world");
+        copy_dir(&fixture("26.2").join("region"), &world.join("region"));
+        let lone = world.join("region/r.5.5.mca");
+        let away = base.join("away.mca");
+        std::fs::copy(world.join("region/r.0.0.mca"), &lone).unwrap();
+        let ctx = MapCtx::with_baker(
+            map_config(&world),
+            &base.join("a"),
+            Baker::new(AssetFiles::new()),
+        )
+        .unwrap();
+        ctx.render(&pool, false, |_| {}).unwrap();
+        let map = base.join("a/maps/test");
+        let first = snapshot(&map);
+
+        // A rename keeps the file's mtime and size, as `rsync -a` would.
+        std::fs::rename(&lone, &away).unwrap();
+        ctx.render(&pool, false, |_| {}).unwrap();
+        assert_ne!(snapshot(&map), first, "the region's tiles should be gone");
+        std::fs::rename(&away, &lone).unwrap();
+        assert!(ctx.render(&pool, false, |_| {}).unwrap().stats.chunks > 0);
         assert_eq!(snapshot(&map), first);
 
         let _ = std::fs::remove_dir_all(&base);
