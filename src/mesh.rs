@@ -72,6 +72,8 @@ const MAX_COLORS: usize = 1 << 13;
 
 pub struct Settings {
     pub min_y: i32,
+    /// Blocks at this y and above aren't there, which is how a map sees under a roof.
+    pub max_y: i32,
     pub remove_caves_below_y: i32,
     /// Meshing a LOD tile: no halo faces, and the halo is a stand-in, not real blocks.
     pub lod: bool,
@@ -160,6 +162,10 @@ impl Volume {
                 }
             }
         }
+        yhi = yhi.min(settings.max_y - 1);
+        if yhi < ylo {
+            return false;
+        }
         self.x0 = x0;
         self.z0 = z0;
         self.y0 = ylo - 1;
@@ -214,7 +220,9 @@ impl Volume {
                     }
                     for ly in 0..16 {
                         let wy = sy0 + ly;
-                        if wy < self.y0 || wy >= self.y0 + self.h as i32 {
+                        // The layer over the cut stays as it started, air in full
+                        // sky light, so cut faces draw like any other surface.
+                        if wy < self.y0 || wy >= self.y0 + self.h as i32 || wy >= settings.max_y {
                             continue;
                         }
                         let vy = (wy - self.y0) as usize;
@@ -248,6 +256,11 @@ impl Volume {
         }
         self.caves_below = settings.remove_caves_below_y;
         self.remove_dark = settings.remove_caves_below_y > settings.min_y;
+        // A floor saved above the cut was on something that's gone now. From the cut
+        // down, the next step finds what the ground is here.
+        for floor in &mut self.floor {
+            *floor = (*floor).min(settings.max_y);
+        }
         self.lower_floors_to_opaque(reg);
         self.build_lit();
         true
@@ -1391,6 +1404,105 @@ mod tests {
         })
     }
 
+    /// The top faces' heights in a tile of the made-up Nether, cut off at `max_y`.
+    fn nether_tops(max_y: i32) -> std::collections::BTreeSet<u16> {
+        let reg = registry();
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/nether/region/r.0.0.mca"
+        );
+        let region = crate::region::Region::open(std::path::Path::new(path), 0, 0).unwrap();
+        let (mut raw, mut buf, mut cache) = (Vec::new(), Vec::new(), Default::default());
+        let chunks: std::collections::BTreeMap<(i32, i32), crate::world::Chunk> = (0..16)
+            .map(|i| {
+                let (x, z) = (i % 4, i / 4);
+                assert!(region.read_chunk(x, z, &mut raw, &mut buf).unwrap());
+                let chunk = crate::world::decode_chunk(&buf, &reg, 0, &mut cache).unwrap();
+                ((x as i32, z as i32), chunk.unwrap())
+            })
+            .collect();
+        let s = Settings {
+            min_y: 0,
+            max_y,
+            remove_caves_below_y: 55,
+            lod: false,
+        };
+        let mut v = Volume::new();
+        assert!(v.fill(0, 0, &s, &reg, &|x, z| chunks.get(&(x, z))));
+        let tile = Mesher::new().mesh(&v, &reg, &s).unwrap();
+        decode(&tile)
+            .iter()
+            .filter(|q| q.dir == UP as usize)
+            // The tile's origin is one block under min_y.
+            .map(|q| q.y)
+            .collect()
+    }
+
+    #[test]
+    fn max_y_cuts_through_a_roof() {
+        // Heights count from one block under min_y, so the roof at y=127 is 128.
+        let uncut = nether_tops(320);
+        assert_eq!(uncut.iter().max(), Some(&128));
+
+        let cut = nether_tops(100);
+        assert_eq!(cut.iter().max(), Some(&100), "the top is y=99");
+        assert!(cut.contains(&100), "the cut itself draws");
+        // Cave floors and lava are still under it, to look down on.
+        assert!(
+            cut.iter().any(|&y| y < 100),
+            "no caves under the cut: {cut:?}"
+        );
+    }
+
+    #[test]
+    fn a_cut_finds_the_floor_under_a_removed_roof() {
+        let reg = registry();
+        let stone = reg.id("minecraft:stone", &mut []);
+        // Stone up to a roof at y=127, with a shaft from y=41 up to the roof. The
+        // saved heightmap says the ground is on the roof, and no sky light gets in.
+        let sections = (0..8)
+            .map(|sy| {
+                let mut blocks = Box::new([stone; 4096]);
+                for (i, b) in blocks.iter_mut().enumerate() {
+                    let (x, z, y) = (i & 15, (i >> 4) & 15, sy * 16 + (i >> 8) as i32);
+                    if (4..12).contains(&x) && (4..12).contains(&z) && (41..127).contains(&y) {
+                        *b = 0;
+                    }
+                }
+                crate::world::Section {
+                    y: sy,
+                    blocks: Some(blocks),
+                    single: 0,
+                    biomes: [0; 64],
+                    light: None,
+                    uniform_light: 0,
+                    has_water: false,
+                }
+            })
+            .collect();
+        let chunk = crate::world::Chunk {
+            sections,
+            has_light: true,
+            ocean_floor: Some(Box::new([128; 256])),
+        };
+        let s = Settings {
+            min_y: 0,
+            max_y: 100,
+            remove_caves_below_y: 55,
+            lod: false,
+        };
+        let mut v = Volume::new();
+        assert!(v.fill(0, 0, &s, &reg, &|x, z| (x == 0 && z == 0).then_some(&chunk)));
+        let tile = Mesher::new().mesh(&v, &reg, &s).unwrap();
+        // Heights count from one block under min_y, so the floor at y=40 is 41.
+        assert!(
+            decode(&tile)
+                .iter()
+                .any(|q| q.dir == UP as usize && q.y == 41),
+            "cave removal took the floor of the shaft"
+        );
+    }
+
     #[test]
     fn skirts_cover_ground_under_a_roof() {
         let reg = registry();
@@ -1412,6 +1524,7 @@ mod tests {
         assert!(v.fill_grid(&g, 0, 0, &reg, 2));
         let s = Settings {
             min_y: 0,
+            max_y: i32::MAX,
             remove_caves_below_y: i32::MIN,
             lod: true,
         };
@@ -1449,6 +1562,7 @@ mod tests {
         assert!(v.fill_grid(&g, 0, 0, &reg, 2));
         let s = Settings {
             min_y: 0,
+            max_y: i32::MAX,
             remove_caves_below_y: i32::MIN,
             lod: true,
         };

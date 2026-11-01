@@ -571,6 +571,8 @@ pub fn build_tile(
     }
     let settings = Settings {
         min_y: min_y / s,
+        // The grids were cut when they were made.
+        max_y: i32::MAX,
         remove_caves_below_y: i32::MIN,
         lod: true,
     };

@@ -157,6 +157,7 @@ impl MapCtx {
         std::fs::create_dir_all(&out).with_context(|| format!("creating {}", out.display()))?;
         let settings = Settings {
             min_y: cfg.min_y,
+            max_y: cfg.max_y,
             remove_caves_below_y: cfg.remove_caves_below_y,
             lod: false,
         };
@@ -263,7 +264,13 @@ impl MapCtx {
             // Output from older versions that this one no longer writes.
             let _ = std::fs::remove_dir_all(self.out.join("lowres"));
         }
-        if prev != Some(RENDER_VERSION) {
+        // Its LOD sources are about to go, so an empty new one can't count as "the
+        // same as before": every LOD tile this pass touches gets rebuilt.
+        let outdated = prev != Some(RENDER_VERSION);
+        if outdated {
+            // Saying so first: a pass stopped after this, with its height then put
+            // back, would otherwise look finished with its LOD sources gone.
+            self.write_manifest(prev)?;
             // Another version's LOD sources can't feed this one's tiles.
             for level in 1..=lod::LEVELS {
                 let _ = std::fs::remove_dir_all(self.out.join("lod").join(format!("src{level}")));
@@ -336,10 +343,10 @@ impl MapCtx {
             let results: Vec<RegionResult> = pool.install(|| {
                 batch
                     .par_iter()
-                    .map(|((rx, rz), set)| self.render_region(*rx, *rz, set, &present))
+                    .map(|((rx, rz), set)| self.render_region(*rx, *rz, set, &present, outdated))
                     .collect::<Result<Vec<_>>>()
             })?;
-            let lod = self.build_lods(pool, &results)?;
+            let lod = self.build_lods(pool, &results, outdated)?;
             let mut up = Update::default();
             up.add(&results, &lod);
             pass.add(&results, &lod);
@@ -457,6 +464,7 @@ impl MapCtx {
         &self,
         pool: &rayon::ThreadPool,
         results: &[RegionResult],
+        outdated: bool,
     ) -> Result<Vec<[i32; 3]>> {
         let mut dirty: BTreeSet<(i32, i32)> = results
             .iter()
@@ -473,7 +481,9 @@ impl MapCtx {
                     .par_iter()
                     .map_init(
                         || (Volume::new(), Mesher::new()),
-                        |(volume, mesher), &(x, z)| self.build_lod(level, x, z, volume, mesher),
+                        |(volume, mesher), &(x, z)| {
+                            self.build_lod(level, x, z, volume, mesher, outdated)
+                        },
                     )
                     .collect::<Result<Vec<_>>>()
             })?;
@@ -579,6 +589,7 @@ impl MapCtx {
         rz: i32,
         tiles: &BTreeSet<(i32, i32)>,
         present: &BTreeSet<(i32, i32)>,
+        outdated: bool,
     ) -> Result<RegionResult> {
         let mut res = RegionResult::default();
         let mut src = ChunkSource::new(self, present);
@@ -624,7 +635,7 @@ impl MapCtx {
                 .then(|| lod::hires_source(&volume, &self.reg, self.cfg.min_y, self.cfg.max_y))
                 .flatten();
             let source_path = lod::source_path(&self.out, 1, tx, tz);
-            if lod::write_source(&source_path, source.as_ref(), &self.reg)? {
+            if lod::write_source(&source_path, source.as_ref(), &self.reg)? || outdated {
                 res.sources.push((tx, tz));
             }
             match encoded {
@@ -659,6 +670,7 @@ impl MapCtx {
         z: i32,
         volume: &mut Volume,
         mesher: &mut Mesher,
+        outdated: bool,
     ) -> Result<LodBuild> {
         let (tile, parent) = lod::build_tile(
             &self.out,
@@ -686,11 +698,11 @@ impl MapCtx {
             None => false,
         };
         let source_changed = level < lod::LEVELS
-            && lod::write_source(
+            && (lod::write_source(
                 &lod::source_path(&self.out, level + 1, x, z),
                 parent.as_ref(),
                 &self.reg,
-            )?;
+            )? || outdated);
         Ok(LodBuild {
             x,
             z,
@@ -777,7 +789,10 @@ impl MapCtx {
         if let Some(v) = index.render_version {
             return Ok(v);
         }
+        // Tiles cut at another height aren't this map's either. Manifests from
+        // before hires tiles were cut don't say, and had nothing cut off.
         let listed = read_manifest(&self.out.join("map.json"))
+            .filter(|v| v["cutAt"].as_i64().unwrap_or(320) == self.cfg.max_y as i64)
             .and_then(|v| v["renderVersion"].as_u64())
             .map(|v| v as u32);
         let v = match listed {
@@ -859,6 +874,7 @@ impl MapCtx {
             "renderVersion": render_version,
             "minY": self.cfg.min_y,
             "maxY": self.cfg.max_y,
+            "cutAt": self.cfg.max_y,
             "tileSize": TILE,
             "textures": self.reg.baker.textures.count(),
             "hires": hires,
@@ -1572,6 +1588,74 @@ mod tests {
         std::fs::rename(&away, &lone).unwrap();
         assert!(ctx.render(&pool, false, |_| {}).unwrap().stats.chunks > 0);
         assert_eq!(snapshot(&map), first);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn changing_where_a_map_is_cut_renders_it_again() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let base = temp_dir("cut");
+        let world = base.join("world");
+        copy_dir(&fixture("nether").join("region"), &world.join("region"));
+        let render = |data: &str, max_y: i32| {
+            let mut cfg = map_config(&world);
+            cfg.min_y = 0;
+            cfg.max_y = max_y;
+            MapCtx::with_baker(cfg, &base.join(data), Baker::new(AssetFiles::new()))
+                .unwrap()
+                .render(&pool, false, |_| {})
+                .unwrap()
+        };
+        let map = base.join("a/maps/test");
+        render("a", 100);
+        assert_eq!(render("a", 100).stats.chunks, 0, "nothing changed");
+
+        // A new height renders everything, with no --full, and matches a fresh render.
+        assert!(render("a", 60).stats.chunks > 0);
+        assert_eq!(render("a", 60).stats.chunks, 0);
+        render("fresh", 60);
+        assert_eq!(snapshot(&map), snapshot(&base.join("fresh/maps/test")));
+
+        // A change stopped before its first batch, and then taken back, still renders.
+        let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut cfg = map_config(&world);
+            cfg.min_y = 0;
+            cfg.max_y = 80;
+            MapCtx::with_baker(cfg, &base.join("a"), Baker::new(AssetFiles::new()))
+                .unwrap()
+                .render_reporting(&pool, false, |_| panic!("stopping the pass"), |_| {})
+        }));
+        assert!(stopped.is_err());
+        render("a", 60);
+        assert_eq!(snapshot(&map), snapshot(&base.join("fresh/maps/test")));
+
+        // A manifest from before tiles were cut is a map with nothing cut off, so a
+        // map at the default height carries on, and a lower one renders once.
+        let path = map.join("map.json");
+        let strip = |version: u32| {
+            let mut manifest = read_manifest(&path).unwrap();
+            manifest.as_object_mut().unwrap().remove("cutAt");
+            manifest["renderVersion"] = version.into();
+            std::fs::write(&path, manifest.to_string()).unwrap();
+        };
+        render("a", 320);
+        strip(RENDER_VERSION);
+        assert_eq!(
+            render("a", 320).stats.chunks,
+            0,
+            "a default map re-rendered"
+        );
+        strip(RENDER_VERSION);
+        assert!(
+            render("a", 100).stats.chunks > 0,
+            "an old cut map kept its roof"
+        );
+        render("fresh100", 100);
+        assert_eq!(snapshot(&map), snapshot(&base.join("fresh100/maps/test")));
 
         let _ = std::fs::remove_dir_all(&base);
     }
