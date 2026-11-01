@@ -83,7 +83,8 @@ pub fn client_jar(version: &str, cache_dir: &Path) -> Result<PathBuf> {
     if path.exists() && sha_path.exists() {
         return Ok(path);
     }
-    std::fs::create_dir_all(cache_dir)?;
+    std::fs::create_dir_all(cache_dir)
+        .with_context(|| format!("creating {}", cache_dir.display()))?;
     tracing::info!("downloading Minecraft {version} client jar from Mojang");
     let manifest: serde_json::Value =
         get_json("https://piston-meta.mojang.com/mc/game/version_manifest_v2.json")?;
@@ -113,9 +114,9 @@ pub fn client_jar(version: &str, cache_dir: &Path) -> Result<PathBuf> {
         bail!("client jar checksum mismatch for {version}: expected {sha1}, got {got}");
     }
     let tmp = path.with_extension("jar.tmp");
-    std::fs::write(&tmp, &body)?;
-    std::fs::rename(&tmp, &path)?;
-    std::fs::write(&sha_path, &sha1)?;
+    std::fs::write(&tmp, &body).with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).with_context(|| format!("writing {}", path.display()))?;
+    std::fs::write(&sha_path, &sha1).with_context(|| format!("writing {}", sha_path.display()))?;
     Ok(path)
 }
 
