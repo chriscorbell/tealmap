@@ -366,6 +366,8 @@ export class MapEngine {
     // A camera nobody has moved stays free to frame the map as tiles arrive.
     if (this.ready) this.startView = this.autoView ? undefined : (this.flight?.to ?? this.view())
     this.lost = true
+    // Browsers paint a lost canvas white, whatever is behind it.
+    this.canvas.style.visibility = 'hidden'
     this.generation++
     this.ready = false
     cancelAnimationFrame(this.raf)
@@ -379,6 +381,7 @@ export class MapEngine {
   /** Everything on the GPU went with the context: tiles and textures load again, from the HTTP cache. */
   private contextRestored = () => {
     this.lost = false
+    this.canvas.style.visibility = ''
     this.problem = null
     this.renderer = new Renderer(this.gl)
     this.gl.clearColor(BG[0], BG[1], BG[2], 1)
@@ -1085,7 +1088,7 @@ export class MapEngine {
     for (const t of off) t.drawn = false
     this.visible = [...draw]
     // Whatever kept failing, the map no longer wants it.
-    if (this.problem === 'unreachable' && ![...this.tiles.values()].some((t) => t.state === 'failed')) {
+    if (this.problem === 'unreachable' && ![...this.tiles.values()].some((t) => t.retryAt > 0)) {
       this.failingSince = 0
       this.setProblem(null)
     }
@@ -1177,6 +1180,7 @@ export class MapEngine {
         return
       }
       if (res.kind !== 'tile') return
+      tile.retryAt = 0
       this.failingSince = 0
       if (this.problem === 'unreachable') this.setProblem(null)
       this.downloaded += res.bytes

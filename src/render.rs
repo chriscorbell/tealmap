@@ -178,6 +178,11 @@ impl MapCtx {
         !self.index_mut(&mut guard).hires.is_empty()
     }
 
+    /// Whether the last pass left out a region it couldn't read.
+    pub fn skipping_regions(&self) -> bool {
+        !self.skipped.lock().unwrap().is_empty()
+    }
+
     fn region_dir(&self) -> PathBuf {
         self.cfg.world.join("region")
     }

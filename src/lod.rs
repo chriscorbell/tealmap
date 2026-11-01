@@ -14,7 +14,7 @@
 
 use crate::mesh::{Settings, TILE, Volume};
 use crate::model::{AIR, BlockInfo, F_LAVA, F_WATER, HIDDEN_NAME, Registry};
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -387,7 +387,7 @@ pub fn write_source(path: &Path, g: Option<&Grid>, reg: &Registry) -> Result<boo
         return match std::fs::remove_file(path) {
             Ok(()) => Ok(true),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(e.into()),
+            Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
         };
     };
     let bytes = encode_source(g, reg);
@@ -457,7 +457,7 @@ pub fn load_source(path: &Path, reg: &Registry) -> Result<Option<Grid>> {
     let raw = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e.into()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
     let mut b = Vec::new();
     std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(&raw[..]), &mut b)?;
