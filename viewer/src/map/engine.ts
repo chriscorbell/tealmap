@@ -1,5 +1,6 @@
-import { Box3, Frustum, MathUtils, Matrix4, PerspectiveCamera } from 'three'
+import { Box3, Frustum, MathUtils, Matrix4, PerspectiveCamera, Vector3 } from 'three'
 import { MapControls } from 'three/examples/jsm/controls/MapControls.js'
+import { formatHash, type Pin, type View } from '../route'
 import { type Mesh, Pass, Renderer } from './renderer'
 import { NO_TOP } from './tile'
 import type { Request, Response } from './worker'
@@ -66,6 +67,10 @@ const KEEP_MS = 10_000
 /** Idle frames before the loop sleeps, and how often it wakes to plan. */
 const IDLE_FRAMES = 30
 const SLEEP_MS = 1000
+/** How long the camera takes to move to somewhere nearby. */
+const FLY_MS = 600
+/** Longest a ray goes looking for terrain, in steps. */
+const PICK_STEPS = 4000
 
 interface Tile {
   key: number
@@ -189,6 +194,11 @@ export class MapEngine {
   private onCamera: (c: CameraState) => void
   private hashTimer = 0
   private gpuTimer: GpuTimer | null = null
+  private pin: Pin | null = null
+  private flight: { from: View; to: View; start: number } | null = null
+  /** Where to start once the map being opened has loaded. */
+  private startView: View | undefined
+  private point = new Vector3()
 
   private canvas: HTMLCanvasElement
   private disposed = false
@@ -239,6 +249,7 @@ export class MapEngine {
     this.controls.zoomToCursor = true
     this.controls.addEventListener('start', () => {
       this.autoView = false
+      this.flight = null
     })
     this.controls.addEventListener('change', () => {
       this.dirty = true
@@ -259,6 +270,7 @@ export class MapEngine {
     this.generation++
     cancelAnimationFrame(this.raf)
     clearTimeout(this.sleepTimer)
+    clearTimeout(this.hashTimer)
     window.removeEventListener('resize', this.resize)
     for (const event of ['pointerdown', 'wheel', 'touchstart']) this.canvas.removeEventListener(event, this.wake)
     this.events?.close()
@@ -281,16 +293,18 @@ export class MapEngine {
   }
 
   /** Loads a map. `view` restores a camera position (e.g. from the URL). */
-  async setMap(map: MapInfo, view?: { x: number; z: number; dist: number; az: number; polar: number }) {
+  async setMap(map: MapInfo, view?: View) {
     if (this.disposed) return
     const gen = ++this.generation
     this.clearTiles()
     this.map = map
+    this.flight = null
     // Nothing plans against the old map's manifest or textures while loading.
     this.manifest = null
     this.ready = false
     this.pendingUpdate = false
     this.autoView = !view
+    this.startView = view
     // Subscribe first so an update published while loading isn't missed.
     this.listen()
     let manifest: Manifest
@@ -313,7 +327,8 @@ export class MapEngine {
     this.renderer.setBlockTextures(texData, manifest.textures)
     this.ready = true
 
-    if (view) this.placeCamera(view.x, view.z, view.dist, view.az, view.polar)
+    const start = this.startView
+    if (start) this.placeCamera(start.x, start.z, start.dist, start.az, start.polar)
     else this.placeDefault()
     if (this.pendingUpdate) this.refreshManifest(gen)
     this.dirty = true
@@ -438,11 +453,128 @@ export class MapEngine {
     return this.map?.id ?? null
   }
 
-  goTo(v: { x: number; z: number; dist: number; az: number; polar: number }) {
+  /** Whether the map being shown has opened, so the camera is on it. */
+  get loaded() {
+    return this.ready
+  }
+
+  /** Stops a fling, so it doesn't carry the camera on from wherever it's sent next. */
+  private stopInertia() {
+    this.controls.enableDamping = false
+    this.controls.update()
+    this.controls.enableDamping = true
+  }
+
+  goTo(v: View) {
+    this.autoView = false
+    this.flight = null
+    if (!this.ready) {
+      // Still opening a map: this replaces where it was going to start.
+      this.startView = v
+      return
+    }
+    this.stopInertia()
     this.placeCamera(v.x, v.z, v.dist, v.az, v.polar)
     this.lastPlan = 0
     this.dirty = true
     this.wake()
+  }
+
+  /** Moves to a view, easing there when it's near enough to see where it's going. */
+  flyTo(to: View) {
+    const f = this.flight
+    if (f && f.to.x === to.x && f.to.z === to.z && f.to.dist === to.dist && f.to.az === to.az && f.to.polar === to.polar) return
+    const from = this.view()
+    const far = Math.hypot(to.x - from.x, to.z - from.z) > 3 * Math.max(from.dist, to.dist)
+    if (far || !this.ready || matchMedia('(prefers-reduced-motion: reduce)').matches) return this.goTo(to)
+    this.autoView = false
+    this.stopInertia()
+    this.flight = { from, to, start: 0 }
+    this.wake()
+  }
+
+  /** Drops a pending URL write, which would overwrite a location just navigated to. */
+  cancelHashWrite() {
+    clearTimeout(this.hashTimer)
+    this.hashTimer = 0
+  }
+
+  /** Moves to a view as a step the browser's Back button undoes. */
+  jumpTo(to: View) {
+    if (!this.map) return
+    this.cancelHashWrite()
+    history.replaceState(null, '', this.hash())
+    history.pushState(null, '', formatHash(this.map.id, to, this.pin))
+    this.flyTo(to)
+  }
+
+  /** Marks a block in the URL. Drawing the marker is up to the page. */
+  setPin(pin: Pin | null) {
+    this.pin = pin
+    this.scheduleHash()
+  }
+
+  /**
+   * The URL hash for where the map is, without waiting for the address bar. That's
+   * where it's headed in flight. While a map opens, the camera is still the last
+   * map's, so all there is to say is where this one will start, if that's known.
+   */
+  hash() {
+    if (!this.map) return ''
+    if (!this.ready && !this.startView) return `#${this.map.id}`
+    return formatHash(this.map.id, this.flight?.to ?? this.view(), this.pin)
+  }
+
+  /** The block under a point on the canvas, from the terrain loaded there. */
+  pick(clientX: number, clientY: number): Pin | null {
+    const m = this.manifest
+    if (!m) return null
+    const rect = this.canvas.getBoundingClientRect()
+    const o = this.camera.position
+    const dir = this.point
+      .set(((clientX - rect.left) / rect.width) * 2 - 1, 1 - ((clientY - rect.top) / rect.height) * 2, 0.5)
+      .unproject(this.camera)
+      .sub(o)
+      .normalize()
+    const below = (t: number) => {
+      const h = this.drawnHeightAt(o.x + dir.x * t, o.z + dir.z * t)
+      return h !== null && o.y + dir.y * t <= h
+    }
+    // Nothing is above the top of the world, so start there.
+    let t = o.y > m.maxY ? (dir.y < 0 ? (m.maxY - o.y) / dir.y : Infinity) : 0
+    if (t === Infinity) return null
+    // A ray only hits by coming down onto a surface. A column's top says nothing
+    // about a camera under it, like one beneath a tree or an overhang.
+    let above = o.y > m.maxY || !below(t)
+    let before = t
+    for (let i = 0; ; i++) {
+      if (i === PICK_STEPS || o.y + dir.y * t < m.minY) return null
+      before = t
+      // Steps stay under a block nearby and grow with distance, where a block is under a pixel.
+      t += Math.max(0.5, t * 0.002)
+      if (!below(t)) above = true
+      else if (above) break
+    }
+    let after = t
+    for (let i = 0; i < 12; i++) {
+      const mid = (before + after) / 2
+      if (below(mid)) after = mid
+      else before = mid
+    }
+    const x = o.x + dir.x * after
+    const z = o.z + dir.z * after
+    const h = this.drawnHeightAt(x, z)
+    if (h === null) return null
+    // A ray that comes in through the side of a cliff or a tree is on that side,
+    // somewhere under the column's top.
+    return { x: Math.floor(x), y: Math.min(h - 1, Math.floor(o.y + dir.y * after)), z: Math.floor(z) }
+  }
+
+  /** Where a point in the world is on the canvas, or null if it's behind the camera. */
+  project(x: number, y: number, z: number): { x: number; y: number } | null {
+    const p = this.point.set(x, y, z).project(this.camera)
+    if (p.z > 1) return null
+    return { x: ((p.x + 1) / 2) * this.canvas.clientWidth, y: ((1 - p.y) / 2) * this.canvas.clientHeight }
   }
 
   /** Debug summary of tile states per level. */
@@ -456,10 +588,10 @@ export class MapEngine {
     return { ...out, target: this.controls.target.toArray().map(Math.round) }
   }
 
-  private placeCamera(x: number, z: number, dist: number, azDeg: number, polarDeg: number) {
+  private placeCamera(x: number, z: number, dist: number, azDeg: number, polarDeg: number, atY?: number) {
     const az = (azDeg * Math.PI) / 180
     const polar = (polarDeg * Math.PI) / 180
-    const y = this.heightAt(x, z) ?? 64
+    const y = atY ?? this.heightAt(x, z) ?? 64
     this.controls.target.set(x, y, z)
     this.camera.position.set(
       x + dist * Math.sin(polar) * Math.sin(az),
@@ -470,7 +602,8 @@ export class MapEngine {
   }
 
   /** Camera view as URL-friendly numbers. */
-  view() {
+  view(): View {
+    if (!this.ready && this.startView) return this.startView
     const t = this.controls.target
     const off = this.camera.position.clone().sub(t)
     const dist = off.length()
@@ -485,12 +618,14 @@ export class MapEngine {
     }
   }
 
+  /** Writes the camera to the URL at most every 400 ms, so a long move can't hold it back. */
   private scheduleHash() {
-    clearTimeout(this.hashTimer)
+    if (this.hashTimer) return
     this.hashTimer = window.setTimeout(() => {
-      if (!this.map) return
-      const v = this.view()
-      history.replaceState(null, '', `#${this.map.id}/${v.x}/${v.z}/${v.dist}/${v.az}/${v.polar}`)
+      this.hashTimer = 0
+      // In flight, the URL already says where it's going. The last move of the
+      // flight schedules another write, for wherever it ends up.
+      if (this.ready && !this.flight) history.replaceState(null, '', this.hash())
     }, 400)
   }
 
@@ -800,6 +935,20 @@ export class MapEngine {
     this.dirty = true
   }
 
+  /** The height of what's on screen at a point. Other loaded tiles may disagree: a coarse one spreads a column's height over many blocks. */
+  private drawnHeightAt(x: number, z: number): number | null {
+    for (let level = 0; level <= (this.manifest?.lodLevels ?? 0); level++) {
+      const size = TILE << level
+      const tx = Math.floor(x / size)
+      const tz = Math.floor(z / size)
+      const t = this.tiles.get(key(level, tx, tz))
+      if (!t?.drawn || !t.tops) continue
+      const h = t.tops[Math.floor(((z - tz * size) / size) * 64) * 64 + Math.floor(((x - tx * size) / size) * 64)]
+      return h === NO_TOP ? null : h * (1 << level)
+    }
+    return null
+  }
+
   /** Terrain height under a point, from the finest loaded tile there. */
   heightAt(x: number, z: number): number | null {
     for (let level = 0; level <= (this.manifest?.lodLevels ?? 0); level++) {
@@ -833,8 +982,22 @@ export class MapEngine {
     this.raf = requestAnimationFrame(this.frame)
   }
 
+  private stepFlight(now: number) {
+    const f = this.flight!
+    f.start ||= now
+    const p = Math.min(1, (now - f.start) / FLY_MS)
+    const e = 1 - (1 - p) ** 3
+    const mix = (a: number, b: number) => a + (b - a) * e
+    // Around the short way.
+    const az = f.from.az + ((((f.to.az - f.from.az) % 360) + 540) % 360 - 180) * e
+    this.placeCamera(mix(f.from.x, f.to.x), mix(f.from.z, f.to.z), mix(f.from.dist, f.to.dist), az, mix(f.from.polar, f.to.polar), this.controls.target.y)
+    this.dirty = true
+    if (p === 1) this.flight = null
+  }
+
   private frame = (now: number) => {
     this.raf = requestAnimationFrame(this.frame)
+    if (this.flight) this.stepFlight(now)
     const moved = this.controls.update()
 
     // Nothing is closer than the top of the world, so the near plane can follow
