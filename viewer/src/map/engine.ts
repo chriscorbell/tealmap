@@ -10,6 +10,8 @@ export interface MapInfo {
   id: string
   name: string
   status?: MapStatus
+  /** Where the map starts and Home goes, as [x, z], if it's set. */
+  start?: [number, number]
 }
 
 /** How the map being shown is doing, as far as the viewer can tell. */
@@ -53,6 +55,8 @@ export interface CameraState {
   x: number
   y: number
   z: number
+  /** Which way the camera is turned, in degrees. North is up at 0. */
+  az: number
 }
 
 const BG = [0x0b / 255, 0x14 / 255, 0x16 / 255]
@@ -83,6 +87,21 @@ const RETRY_LAST_MS = 30_000
 const WAIT_MS = 3000
 /** How long tiles have to keep failing before that's worth saying. */
 const TILES_FAILING_MS = 10_000
+/** How far past the mapped area the camera can look, in blocks. */
+const PAN_MARGIN = 128
+const START_DIST = 900
+const START_AZ = 35
+const START_POLAR = 50
+/** What each held key does, per second: moves a share of the view, or turns in degrees. */
+const KEY_PAN = 0.9
+const KEY_TURN = 70
+const KEY_TILT = 45
+const KEY_ZOOM = 1.6
+const MAX_KEY_STEP_MS = 100
+/** How far two fingers have to twist before it counts as rotating, in radians. */
+const TWIST_START = 0.14
+/** Top-down, just off vertical so north stays up. */
+const TOP_DOWN_POLAR = 1
 /** How long the camera takes to move to somewhere nearby. */
 const FLY_MS = 600
 /** Longest a ray goes looking for terrain, in steps. */
@@ -120,6 +139,12 @@ const overlap = (a: Tile, b: Tile) => {
   return fine.x >> up === coarse.x && fine.z >> up === coarse.z
 }
 const CHILD_OFFSETS = [[0, 0], [1, 0], [0, 1], [1, 1]]
+const KEYS = new Set([
+  'KeyW', 'KeyA', 'KeyS', 'KeyD',
+  'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight',
+  'KeyQ', 'KeyE', 'KeyR', 'KeyF',
+  'Equal', 'NumpadAdd', 'Minus', 'NumpadSubtract',
+])
 const EMPTY_KIDS: [number, number, number][] = []
 
 class Workers {
@@ -227,6 +252,11 @@ export class MapEngine {
   /** Where to start once the map being opened has loaded. */
   private startView: View | undefined
   private point = new Vector3()
+  /** What's mapped, in blocks, with some room around it. */
+  private bounds: { minX: number; maxX: number; minZ: number; maxZ: number } | null = null
+  private keys = new Set<string>()
+  private lastFrame = 0
+  private twist: { angle: number; turned: number; engaged: boolean } | null = null
 
   private canvas: HTMLCanvasElement
   private disposed = false
@@ -303,6 +333,10 @@ export class MapEngine {
     for (const event of ['pointerdown', 'wheel', 'touchstart']) canvas.addEventListener(event, this.wake, { passive: true })
     canvas.addEventListener('webglcontextlost', this.contextLost)
     canvas.addEventListener('webglcontextrestored', this.contextRestored)
+    canvas.addEventListener('touchstart', this.twistMove, { passive: true })
+    canvas.addEventListener('touchmove', this.twistMove, { passive: true })
+    canvas.addEventListener('touchend', this.twistMove, { passive: true })
+    canvas.addEventListener('touchcancel', this.twistMove, { passive: true })
     this.raf = requestAnimationFrame(this.frame)
   }
 
@@ -318,6 +352,7 @@ export class MapEngine {
     for (const event of ['pointerdown', 'wheel', 'touchstart']) this.canvas.removeEventListener(event, this.wake)
     this.canvas.removeEventListener('webglcontextlost', this.contextLost)
     this.canvas.removeEventListener('webglcontextrestored', this.contextRestored)
+    for (const event of ['touchstart', 'touchmove', 'touchend', 'touchcancel']) this.canvas.removeEventListener(event, this.twistMove as EventListener)
     this.events?.close()
     this.clearTiles()
     this.workers.dispose()
@@ -447,6 +482,16 @@ export class MapEngine {
     // A level 1–3 node is a 2^(3-level) grid cell of a region's mask, so masks
     // answer those without a set. Only nodes bigger than a region need one.
     this.masks = new Map((m.hires ?? []).map(([rx, rz, lo, hi]) => [key(0, rx, rz), [lo, hi]]))
+    const regions = m.hires ?? []
+    const region = TILE * 8
+    this.bounds = regions.length
+      ? {
+          minX: Math.min(...regions.map((r) => r[0])) * region - PAN_MARGIN,
+          maxX: (Math.max(...regions.map((r) => r[0])) + 1) * region + PAN_MARGIN,
+          minZ: Math.min(...regions.map((r) => r[1])) * region - PAN_MARGIN,
+          maxZ: (Math.max(...regions.map((r) => r[1])) + 1) * region + PAN_MARGIN,
+        }
+      : null
     this.bigNodes = new Set()
     this.roots = []
     let row: [number, number][] = (m.hires ?? []).map(([rx, rz]) => [rx, rz])
@@ -510,12 +555,14 @@ export class MapEngine {
     for (const [x, z] of this.roots) walk(m.lodLevels, x, z)
   }
 
-  /** Starts over the mapped tile closest to the middle of everything mapped. */
-  private placeDefault() {
+  /** Where the map starts: its configured spot, or the mapped tile closest to the middle of everything mapped. */
+  homeView(): View {
+    const view = (x: number, z: number) => ({ x, z, dist: START_DIST, az: START_AZ, polar: START_POLAR })
+    if (this.map?.start) return view(this.map.start[0], this.map.start[1])
     const m = this.manifest
     // Hires tiles always exist where anything is mapped; LOD meshes may not.
     const hires = m?.hires ?? []
-    if (!hires.length) return this.placeCamera(0, 0, 520, 35, 50)
+    if (!hires.length) return { ...view(0, 0), dist: 520 }
     let cx = 0
     let cz = 0
     let n = 0
@@ -542,7 +589,115 @@ export class MapEngine {
         best = [x, z]
       }
     })
-    this.placeCamera((best[0] + 0.5) * TILE, (best[1] + 0.5) * TILE, 900, 35, 50)
+    return view((best[0] + 0.5) * TILE, (best[1] + 0.5) * TILE)
+  }
+
+  private placeDefault() {
+    const v = this.homeView()
+    this.placeCamera(v.x, v.z, v.dist, v.az, v.polar)
+  }
+
+  /** Keeps the view on the map, however it got pointed elsewhere. */
+  private clampTarget() {
+    const b = this.bounds
+    if (!b) return
+    const t = this.controls.target
+    const dx = Math.min(Math.max(t.x, b.minX), b.maxX) - t.x
+    const dz = Math.min(Math.max(t.z, b.minZ), b.maxZ) - t.z
+    if (dx === 0 && dz === 0) return
+    t.x += dx
+    t.z += dz
+    this.camera.position.x += dx
+    this.camera.position.z += dz
+    this.dirty = true
+    this.lastPlan = 0
+    this.scheduleHash()
+  }
+
+  /** Starts doing what a key does, if it does anything. Returns whether it does. */
+  keyDown(code: string) {
+    if (!KEYS.has(code)) return false
+    if (!this.ready) return true
+    if (!this.keys.size) this.stopInertia()
+    this.keys.add(code)
+    this.autoView = false
+    this.flight = null
+    this.lastFrame = 0
+    this.wake()
+    return true
+  }
+
+  /** A key repeating: nothing to start, but the browser mustn't act on it either. */
+  keyHeld(code: string) {
+    return KEYS.has(code)
+  }
+
+  keyUp(code: string) {
+    this.keys.delete(code)
+  }
+
+  releaseKeys() {
+    this.keys.clear()
+  }
+
+  private stepKeys(now: number) {
+    const dt = Math.min(now - (this.lastFrame || now - 16), MAX_KEY_STEP_MS) / 1000
+    const held = (...codes: string[]) => codes.some((c) => this.keys.has(c))
+    const axis = (plus: string[], minus: string[]) => (held(...plus) ? 1 : 0) - (held(...minus) ? 1 : 0)
+    const t = this.controls.target
+    const off = this.camera.position.clone().sub(t)
+    let dist = off.length()
+    let az = Math.atan2(off.x, off.z)
+    let polar = Math.acos(MathUtils.clamp(off.y / dist, -1, 1))
+    const forward = axis(['KeyW', 'ArrowUp'], ['KeyS', 'ArrowDown']) * dist * KEY_PAN * dt
+    const right = axis(['KeyD', 'ArrowRight'], ['KeyA', 'ArrowLeft']) * dist * KEY_PAN * dt
+    const x = t.x - Math.sin(az) * forward + Math.cos(az) * right
+    const z = t.z - Math.cos(az) * forward - Math.sin(az) * right
+    az += MathUtils.degToRad(axis(['KeyE'], ['KeyQ']) * KEY_TURN * dt)
+    polar += MathUtils.degToRad(axis(['KeyF'], ['KeyR']) * KEY_TILT * dt)
+    polar = MathUtils.clamp(polar, MathUtils.degToRad(TOP_DOWN_POLAR), this.controls.maxPolarAngle)
+    dist *= Math.exp(axis(['Minus', 'NumpadSubtract'], ['Equal', 'NumpadAdd']) * KEY_ZOOM * dt)
+    dist = MathUtils.clamp(dist, this.controls.minDistance, this.controls.maxDistance)
+    this.placeCamera(x, z, dist, MathUtils.radToDeg(az), MathUtils.radToDeg(polar), t.y)
+    this.dirty = true
+  }
+
+  /** Twisting two fingers turns the map with them. Pinching and dragging stay with the controls. */
+  private twistMove = (e: TouchEvent) => {
+    if (e.touches.length !== 2) {
+      this.twist = null
+      return
+    }
+    const [a, b] = [e.touches[0], e.touches[1]]
+    const angle = Math.atan2(b.clientY - a.clientY, b.clientX - a.clientX)
+    if (!this.twist) {
+      this.twist = { angle, turned: 0, engaged: false }
+      return
+    }
+    // The short way round.
+    const delta = Math.atan2(Math.sin(angle - this.twist.angle), Math.cos(angle - this.twist.angle))
+    this.twist.angle = angle
+    this.twist.turned += delta
+    this.twist.engaged ||= Math.abs(this.twist.turned) > TWIST_START
+    if (!this.twist.engaged || !this.ready) return
+    const t = this.controls.target
+    const off = this.camera.position.clone().sub(t)
+    const dist = off.length()
+    const polar = Math.acos(MathUtils.clamp(off.y / dist, -1, 1))
+    const az = Math.atan2(off.x, off.z) + delta
+    this.autoView = false
+    this.placeCamera(t.x, t.z, dist, MathUtils.radToDeg(az), MathUtils.radToDeg(polar), t.y)
+    this.dirty = true
+    this.wake()
+  }
+
+  /** Eases to north up. Already there, it goes top-down, and from top-down back to a slant. */
+  pointNorth() {
+    if (!this.ready) return
+    const v = this.view()
+    const north = Math.abs(v.az) < 1
+    const top = v.polar <= TOP_DOWN_POLAR + 1
+    this.flyTo({ ...v, az: 0, polar: !north ? v.polar : top ? START_POLAR : TOP_DOWN_POLAR })
   }
 
   private async refreshManifest(gen: number) {
@@ -1142,8 +1297,11 @@ export class MapEngine {
 
   private frame = (now: number) => {
     this.raf = requestAnimationFrame(this.frame)
+    if (this.keys.size) this.stepKeys(now)
+    this.lastFrame = now
     if (this.flight) this.stepFlight(now)
     const moved = this.controls.update()
+    this.clampTarget()
 
     // Nothing is closer than the top of the world, so the near plane can follow
     // the camera up. Depth precision depends on it: at a whole-map view, a near
@@ -1194,7 +1352,8 @@ export class MapEngine {
       this.frameMsAcc += performance.now() - t0
       this.frames++
       this.dirty = false
-      this.onCamera({ x: t.x, y: t.y, z: t.z })
+      const off = this.camera.position
+      this.onCamera({ x: t.x, y: t.y, z: t.z, az: MathUtils.radToDeg(Math.atan2(off.x - t.x, off.z - t.z)) })
     }
 
     if (now - this.lastStats > 1000) this.reportStats(now)

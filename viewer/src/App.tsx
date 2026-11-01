@@ -1,6 +1,7 @@
-import { Activity, ChevronDown, Layers } from 'lucide-react'
+import { Activity, ChevronDown, CircleHelp, House, Layers, Navigation2 } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Coords } from './Coords'
+import { Help } from './Help'
 import { type CameraState, type LoadState, type MapInfo, MapEngine, type Stats, WebGL2Missing } from './map/engine'
 import { PinCard } from './PinCard'
 import { parseHash, type Pin } from './route'
@@ -24,6 +25,9 @@ export default function App() {
   const xRef = useRef<HTMLInputElement>(null)
   const yRef = useRef<HTMLElement>(null)
   const zRef = useRef<HTMLInputElement>(null)
+  const compassRef = useRef<HTMLSpanElement>(null)
+  const pickerRef = useRef<HTMLDivElement>(null)
+  const pickerButtonRef = useRef<HTMLButtonElement>(null)
   const markerRef = useRef<HTMLDivElement>(null)
   const pinRef = useRef<Pin | null>(null)
   const pressRef = useRef<{ id: number; x: number; y: number; at: number; kind: string } | null>(null)
@@ -33,7 +37,7 @@ export default function App() {
   const [stats, setStats] = useState<Stats | null>(null)
   const [pin, setPinState] = useState<Pin | null>(null)
   const [bench] = useState(() => new URLSearchParams(location.search).has('bench'))
-  const [statsOpen, setStatsOpen] = useState(bench)
+  const [panel, setPanel] = useState<'stats' | 'help' | null>(bench ? 'stats' : null)
   const [menu, setMenu] = useState(false)
   /** Why the viewer can't run at all, or why the open map failed. */
   const [error, setError] = useState<string | null>(null)
@@ -41,6 +45,14 @@ export default function App() {
   const [noServer, setNoServer] = useState(false)
   const [load, setLoad] = useState<LoadState>({ problem: null, opened: false, hasTiles: false })
   const [statuses, setStatuses] = useState<Record<string, MapStatus>>({})
+
+  // For the listeners set up once, which would otherwise only see the first value.
+  const menuRef = useRef(menu)
+  const panelRef = useRef(panel)
+  useEffect(() => {
+    menuRef.current = menu
+    panelRef.current = panel
+  }, [menu, panel])
 
   const placeMarker = useCallback(() => {
     const el = markerRef.current
@@ -63,7 +75,7 @@ export default function App() {
     el.style.setProperty('--nudge', `${nudge}px`)
   }, [])
 
-  const writeCoords = useCallback((c: CameraState) => {
+  const writeCoords = useCallback((c: Pick<CameraState, 'x' | 'y' | 'z'>) => {
     if (yRef.current) yRef.current.textContent = String(Math.round(c.y))
     // Don't type over someone typing, in either field.
     const typing = document.activeElement === xRef.current || document.activeElement === zRef.current
@@ -87,6 +99,7 @@ export default function App() {
         onCamera: (c: CameraState) => {
           writeCoords(c)
           placeMarker()
+          if (compassRef.current) compassRef.current.style.transform = `rotate(${c.az}deg)`
         },
         onLoadState: setLoad,
         onMapStatus: (id, status) => setStatuses((all) => ({ ...all, [id]: status })),
@@ -153,14 +166,42 @@ export default function App() {
     // write can replace the URL before it's read. hashchange covers the rest.
     window.addEventListener('popstate', follow)
     window.addEventListener('hashchange', follow)
-    const escape = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && pinRef.current) setPin(null)
+    // Typing and browser shortcuts keep their keys. Everything else on the page
+    // can share them with the map, which is most of what the page is.
+    const keyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        const menuOpen = menuRef.current
+        if (menuOpen) {
+          setMenu(false)
+          pickerButtonRef.current?.focus()
+        } else if (panelRef.current) setPanel(null)
+        else if (pinRef.current) setPin(null)
+        return
+      }
+      const typing = e.target instanceof HTMLElement && e.target.closest('input, textarea, select, [contenteditable]')
+      if (typing || e.ctrlKey || e.metaKey || e.altKey) return
+      if (e.key === '?') {
+        setPanel((p) => (p === 'help' ? null : 'help'))
+        return
+      }
+      if (e.repeat ? engine.keyHeld(e.code) : engine.keyDown(e.code)) e.preventDefault()
     }
-    window.addEventListener('keydown', escape)
+    const keyUp = (e: KeyboardEvent) => engine.keyUp(e.code)
+    const leave = () => engine.releaseKeys()
+    const clickAway = (e: PointerEvent) => {
+      if (menuRef.current && !pickerRef.current?.contains(e.target as Node)) setMenu(false)
+    }
+    window.addEventListener('keydown', keyDown)
+    window.addEventListener('keyup', keyUp)
+    window.addEventListener('blur', leave)
+    window.addEventListener('pointerdown', clickAway)
     return () => {
       window.removeEventListener('popstate', follow)
       window.removeEventListener('hashchange', follow)
-      window.removeEventListener('keydown', escape)
+      window.removeEventListener('keydown', keyDown)
+      window.removeEventListener('keyup', keyUp)
+      window.removeEventListener('blur', leave)
+      window.removeEventListener('pointerdown', clickAway)
       closed = true
       clearTimeout(retryTimer)
       engine.dispose()
@@ -247,6 +288,9 @@ export default function App() {
       <canvas
         ref={canvasRef}
         className="map"
+        tabIndex={0}
+        role="application"
+        aria-label="Map. Arrow keys or W A S D pan, Q and E rotate, R and F tilt, plus and minus zoom."
         onContextMenu={(e) => e.preventDefault()}
         onPointerDown={press}
         onPointerMove={move}
@@ -272,15 +316,26 @@ export default function App() {
           <span>tealmap</span>
         </div>
         {maps.length > 0 && (
-          <div className="picker">
-            <button className="picker-button" onClick={() => setMenu((v) => !v)} aria-expanded={menu}>
+          <div className="picker" ref={pickerRef}>
+            <button
+              ref={pickerButtonRef}
+              className="picker-button"
+              onClick={() => setMenu((v) => !v)}
+              aria-expanded={menu}
+              aria-controls="maps"
+              aria-label={`Map: ${current?.name ?? 'loading'}`}
+            >
               {current?.name ?? '…'}
               <ChevronDown size={14} className={menu ? 'flip' : ''} />
             </button>
-            <ul className={`menu ${menu ? 'open' : ''}`} role="menu">
+            <ul id="maps" className={`menu ${menu ? 'open' : ''}`}>
               {maps.map((m) => (
                 <li key={m.id}>
-                  <button className={m.id === current?.id ? 'active' : ''} onClick={() => switchMap(m)}>
+                  <button
+                    className={m.id === current?.id ? 'active' : ''}
+                    aria-current={m.id === current?.id ? 'true' : undefined}
+                    onClick={() => switchMap(m)}
+                  >
                     {m.name}
                   </button>
                 </li>
@@ -291,12 +346,50 @@ export default function App() {
       </header>
 
       <div className="bar top-right">
-        <button className={`icon ${statsOpen ? 'active' : ''}`} onClick={() => setStatsOpen((v) => !v)} aria-label="Stats">
+        <button
+          className={`icon ${panel === 'help' ? 'active' : ''}`}
+          onClick={() => setPanel((p) => (p === 'help' ? null : 'help'))}
+          aria-label="Controls"
+          aria-expanded={panel === 'help'}
+          title="Controls"
+        >
+          <CircleHelp size={16} />
+        </button>
+        <button
+          className={`icon ${panel === 'stats' ? 'active' : ''}`}
+          onClick={() => setPanel((p) => (p === 'stats' ? null : 'stats'))}
+          aria-label="Stats"
+          aria-expanded={panel === 'stats'}
+          title="Stats"
+        >
           <Activity size={16} />
         </button>
       </div>
 
-      <section className={`panel ${statsOpen ? 'open' : ''}`} aria-hidden={!statsOpen}>
+      <div className="bar bottom-right">
+        <button className="icon" onClick={() => engineRef.current?.pointNorth()} aria-label="Point north" title="Point north">
+          <span ref={compassRef} className="compass">
+            <Navigation2 size={16} />
+          </span>
+        </button>
+        <button
+          className="icon"
+          onClick={() => {
+            const engine = engineRef.current
+            if (engine?.loaded) engine.jumpTo(engine.homeView())
+          }}
+          aria-label="Go to the map's start"
+          title="Go to the map's start"
+        >
+          <House size={16} />
+        </button>
+      </div>
+
+      <section className={`panel ${panel === 'help' ? 'open' : ''}`} aria-hidden={panel !== 'help'}>
+        <Help />
+      </section>
+
+      <section className={`panel ${panel === 'stats' ? 'open' : ''}`} aria-hidden={panel !== 'stats'}>
         {stats && (
           <dl className="stats">
             <dt>fps</dt>

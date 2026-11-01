@@ -114,7 +114,13 @@ pub fn run(cfg: Config, pool: rayon::ThreadPool) -> Result<()> {
     let maps: Vec<serde_json::Value> = cfg
         .maps
         .iter()
-        .map(|m| serde_json::json!({ "id": m.id, "name": m.display_name() }))
+        .map(|m| {
+            let mut info = serde_json::json!({ "id": m.id, "name": m.display_name() });
+            if let Some(start) = m.start {
+                info["start"] = serde_json::json!(start);
+            }
+            info
+        })
         .collect();
     let statuses = Statuses {
         maps: Arc::new(Mutex::new(

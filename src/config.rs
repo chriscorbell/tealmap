@@ -36,6 +36,9 @@ pub struct MapConfig {
     pub min_y: i32,
     #[serde(default = "default_max_y")]
     pub max_y: i32,
+    /// Where the map starts and its Home button goes, as [x, z]. Defaults to the
+    /// middle of what's rendered.
+    pub start: Option<[f64; 2]>,
     /// Skip unlit blocks below this y and the ocean floor (BlueMap's default is 55).
     #[serde(default = "default_caves")]
     pub remove_caves_below_y: i32,
