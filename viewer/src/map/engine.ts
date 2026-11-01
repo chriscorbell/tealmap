@@ -196,6 +196,8 @@ export class MapEngine {
   private gpuTimer: GpuTimer | null = null
   private pin: Pin | null = null
   private flight: { from: View; to: View; start: number } | null = null
+  /** Where to start once the map being opened has loaded. */
+  private startView: View | undefined
   private point = new Vector3()
 
   private canvas: HTMLCanvasElement
@@ -302,6 +304,7 @@ export class MapEngine {
     this.ready = false
     this.pendingUpdate = false
     this.autoView = !view
+    this.startView = view
     // Subscribe first so an update published while loading isn't missed.
     this.listen()
     let manifest: Manifest
@@ -324,7 +327,8 @@ export class MapEngine {
     this.renderer.setBlockTextures(texData, manifest.textures)
     this.ready = true
 
-    if (view) this.placeCamera(view.x, view.z, view.dist, view.az, view.polar)
+    const start = this.startView
+    if (start) this.placeCamera(start.x, start.z, start.dist, start.az, start.polar)
     else this.placeDefault()
     if (this.pendingUpdate) this.refreshManifest(gen)
     this.dirty = true
@@ -452,6 +456,11 @@ export class MapEngine {
   goTo(v: View) {
     this.autoView = false
     this.flight = null
+    if (!this.ready) {
+      // Still opening a map: this replaces where it was going to start.
+      this.startView = v
+      return
+    }
     this.placeCamera(v.x, v.z, v.dist, v.az, v.polar)
     this.lastPlan = 0
     this.dirty = true
@@ -507,31 +516,34 @@ export class MapEngine {
       .unproject(this.camera)
       .sub(o)
       .normalize()
-    const hit = (t: number) => {
-      const y = o.y + dir.y * t
-      const h = this.heightAt(o.x + dir.x * t, o.z + dir.z * t)
-      return h !== null && y <= h
+    const below = (t: number) => {
+      const h = this.drawnHeightAt(o.x + dir.x * t, o.z + dir.z * t)
+      return h !== null && o.y + dir.y * t <= h
     }
     // Nothing is above the top of the world, so start there.
     let t = o.y > m.maxY ? (dir.y < 0 ? (m.maxY - o.y) / dir.y : Infinity) : 0
     if (t === Infinity) return null
+    // A ray only hits by coming down onto a surface. A column's top says nothing
+    // about a camera under it, like one beneath a tree or an overhang.
+    let above = !below(t)
     let before = t
-    for (let i = 0; i < PICK_STEPS && !hit(t); i++) {
-      if (o.y + dir.y * t < m.minY) return null
+    for (let i = 0; ; i++) {
+      if (i === PICK_STEPS || o.y + dir.y * t < m.minY) return null
       before = t
       // Steps stay under a block nearby and grow with distance, where a block is under a pixel.
       t += Math.max(0.5, t * 0.002)
-      if (i === PICK_STEPS - 1) return null
+      if (!below(t)) above = true
+      else if (above) break
     }
     let after = t
     for (let i = 0; i < 12; i++) {
       const mid = (before + after) / 2
-      if (hit(mid)) after = mid
+      if (below(mid)) after = mid
       else before = mid
     }
     const x = o.x + dir.x * after
     const z = o.z + dir.z * after
-    const h = this.heightAt(x, z)
+    const h = this.drawnHeightAt(x, z)
     return h === null ? null : { x: Math.floor(x), y: h - 1, z: Math.floor(z) }
   }
 
@@ -587,7 +599,9 @@ export class MapEngine {
     if (this.hashTimer) return
     this.hashTimer = window.setTimeout(() => {
       this.hashTimer = 0
-      if (this.ready) history.replaceState(null, '', this.hash())
+      // In flight, the URL already says where it's going. The last move of the
+      // flight schedules another write, for wherever it ends up.
+      if (this.ready && !this.flight) history.replaceState(null, '', this.hash())
     }, 400)
   }
 
@@ -895,6 +909,20 @@ export class MapEngine {
     if (i >= 0) this.visible.splice(i, 1)
     this.tiles.delete(tile.key)
     this.dirty = true
+  }
+
+  /** The height of what's on screen at a point. Other loaded tiles may disagree: a coarse one spreads a column's height over many blocks. */
+  private drawnHeightAt(x: number, z: number): number | null {
+    for (let level = 0; level <= (this.manifest?.lodLevels ?? 0); level++) {
+      const size = TILE << level
+      const tx = Math.floor(x / size)
+      const tz = Math.floor(z / size)
+      const t = this.tiles.get(key(level, tx, tz))
+      if (!t?.drawn || !t.tops) continue
+      const h = t.tops[Math.floor(((z - tz * size) / size) * 64) * 64 + Math.floor(((x - tx * size) / size) * 64)]
+      return h === NO_TOP ? null : h * (1 << level)
+    }
+    return null
   }
 
   /** Terrain height under a point, from the finest loaded tile there. */

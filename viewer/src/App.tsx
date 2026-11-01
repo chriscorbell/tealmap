@@ -1,5 +1,5 @@
 import { Activity, ChevronDown, Layers } from 'lucide-react'
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { Coords } from './Coords'
 import { type CameraState, type MapInfo, MapEngine, type Stats } from './map/engine'
 import { PinCard } from './PinCard'
@@ -30,7 +30,7 @@ export default function App() {
   const [menu, setMenu] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
-  const placeMarker = () => {
+  const placeMarker = useCallback(() => {
     const el = markerRef.current
     const p = pinRef.current
     const engine = engineRef.current
@@ -45,7 +45,14 @@ export default function App() {
     const half = (el.querySelector<HTMLElement>('.pin-card')?.offsetWidth ?? 0) / 2
     const nudge = Math.min(Math.max(at.x, half + CARD_MARGIN), width - half - CARD_MARGIN) - at.x
     el.style.setProperty('--nudge', `${nudge}px`)
-  }
+  }, [])
+
+  const writeCoords = useCallback((c: CameraState) => {
+    // Don't type over someone typing.
+    if (xRef.current && document.activeElement !== xRef.current) xRef.current.value = String(Math.round(c.x))
+    if (zRef.current && document.activeElement !== zRef.current) zRef.current.value = String(Math.round(c.z))
+    if (yRef.current) yRef.current.textContent = String(Math.round(c.y))
+  }, [])
 
   const setPin = (p: Pin | null) => {
     pinRef.current = p
@@ -53,18 +60,12 @@ export default function App() {
     setPinState(p)
   }
 
-  // A new pin's marker exists once React has drawn it.
-  useEffect(placeMarker, [pin])
-
   useEffect(() => {
     const engine = new MapEngine(canvasRef.current!, {
       onStats: setStats,
       // Straight to the DOM: this runs every frame the camera moves.
       onCamera: (c: CameraState) => {
-        // Don't type over someone typing.
-        if (xRef.current && document.activeElement !== xRef.current) xRef.current.value = String(Math.round(c.x))
-        if (zRef.current && document.activeElement !== zRef.current) zRef.current.value = String(Math.round(c.z))
-        if (yRef.current) yRef.current.textContent = String(Math.round(c.y))
+        writeCoords(c)
         placeMarker()
       },
       bench,
@@ -115,12 +116,13 @@ export default function App() {
       window.removeEventListener('keydown', escape)
       engine.dispose()
     }
-  }, [bench])
+  }, [bench, placeMarker, writeCoords])
 
   const switchMap = (m: MapInfo) => {
     setMenu(false)
     const engine = engineRef.current
     if (!engine || m.id === current?.id) return
+    setError(null)
     // A step the Back button undoes, like any other move to somewhere else.
     history.replaceState(null, '', engine.hash() || location.hash)
     history.pushState(null, '', `#${m.id}`)
@@ -147,12 +149,18 @@ export default function App() {
         : null
   }
 
+  // Dragging away and back is still a drag, wherever it ends.
+  const move = (e: React.PointerEvent) => {
+    const p = pressRef.current
+    if (!p || p.id !== e.pointerId) return
+    const slop = p.kind === 'mouse' ? CLICK_SLOP.mouse : CLICK_SLOP.other
+    if (Math.hypot(e.clientX - p.x, e.clientY - p.y) > slop) pressRef.current = null
+  }
+
   const release = (e: React.PointerEvent) => {
     const p = pressRef.current
     pressRef.current = null
-    if (!p || p.id !== e.pointerId) return
-    const slop = p.kind === 'mouse' ? CLICK_SLOP.mouse : CLICK_SLOP.other
-    if (Math.hypot(e.clientX - p.x, e.clientY - p.y) > slop || performance.now() - p.at > CLICK_MS) return
+    if (!p || p.id !== e.pointerId || performance.now() - p.at > CLICK_MS) return
     // The first click away from a pin only clears it, so a stray click can't lose your place.
     setPin(pinRef.current ? null : (engineRef.current?.pick(e.clientX, e.clientY) ?? null))
   }
@@ -166,13 +174,14 @@ export default function App() {
         className="map"
         onContextMenu={(e) => e.preventDefault()}
         onPointerDown={press}
+        onPointerMove={move}
         onPointerUp={release}
         onPointerCancel={() => (pressRef.current = null)}
       />
 
       <div className={`progress ${loading ? 'on' : ''}`} />
 
-      {pin && <PinCard key={`${pin.x}/${pin.y}/${pin.z}`} pin={pin} marker={markerRef} link={linkHere} close={() => setPin(null)} />}
+      {pin && <PinCard key={`${pin.x}/${pin.y}/${pin.z}`} pin={pin} marker={markerRef} link={linkHere} close={() => setPin(null)} place={placeMarker} />}
 
       <header className="bar top-left">
         <div className="brand">
@@ -231,7 +240,17 @@ export default function App() {
         )}
       </section>
 
-      <Coords x={xRef} y={yRef} z={zRef} go={goToCoords} link={linkHere} />
+      <Coords
+        x={xRef}
+        y={yRef}
+        z={zRef}
+        go={goToCoords}
+        restore={() => {
+          const t = engineRef.current?.controls.target
+          if (t) writeCoords(t)
+        }}
+        link={linkHere}
+      />
 
       {error && <div className="error">{error}</div>}
     </div>

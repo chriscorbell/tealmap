@@ -1,5 +1,5 @@
 import { Copy, Link, MapPin, X } from 'lucide-react'
-import { type Ref, useState } from 'react'
+import { type Ref, useLayoutEffect, useState } from 'react'
 import { CopyButton } from './CopyButton'
 import type { Pin } from './route'
 
@@ -9,13 +9,18 @@ export function PinCard({
   marker,
   link,
   close,
+  place,
 }: {
   pin: Pin
   marker: Ref<HTMLDivElement>
   link: () => string
   close: () => void
+  /** Positions the marker and fits the card on screen. */
+  place: () => void
 }) {
   const [open, setOpen] = useState(true)
+  // The card's size decides how it fits, and a closed card has none.
+  useLayoutEffect(place, [open, place])
   return (
     <div ref={marker} className="pin">
       <button className="pin-mark" onClick={() => setOpen((v) => !v)} aria-label="Pinned block" aria-expanded={open}>

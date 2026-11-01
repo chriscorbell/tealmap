@@ -9,12 +9,15 @@ export function Coords({
   y,
   z,
   go,
+  restore,
   link,
 }: {
   x: RefObject<HTMLInputElement | null>
   y: RefObject<HTMLElement | null>
   z: RefObject<HTMLInputElement | null>
   go: (to: { x?: number; z?: number }) => void
+  /** Puts the camera's position back in the fields. */
+  restore: () => void
   link: () => string
 }) {
   const key = (axis: 'x' | 'z') => (e: KeyboardEvent<HTMLInputElement>) => {
@@ -24,10 +27,12 @@ export function Coords({
     if (e.key === 'Escape') {
       input.blur()
     } else if (e.key === 'Enter') {
-      const pair = parseCoords(input.value)
       const n = Number(input.value)
-      if (pair) go(pair)
-      else if (input.value.trim() !== '' && Number.isFinite(n)) go({ [axis]: n })
+      if (input.value.trim() !== '' && Number.isFinite(n)) go({ [axis]: n })
+      else {
+        const pair = parseCoords(input.value)
+        if (pair) go(pair)
+      }
       input.blur()
     }
   }
@@ -54,6 +59,7 @@ export function Coords({
         onKeyDown={key(axis)}
         onPaste={paste}
         onFocus={(e) => e.currentTarget.select()}
+        onBlur={restore}
       />
     </label>
   )

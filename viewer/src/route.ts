@@ -39,11 +39,16 @@ export function formatHash(id: string, v: View, pin?: Pin | null): string {
 }
 
 /**
- * Reads coordinates out of pasted or typed text, such as `120 64 -340`, `120, -340`
- * or `/tp @s 120 64 -340`. Two numbers are x and z; with more, the first three are x, y, z.
+ * Reads coordinates out of pasted or typed text, such as `120 64 -340`, `120, -340`,
+ * `XYZ: 120.5 / 64 / -340.5` or `/tp @s 120 64 -340`. Two numbers are x and z; with
+ * more, the first three are x, y, z.
  */
 export function parseCoords(text: string): { x: number; z: number } | null {
-  const n = (text.match(/-?\d+(\.\d+)?/g) ?? []).map(Number)
+  const n = text
+    .split(/[\s,;:/()[\]{}]+/)
+    .filter(Boolean)
+    .map(Number)
+    .filter(Number.isFinite)
   if (n.length === 2) return { x: n[0], z: n[1] }
   if (n.length >= 3) return { x: n[0], z: n[2] }
   return null
