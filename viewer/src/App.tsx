@@ -8,6 +8,7 @@ import { parseHash, type Pin } from './route'
 /** Moving less than this between press and release, in CSS pixels, counts as a click. */
 const CLICK_SLOP = { mouse: 5, other: 10 }
 const CLICK_MS = 500
+const NOTICE_MS = 6000
 /** How far the pin's card stays from the screen's edges, in CSS pixels. */
 const CARD_MARGIN = 8
 
@@ -21,6 +22,7 @@ export default function App() {
   const markerRef = useRef<HTMLDivElement>(null)
   const pinRef = useRef<Pin | null>(null)
   const pressRef = useRef<{ id: number; x: number; y: number; at: number; kind: string } | null>(null)
+  const pointersRef = useRef(new Set<number>())
   const [maps, setMaps] = useState<MapInfo[]>([])
   const [current, setCurrent] = useState<MapInfo | null>(null)
   const [stats, setStats] = useState<Stats | null>(null)
@@ -29,6 +31,7 @@ export default function App() {
   const [statsOpen, setStatsOpen] = useState(bench)
   const [menu, setMenu] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [notice, setNotice] = useState<string | null>(null)
 
   const placeMarker = useCallback(() => {
     const el = markerRef.current
@@ -37,21 +40,24 @@ export default function App() {
     if (!el || !p || !engine) return
     // On top of the block, not inside it.
     const at = engine.project(p.x + 0.5, p.y + 1, p.z + 0.5)
-    el.style.visibility = at ? 'visible' : 'hidden'
-    if (!at) return
+    const { clientWidth: width, clientHeight: height } = canvasRef.current!
+    const onScreen = at && at.x >= 0 && at.x <= width && at.y >= 0 && at.y <= height
+    el.style.visibility = onScreen ? 'visible' : 'hidden'
+    if (!onScreen) return
     el.style.transform = `translate(${at.x}px, ${at.y}px)`
     el.classList.toggle('below', at.y < 90)
-    const width = canvasRef.current!.clientWidth
     const half = (el.querySelector<HTMLElement>('.pin-card')?.offsetWidth ?? 0) / 2
     const nudge = Math.min(Math.max(at.x, half + CARD_MARGIN), width - half - CARD_MARGIN) - at.x
     el.style.setProperty('--nudge', `${nudge}px`)
   }, [])
 
   const writeCoords = useCallback((c: CameraState) => {
-    // Don't type over someone typing.
-    if (xRef.current && document.activeElement !== xRef.current) xRef.current.value = String(Math.round(c.x))
-    if (zRef.current && document.activeElement !== zRef.current) zRef.current.value = String(Math.round(c.z))
     if (yRef.current) yRef.current.textContent = String(Math.round(c.y))
+    // Don't type over someone typing, in either field.
+    const typing = document.activeElement === xRef.current || document.activeElement === zRef.current
+    if (typing || !xRef.current || !zRef.current) return
+    xRef.current.value = String(Math.round(c.x))
+    zRef.current.value = String(Math.round(c.z))
   }, [])
 
   const setPin = (p: Pin | null) => {
@@ -84,7 +90,7 @@ export default function App() {
       const { id, view, pin: linked } = parseHash(location.hash)
       const list = mapsRef.current
       const target = list.find((m) => m.id === id)
-      setError(id && !target ? `There's no map called ${id}.` : null)
+      setNotice(id && !target ? `There's no map called ${id}.` : null)
       if (!target && engine.mapId) return
       const pick = target ?? list[0]
       if (!pick) return
@@ -118,11 +124,18 @@ export default function App() {
     }
   }, [bench, placeMarker, writeCoords])
 
+  // A notice is about something that just happened, and goes away by itself.
+  useEffect(() => {
+    if (!notice) return
+    const timer = setTimeout(() => setNotice(null), NOTICE_MS)
+    return () => clearTimeout(timer)
+  }, [notice])
+
   const switchMap = (m: MapInfo) => {
     setMenu(false)
     const engine = engineRef.current
     if (!engine || m.id === current?.id) return
-    setError(null)
+    setNotice(null)
     // A step the Back button undoes, like any other move to somewhere else.
     history.replaceState(null, '', engine.hash() || location.hash)
     history.pushState(null, '', `#${m.id}`)
@@ -135,17 +148,21 @@ export default function App() {
     const engine = engineRef.current
     if (!engine?.mapId) return
     const here = engine.view()
-    engine.jumpTo({ ...here, x: Math.round(to.x ?? here.x), z: Math.round(to.z ?? here.z) })
+    const x = Math.round(to.x ?? here.x)
+    const z = Math.round(to.z ?? here.z)
+    if (x !== here.x || z !== here.z) engine.jumpTo({ ...here, x, z })
   }
 
   const linkHere = () => `${location.origin}${location.pathname}${engineRef.current?.hash() ?? ''}`
 
   const press = (e: React.PointerEvent) => {
-    // A second finger makes this a gesture, not a tap.
-    pressRef.current = pressRef.current
-      ? null
-      : e.button === 0
-        ? { id: e.pointerId, x: e.clientX, y: e.clientY, at: performance.now(), kind: e.pointerType }
+    // The first finger of a gesture starts the count over, in case a release got lost.
+    if (e.isPrimary) pointersRef.current.clear()
+    pointersRef.current.add(e.pointerId)
+    // A second finger makes this a gesture, not a tap, until they're all lifted.
+    pressRef.current =
+      pointersRef.current.size === 1 && e.button === 0
+        ? { id: e.pointerId, x: e.clientX, y: e.clientY, at: e.timeStamp, kind: e.pointerType }
         : null
   }
 
@@ -158,9 +175,10 @@ export default function App() {
   }
 
   const release = (e: React.PointerEvent) => {
+    pointersRef.current.delete(e.pointerId)
     const p = pressRef.current
     pressRef.current = null
-    if (!p || p.id !== e.pointerId || performance.now() - p.at > CLICK_MS) return
+    if (!p || p.id !== e.pointerId || e.timeStamp - p.at > CLICK_MS) return
     // The first click away from a pin only clears it, so a stray click can't lose your place.
     setPin(pinRef.current ? null : (engineRef.current?.pick(e.clientX, e.clientY) ?? null))
   }
@@ -176,7 +194,10 @@ export default function App() {
         onPointerDown={press}
         onPointerMove={move}
         onPointerUp={release}
-        onPointerCancel={() => (pressRef.current = null)}
+        onPointerCancel={(e) => {
+          pointersRef.current.delete(e.pointerId)
+          pressRef.current = null
+        }}
       />
 
       <div className={`progress ${loading ? 'on' : ''}`} />
@@ -252,7 +273,7 @@ export default function App() {
         link={linkHere}
       />
 
-      {error && <div className="error">{error}</div>}
+      {(error ?? notice) && <div className="error">{error ?? notice}</div>}
     </div>
   )
 }

@@ -1,7 +1,7 @@
 import { Link } from 'lucide-react'
-import type { ClipboardEvent, KeyboardEvent, RefObject } from 'react'
+import type { ClipboardEvent, FocusEvent, KeyboardEvent, RefObject } from 'react'
 import { CopyButton } from './CopyButton'
-import { parseCoords } from './route'
+import { parseCoord, parseCoords } from './route'
 
 /** Where the camera is looking. x and z are also where you type to go somewhere. */
 export function Coords({
@@ -20,21 +20,30 @@ export function Coords({
   restore: () => void
   link: () => string
 }) {
-  const key = (axis: 'x' | 'z') => (e: KeyboardEvent<HTMLInputElement>) => {
+  const key = (e: KeyboardEvent<HTMLInputElement>) => {
     // The map's own keys mustn't fire while typing.
     e.stopPropagation()
     const input = e.currentTarget
     if (e.key === 'Escape') {
       input.blur()
     } else if (e.key === 'Enter') {
-      const n = Number(input.value)
-      if (input.value.trim() !== '' && Number.isFinite(n)) go({ [axis]: n })
-      else {
-        const pair = parseCoords(input.value)
-        if (pair) go(pair)
-      }
+      // Both fields count: typing x, then Tab, then z is one move. One field can
+      // hold a whole position too. A field that isn't a number leaves that axis alone.
+      const number = parseCoord(input.value)
+      const pair = number === null ? parseCoords(input.value) : null
+      go(
+        pair ?? {
+          x: parseCoord(x.current?.value ?? '') ?? undefined,
+          z: parseCoord(z.current?.value ?? '') ?? undefined,
+        },
+      )
       input.blur()
     }
+  }
+
+  // Leaving the fields gives up on what was typed. Moving between them doesn't.
+  const leave = (e: FocusEvent<HTMLInputElement>) => {
+    if (e.relatedTarget !== x.current && e.relatedTarget !== z.current) restore()
   }
 
   // A pasted position usually has both axes, so it goes straight there.
@@ -56,10 +65,10 @@ export function Coords({
         spellCheck={false}
         aria-label={`Go to ${axis}`}
         defaultValue="0"
-        onKeyDown={key(axis)}
+        onKeyDown={key}
         onPaste={paste}
         onFocus={(e) => e.currentTarget.select()}
-        onBlur={restore}
+        onBlur={leave}
       />
     </label>
   )

@@ -500,9 +500,15 @@ export class MapEngine {
     this.scheduleHash()
   }
 
-  /** The URL hash for what's on screen now, without waiting for the address bar. */
+  /**
+   * The URL hash for where the map is, without waiting for the address bar. That's
+   * where it's headed in flight. While a map opens, the camera is still the last
+   * map's, so all there is to say is where this one will start, if that's known.
+   */
   hash() {
-    return this.map ? formatHash(this.map.id, this.view(), this.pin) : ''
+    if (!this.map) return ''
+    if (!this.ready && !this.startView) return `#${this.map.id}`
+    return formatHash(this.map.id, this.flight?.to ?? this.view(), this.pin)
   }
 
   /** The block under a point on the canvas, from the terrain loaded there. */
@@ -544,7 +550,10 @@ export class MapEngine {
     const x = o.x + dir.x * after
     const z = o.z + dir.z * after
     const h = this.drawnHeightAt(x, z)
-    return h === null ? null : { x: Math.floor(x), y: h - 1, z: Math.floor(z) }
+    if (h === null) return null
+    // A ray that comes in through the side of a cliff or a tree is on that side,
+    // somewhere under the column's top.
+    return { x: Math.floor(x), y: Math.min(h - 1, Math.floor(o.y + dir.y * after)), z: Math.floor(z) }
   }
 
   /** Where a point in the world is on the canvas, or null if it's behind the camera. */
@@ -579,7 +588,8 @@ export class MapEngine {
   }
 
   /** Camera view as URL-friendly numbers. */
-  view() {
+  view(): View {
+    if (!this.ready && this.startView) return this.startView
     const t = this.controls.target
     const off = this.camera.position.clone().sub(t)
     const dist = off.length()
