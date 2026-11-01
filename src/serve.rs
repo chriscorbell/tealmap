@@ -221,7 +221,8 @@ pub fn run(cfg: Config, pool: rayon::ThreadPool) -> Result<()> {
                     match ctx.render_reporting(&pool, false, started, publish) {
                         Ok(up) => {
                             // Nothing but failed chunks isn't an unexplored world.
-                            let broken = up.stats.failed_chunks > 0 && !ctx.has_tiles();
+                            let broken = (up.stats.failed_chunks > 0 || ctx.skipping_regions())
+                                && !ctx.has_tiles();
                             statuses.set(
                                 i,
                                 if broken {

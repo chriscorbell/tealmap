@@ -930,7 +930,7 @@ export class MapEngine {
     for (const t of off) t.drawn = false
     this.visible = [...draw]
     // Whatever kept failing, the map no longer wants it.
-    if (this.problem === 'unreachable' && ![...this.tiles.values()].some((t) => t.state === 'failed')) {
+    if (this.problem === 'unreachable' && ![...this.tiles.values()].some((t) => t.retryAt > 0)) {
       this.failingSince = 0
       this.setProblem(null)
     }
@@ -1022,6 +1022,7 @@ export class MapEngine {
         return
       }
       if (res.kind !== 'tile') return
+      tile.retryAt = 0
       this.failingSince = 0
       if (this.problem === 'unreachable') this.setProblem(null)
       this.downloaded += res.bytes
