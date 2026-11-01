@@ -225,6 +225,9 @@ button {
 .panel {
   position: absolute;
   z-index: 2;
+  /* A short, wide screen has to be able to reach all of it. */
+  max-height: calc(100dvh - 76px);
+  overflow-y: auto;
   top: 62px;
   right: 14px;
   width: 220px;
@@ -257,16 +260,20 @@ button {
   width: 290px;
 }
 
-.help {
+.help dl {
   display: grid;
-  grid-template-columns: auto 1fr;
-  gap: 6px 12px;
+  gap: 6px;
   margin: 0;
 }
 
+.help dl div {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
 .help h2 {
-  grid-column: 1 / -1;
-  margin: 8px 0 0;
+  margin: 10px 0 6px;
   color: var(--muted);
   font-size: 11px;
   font-weight: 500;
@@ -352,6 +359,8 @@ button {
 
 .pin {
   position: absolute;
+  /* Over the bars, so a pin's buttons can always be reached. */
+  z-index: 3;
   top: 0;
   left: 0;
   width: 0;
@@ -516,6 +525,26 @@ button {
 
   .coords input {
     padding: 13px 4px;
+  }
+
+  .panel {
+    top: 72px;
+    max-height: calc(100dvh - 86px);
+  }
+
+  .status {
+    top: 72px;
+  }
+
+  .pin-mark {
+    left: -22px;
+    width: 44px;
+    height: 44px;
+    place-items: end center;
+  }
+
+  .pin-card {
+    bottom: 50px;
   }
 }
 

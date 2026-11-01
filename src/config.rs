@@ -44,6 +44,9 @@ pub struct MapConfig {
     pub remove_caves_below_y: i32,
 }
 
+/// Further than any Minecraft world goes.
+const MAX_COORD: f64 = 30_000_000.0;
+
 fn default_listen() -> String {
     "0.0.0.0:8200".into()
 }
@@ -98,6 +101,12 @@ impl Config {
                     m.min_y,
                     m.max_y
                 );
+            }
+            // Written this way round so NaN fails too.
+            if let Some([x, z]) = m.start
+                && !(x.abs() <= MAX_COORD && z.abs() <= MAX_COORD)
+            {
+                bail!("map {}: start is outside any world", m.id);
             }
             if m.max_y - m.min_y > 1000 {
                 bail!(
@@ -165,6 +174,8 @@ mod tests {
         assert!(error(&map("a", "min_y = 10\nmax_y = 10")).contains("must be below"));
         assert!(error(&map("a", "min_y = 0\nmax_y = 2000")).contains("over 1000"));
         assert!(error(&map("a/b", "")).contains("only letters"));
+        assert!(error(&map("a", "start = [40000000, 0]")).contains("outside"));
+        assert!(error(&map("a", "start = [nan, 0]")).contains("outside"));
 
         let good = format!("data_dir = \"/tmp/x\"\n{}{}", map("a", ""), map("b", ""));
         let cfg: Config = toml::from_str(&good).unwrap();

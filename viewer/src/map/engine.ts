@@ -97,7 +97,7 @@ const KEY_PAN = 0.9
 const KEY_TURN = 70
 const KEY_TILT = 45
 const KEY_ZOOM = 1.6
-const MAX_KEY_STEP_MS = 100
+const MAX_KEY_STEP_MS = 250
 /** How far two fingers have to twist before it counts as rotating, in radians. */
 const TWIST_START = 0.14
 /** Top-down, just off vertical so north stays up. */
@@ -676,11 +676,13 @@ export class MapEngine {
 
   /** Twisting two fingers turns the map with them. Pinching and dragging stay with the controls. */
   private twistMove = (e: TouchEvent) => {
-    if (e.touches.length !== 2) {
+    // Only fingers on the map: one resting on a button is no part of this.
+    if (e.targetTouches.length !== 2) {
       this.twist = null
+      this.controls.enableRotate = true
       return
     }
-    const [a, b] = [e.touches[0], e.touches[1]]
+    const [a, b] = [e.targetTouches[0], e.targetTouches[1]]
     const angle = Math.atan2(b.clientY - a.clientY, b.clientX - a.clientX)
     if (!this.twist) {
       this.twist = { angle, turned: 0, engaged: false }
@@ -692,6 +694,9 @@ export class MapEngine {
     this.twist.turned += delta
     this.twist.engaged ||= Math.abs(this.twist.turned) > TWIST_START
     if (!this.twist.engaged || !this.ready) return
+    // The controls read the same fingers' midpoint as rotating and tilting. Twisting
+    // around one still finger moves that midpoint in a circle, so it's one or the other.
+    this.controls.enableRotate = false
     const t = this.controls.target
     const off = this.camera.position.clone().sub(t)
     const dist = off.length()
@@ -789,6 +794,11 @@ export class MapEngine {
   /** Moves to a view as a step the browser's Back button undoes. */
   jumpTo(to: View) {
     if (!this.map) return
+    // Going nowhere isn't a step to go back from, and the map's edge stops a view.
+    const b = this.bounds
+    if (b) to = { ...to, x: Math.min(Math.max(to.x, b.minX), b.maxX), z: Math.min(Math.max(to.z, b.minZ), b.maxZ) }
+    const here = this.flight?.to ?? this.view()
+    if (to.x === here.x && to.z === here.z && to.dist === here.dist && to.az === here.az && to.polar === here.polar) return
     this.cancelHashWrite()
     history.replaceState(null, '', this.hash())
     history.pushState(null, '', formatHash(this.map.id, to, this.pin))

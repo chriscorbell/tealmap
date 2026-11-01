@@ -18,6 +18,16 @@ const CARD_MARGIN = 8
 /** How far down the screen a card below its pin starts, to clear the top bars. */
 const CARD_CLEAR_TOP = 64
 
+/**
+ * Letters and arrows go by where they are on the keyboard, like in the game. Plus
+ * and minus go by what they say, since they're somewhere else on many layouts.
+ */
+function keyCode(e: KeyboardEvent) {
+  if (e.key === '+' || e.key === '=') return 'Equal'
+  if (e.key === '-' || e.key === '_') return 'Minus'
+  return e.code
+}
+
 export default function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const engineRef = useRef<MapEngine | null>(null)
@@ -188,9 +198,10 @@ export default function App() {
         if (!e.repeat) setPanel((p) => (p === 'help' ? null : 'help'))
         return
       }
-      if (e.repeat ? engine.keyHeld(e.code) : engine.keyDown(e.code)) e.preventDefault()
+      const code = keyCode(e)
+      if (e.repeat ? engine.keyHeld(code) : engine.keyDown(code)) e.preventDefault()
     }
-    const keyUp = (e: KeyboardEvent) => engine.keyUp(e.code)
+    const keyUp = (e: KeyboardEvent) => engine.keyUp(keyCode(e))
     const leave = () => engine.releaseKeys()
     const focused = (e: FocusEvent) => {
       if (e.target instanceof HTMLElement && e.target.closest('input, textarea, select, [contenteditable]')) engine.releaseKeys()
@@ -235,6 +246,8 @@ export default function App() {
     setPin(null)
     setCurrent(m)
     setError(null)
+    // The button just chosen is about to hide, and focus would fall off the page.
+    pickerButtonRef.current?.focus()
     engine.setMap(m).catch((e) => {
       console.error(e)
       setError('This map couldn’t be opened.')
@@ -258,8 +271,9 @@ export default function App() {
     if (e.isPrimary) pointersRef.current.clear()
     pointersRef.current.add(e.pointerId)
     // A second finger makes this a gesture, not a tap, until they're all lifted.
+    // Clicking away from the open menu is only that.
     pressRef.current =
-      pointersRef.current.size === 1 && e.button === 0
+      pointersRef.current.size === 1 && e.button === 0 && !menuRef.current
         ? { id: e.pointerId, x: e.clientX, y: e.clientY, at: e.timeStamp, kind: e.pointerType }
         : null
   }
