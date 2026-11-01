@@ -13,7 +13,7 @@ use futures_util::Stream;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 use tokio::sync::broadcast;
 use tokio_stream::StreamExt;
@@ -91,6 +91,8 @@ struct AppState {
 /// A map in the render loop.
 struct Slot {
     ctx: Option<MapCtx>,
+    /// Waiting for the setup thread.
+    setting_up: bool,
     retry_at: Instant,
     /// What it last failed with, so a problem that lasts is logged once rather
     /// than every poll.
@@ -139,6 +141,23 @@ pub fn run(cfg: Config, pool: rayon::ThreadPool) -> Result<()> {
         }),
     };
 
+    // Setting a map up can mean downloading its client jar, so it gets a thread of
+    // its own and the other maps keep updating. One thread, because maps of the same
+    // version share a download.
+    let (want_setup, setup_requests) = mpsc::channel::<usize>();
+    let (setup_done, setups) = mpsc::channel::<(usize, Result<MapCtx>)>();
+    let setup_cfg = cfg.clone();
+    std::thread::Builder::new()
+        .name("setup".into())
+        .spawn(move || {
+            for i in setup_requests {
+                let ctx = MapCtx::new(setup_cfg.maps[i].clone(), &setup_cfg.data_dir);
+                if setup_done.send((i, ctx)).is_err() {
+                    return;
+                }
+            }
+        })?;
+
     // Render loop on its own thread; rendering itself runs on the rayon pool.
     let render_cfg = cfg.clone();
     std::thread::Builder::new()
@@ -149,22 +168,39 @@ pub fn run(cfg: Config, pool: rayon::ThreadPool) -> Result<()> {
                 .iter()
                 .map(|_| Slot {
                     ctx: None,
+                    setting_up: false,
                     retry_at: Instant::now(),
                     failing: None,
                 })
                 .collect();
+            let poll = Duration::from_secs(render_cfg.poll_seconds.max(1));
             loop {
-                for (i, (slot, map)) in slots.iter_mut().zip(&render_cfg.maps).enumerate() {
-                    if slot.ctx.is_none() && Instant::now() >= slot.retry_at {
-                        match MapCtx::new(map.clone(), &render_cfg.data_dir) {
-                            Ok(ctx) => slot.ctx = Some(ctx),
-                            Err(e) => {
-                                slot.failed(&map.id, &e);
-                                statuses.set(i, MapStatus::Error);
-                                slot.retry_at = Instant::now() + SETUP_RETRY;
-                            }
+                for (i, slot) in slots.iter_mut().enumerate() {
+                    if slot.ctx.is_none() && !slot.setting_up && Instant::now() >= slot.retry_at {
+                        slot.setting_up = want_setup.send(i).is_ok();
+                    }
+                }
+                let mut finish_setup = |(i, ctx): (usize, Result<MapCtx>)| {
+                    let slot: &mut Slot = &mut slots[i];
+                    slot.setting_up = false;
+                    match ctx {
+                        Ok(ctx) => slot.ctx = Some(ctx),
+                        Err(e) => {
+                            slot.failed(&render_cfg.maps[i].id, &e);
+                            statuses.set(i, MapStatus::Error);
+                            slot.retry_at = Instant::now() + SETUP_RETRY;
                         }
                     }
+                };
+                // Sleeps between polls, unless a map is ready to start rendering.
+                match setups.recv_timeout(poll) {
+                    Ok(done) => finish_setup(done),
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    // The setup thread died, so there's nothing to wake this up early.
+                    Err(mpsc::RecvTimeoutError::Disconnected) => std::thread::sleep(poll),
+                }
+                setups.try_iter().for_each(&mut finish_setup);
+                for (i, (slot, map)) in slots.iter_mut().zip(&render_cfg.maps).enumerate() {
                     let Some(ctx) = &slot.ctx else { continue };
                     let started = |total| {
                         if total > 0 {
@@ -181,7 +217,16 @@ pub fn run(cfg: Config, pool: rayon::ThreadPool) -> Result<()> {
                     };
                     match ctx.render_reporting(&pool, false, started, publish) {
                         Ok(up) => {
-                            statuses.set(i, MapStatus::Ready);
+                            // Nothing but failed chunks isn't an unexplored world.
+                            let broken = up.stats.failed_chunks > 0 && !ctx.has_tiles();
+                            statuses.set(
+                                i,
+                                if broken {
+                                    MapStatus::Error
+                                } else {
+                                    MapStatus::Ready
+                                },
+                            );
                             if slot.failing.take().is_some() {
                                 tracing::info!("map {}: working again", map.id);
                             }
@@ -202,7 +247,6 @@ pub fn run(cfg: Config, pool: rayon::ThreadPool) -> Result<()> {
                         }
                     }
                 }
-                std::thread::sleep(Duration::from_secs(render_cfg.poll_seconds.max(1)));
             }
         })?;
 

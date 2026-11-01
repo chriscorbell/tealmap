@@ -106,17 +106,23 @@ impl Config {
         Ok(())
     }
 
-    /// Checks that tiles can be written, before spending any time on rendering.
+    /// Whether tiles can be written, to say so before any time goes on rendering.
+    /// Not always fatal: a read-only root can hold writable map directories.
     pub fn check_data_dir(&self) -> Result<()> {
         let hint = "In the container image tealmap runs as uid 1000, so the directory must belong to that user";
         let dir = &self.data_dir;
         std::fs::create_dir_all(dir)
             .with_context(|| format!("can't create {}. {hint}", dir.display()))?;
-        let probe = dir.join(".tealmap-write-check");
-        std::fs::write(&probe, b"")
-            .with_context(|| format!("can't write to {}. {hint}", dir.display()))?;
-        let _ = std::fs::remove_file(&probe);
-        Ok(())
+        let probe = dir.join(format!(".tealmap-write-check-{}", std::process::id()));
+        // Only ever a new file: a name that's somehow taken isn't this check's to touch.
+        match std::fs::File::create_new(&probe) {
+            Ok(_) => {
+                let _ = std::fs::remove_file(&probe);
+                Ok(())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(e) => Err(e).with_context(|| format!("can't write to {}. {hint}", dir.display())),
+        }
     }
 
     pub fn threads(&self) -> usize {

@@ -172,6 +172,12 @@ impl MapCtx {
         })
     }
 
+    /// Whether the map has anything to show.
+    pub fn has_tiles(&self) -> bool {
+        let mut guard = self.index.lock().unwrap();
+        !self.index_mut(&mut guard).hires.is_empty()
+    }
+
     fn region_dir(&self) -> PathBuf {
         self.cfg.world.join("region")
     }

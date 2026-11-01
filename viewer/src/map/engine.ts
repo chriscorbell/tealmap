@@ -332,6 +332,7 @@ export class MapEngine {
     this.ready = false
     cancelAnimationFrame(this.raf)
     clearTimeout(this.sleepTimer)
+    clearTimeout(this.refreshTimer)
     this.asleep = true
     this.clearTiles()
     this.setProblem('lost')
@@ -344,10 +345,11 @@ export class MapEngine {
     this.renderer = new Renderer(this.gl)
     this.gl.clearColor(BG[0], BG[1], BG[2], 1)
     if (this.gpuTimer) this.gpuTimer = GpuTimer.create(this.gl)
-    this.resize()
+    // Before resizing, which would otherwise wake a sleeping loop into a second one.
     this.asleep = false
     this.idleFrames = 0
     this.raf = requestAnimationFrame(this.frame)
+    this.resize()
     if (this.map) void this.setMap(this.map, this.startView)
   }
 
@@ -376,6 +378,7 @@ export class MapEngine {
   async setMap(map: MapInfo, view?: View) {
     if (this.disposed) return
     const gen = ++this.generation
+    clearTimeout(this.refreshTimer)
     this.clearTiles()
     this.map = map
     this.flight = null
@@ -540,6 +543,7 @@ export class MapEngine {
   }
 
   private async refreshManifest(gen: number) {
+    if (gen !== this.generation) return
     this.pendingUpdate = false
     clearTimeout(this.refreshTimer)
     let m: Manifest
@@ -914,6 +918,11 @@ export class MapEngine {
     }
     for (const t of off) t.drawn = false
     this.visible = [...draw]
+    // Whatever kept failing, the map no longer wants it.
+    if (this.problem === 'unreachable' && ![...this.tiles.values()].some((t) => t.state === 'failed')) {
+      this.failingSince = 0
+      this.setProblem(null)
+    }
     for (const t of this.fading) if (!t.drawn && t.mesh) this.visible.push(t)
     this.visible.sort((a, b) => a.distance - b.distance)
 

@@ -52,6 +52,10 @@ fn main() -> Result<()> {
         .init();
     let cli = Cli::parse();
     let cfg = config::Config::load(&cli.config)?;
+    // Maps that can't write fail as they render, and `serve` still has their tiles.
+    if let Err(e) = cfg.check_data_dir() {
+        tracing::warn!("{e:#}");
+    }
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(cfg.threads())
         .thread_name(|i| format!("render-{i}"))
@@ -67,7 +71,6 @@ fn main() -> Result<()> {
             if maps.is_empty() {
                 bail!("no matching map in {}", cli.config.display());
             }
-            cfg.check_data_dir()?;
             // One map's problem shouldn't stop the others from rendering.
             let mut failed = 0;
             for m in &maps {
@@ -80,13 +83,7 @@ fn main() -> Result<()> {
                 bail!("{failed} of {} maps failed to render", maps.len());
             }
         }
-        Cmd::Serve => {
-            // Existing tiles can still be served; maps report the failure as they try to render.
-            if let Err(e) = cfg.check_data_dir() {
-                tracing::error!("{e:#}");
-            }
-            serve::run(cfg, pool)?
-        }
+        Cmd::Serve => serve::run(cfg, pool)?,
     }
     Ok(())
 }
