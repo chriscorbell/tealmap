@@ -41,6 +41,7 @@ export default function App() {
   const compassRef = useRef<HTMLSpanElement>(null)
   const pickerRef = useRef<HTMLDivElement>(null)
   const pickerButtonRef = useRef<HTMLButtonElement>(null)
+  const placesButtonRef = useRef<HTMLButtonElement>(null)
   const markerRef = useRef<HTMLDivElement>(null)
   const pinRef = useRef<Pin | null>(null)
   const pressRef = useRef<{ id: number; x: number; y: number; at: number; kind: string } | null>(null)
@@ -134,6 +135,7 @@ export default function App() {
 
     const open = (m: MapInfo, view: Parameters<MapEngine['setMap']>[1]) => {
       setCurrent(m)
+      setPanel((p) => (p === 'places' ? null : p))
       setError(null)
       engine.setMap(m, view).catch((e) => {
         console.error(e)
@@ -192,7 +194,10 @@ export default function App() {
         if (menuOpen) {
           setMenu(false)
           pickerButtonRef.current?.focus()
-        } else if (panelRef.current) setPanel(null)
+        } else if (panelRef.current) {
+          if (panelRef.current === 'places') placesButtonRef.current?.focus()
+          setPanel(null)
+        }
         else if (pinRef.current) setPin(null)
         return
       }
@@ -283,9 +288,12 @@ export default function App() {
 
   const goToPlace = (place: Place) => {
     setPanel(null)
+    // The search box is about to hide, and focus would fall off the page.
+    placesButtonRef.current?.focus()
     const engine = engineRef.current
-    if (!engine?.loaded) return
-    const here = engine.view()
+    if (!engine) return
+    // A map still opening starts here instead, once it has.
+    const here = engine.loaded ? engine.view() : engine.homeView()
     engine.jumpTo({ ...here, x: Math.round(place.x), z: Math.round(place.z), dist: Math.min(here.dist, PLACE_DIST) })
   }
 
@@ -401,6 +409,7 @@ export default function App() {
       <div className="bar top-right">
         {places.length > 0 && (
           <button
+            ref={placesButtonRef}
             className={`icon ${panel === 'places' ? 'active' : ''}`}
             onClick={() => {
               setMenu(false)

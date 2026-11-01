@@ -428,6 +428,7 @@ export class MapEngine {
     this.flight = null
     // Nothing plans against the old map's manifest or textures while loading.
     this.manifest = null
+    this.bounds = null
     this.ready = false
     this.pendingUpdate = false
     this.autoView = !view
