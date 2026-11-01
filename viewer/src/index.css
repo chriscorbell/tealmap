@@ -59,6 +59,7 @@ button {
 
 .bar {
   position: absolute;
+  z-index: 2;
   display: flex;
   align-items: center;
   gap: 6px;
@@ -206,6 +207,7 @@ button {
 
 .panel {
   position: absolute;
+  z-index: 2;
   top: 62px;
   right: 14px;
   width: 220px;
@@ -371,17 +373,30 @@ button {
   animation-play-state: running;
 }
 
-.error {
+.status {
   position: absolute;
-  bottom: 14px;
+  top: 64px;
   left: 50%;
-  transform: translateX(-50%);
+  translate: -50% 0;
+  width: max-content;
+  max-width: calc(100vw - 28px);
   padding: 8px 14px;
+  overflow-wrap: anywhere;
+  text-align: center;
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  pointer-events: none;
+  animation: rise 0.4s var(--ease) both;
+}
+
+.status.alert {
   color: #fecaca;
   background: rgba(60, 16, 16, 0.85);
-  border: 1px solid rgba(248, 113, 113, 0.25);
-  border-radius: 10px;
-  animation: rise 0.4s var(--ease) both;
+  border-color: rgba(248, 113, 113, 0.25);
 }
 
 @keyframes enter {

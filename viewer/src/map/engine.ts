@@ -1,6 +1,7 @@
 import { Box3, Frustum, MathUtils, Matrix4, PerspectiveCamera, Vector3 } from 'three'
 import { MapControls } from 'three/examples/jsm/controls/MapControls.js'
 import { formatHash, type Pin, type View } from '../route'
+import type { MapStatus, Problem } from '../status'
 import { type Mesh, Pass, Renderer } from './renderer'
 import { NO_TOP } from './tile'
 import type { Request, Response } from './worker'
@@ -8,6 +9,14 @@ import type { Request, Response } from './worker'
 export interface MapInfo {
   id: string
   name: string
+  status?: MapStatus
+}
+
+/** How the map being shown is doing, as far as the viewer can tell. */
+export interface LoadState {
+  problem: Problem
+  opened: boolean
+  hasTiles: boolean
 }
 
 interface Manifest {
@@ -67,6 +76,13 @@ const KEEP_MS = 10_000
 /** Idle frames before the loop sleeps, and how often it wakes to plan. */
 const IDLE_FRAMES = 30
 const SLEEP_MS = 1000
+/** Retries while the server can't be reached double from the first to the last. */
+const RETRY_FIRST_MS = 1000
+const RETRY_LAST_MS = 30_000
+/** How often to look for a map whose first render hasn't started. */
+const WAIT_MS = 3000
+/** How long tiles have to keep failing before that's worth saying. */
+const TILES_FAILING_MS = 10_000
 /** How long the camera takes to move to somewhere nearby. */
 const FLY_MS = 600
 /** Longest a ray goes looking for terrain, in steps. */
@@ -146,6 +162,9 @@ class Workers {
 }
 
 
+/** Thrown when the browser or device can't give the viewer the graphics it needs. */
+export class WebGL2Missing extends Error {}
+
 export class MapEngine {
   readonly camera: PerspectiveCamera
   readonly controls: MapControls
@@ -192,6 +211,15 @@ export class MapEngine {
   private triangles = 0
   private onStats: (s: Stats) => void
   private onCamera: (c: CameraState) => void
+  private onLoadState: (s: LoadState) => void
+  private onMapStatus: (id: string, s: MapStatus) => void
+  private problem: Problem = null
+  /** When tiles started failing without any loading in between, or 0. */
+  private failingSince = 0
+  private refreshTimer = 0
+  private reconnectTimer = 0
+  /** The GPU context is gone until the browser gives it back. */
+  private lost = false
   private hashTimer = 0
   private gpuTimer: GpuTimer | null = null
   private pin: Pin | null = null
@@ -218,11 +246,19 @@ export class MapEngine {
 
   constructor(
     canvas: HTMLCanvasElement,
-    opts: { onStats: (s: Stats) => void; onCamera: (c: CameraState) => void; bench?: boolean },
+    opts: {
+      onStats: (s: Stats) => void
+      onCamera: (c: CameraState) => void
+      onLoadState: (s: LoadState) => void
+      onMapStatus: (id: string, s: MapStatus) => void
+      bench?: boolean
+    },
   ) {
     this.canvas = canvas
     this.onStats = opts.onStats
     this.onCamera = opts.onCamera
+    this.onLoadState = opts.onLoadState
+    this.onMapStatus = opts.onMapStatus
     this.bench = opts.bench ?? false
     const gl = canvas.getContext('webgl2', {
       // On a high-density screen, edges are already fine, and multisampling
@@ -232,7 +268,10 @@ export class MapEngine {
       stencil: false,
       powerPreference: 'high-performance',
     })
-    if (!gl) throw new Error('WebGL2 is not available')
+    if (!gl) {
+      this.workers.dispose()
+      throw new WebGL2Missing()
+    }
     this.gl = gl
     this.renderer = new Renderer(gl)
     gl.clearColor(BG[0], BG[1], BG[2], 1)
@@ -262,6 +301,8 @@ export class MapEngine {
     this.resize()
     window.addEventListener('resize', this.resize)
     for (const event of ['pointerdown', 'wheel', 'touchstart']) canvas.addEventListener(event, this.wake, { passive: true })
+    canvas.addEventListener('webglcontextlost', this.contextLost)
+    canvas.addEventListener('webglcontextrestored', this.contextRestored)
     this.raf = requestAnimationFrame(this.frame)
   }
 
@@ -271,13 +312,60 @@ export class MapEngine {
     cancelAnimationFrame(this.raf)
     clearTimeout(this.sleepTimer)
     clearTimeout(this.hashTimer)
+    clearTimeout(this.refreshTimer)
+    clearTimeout(this.reconnectTimer)
     window.removeEventListener('resize', this.resize)
     for (const event of ['pointerdown', 'wheel', 'touchstart']) this.canvas.removeEventListener(event, this.wake)
+    this.canvas.removeEventListener('webglcontextlost', this.contextLost)
+    this.canvas.removeEventListener('webglcontextrestored', this.contextRestored)
     this.events?.close()
     this.clearTiles()
     this.workers.dispose()
     this.controls.dispose()
     this.renderer.dispose()
+  }
+
+  /** Asking for the event's default not to happen is how a page says it'll rebuild. */
+  private contextLost = (e: Event) => {
+    e.preventDefault()
+    // A camera nobody has moved stays free to frame the map as tiles arrive.
+    if (this.ready) this.startView = this.autoView ? undefined : (this.flight?.to ?? this.view())
+    this.lost = true
+    // Browsers paint a lost canvas white, whatever is behind it.
+    this.canvas.style.visibility = 'hidden'
+    this.generation++
+    this.ready = false
+    cancelAnimationFrame(this.raf)
+    clearTimeout(this.sleepTimer)
+    clearTimeout(this.refreshTimer)
+    this.asleep = true
+    this.clearTiles()
+    this.setProblem('lost')
+  }
+
+  /** Everything on the GPU went with the context: tiles and textures load again, from the HTTP cache. */
+  private contextRestored = () => {
+    this.lost = false
+    this.canvas.style.visibility = ''
+    this.problem = null
+    this.renderer = new Renderer(this.gl)
+    this.gl.clearColor(BG[0], BG[1], BG[2], 1)
+    if (this.gpuTimer) this.gpuTimer = GpuTimer.create(this.gl)
+    // Before resizing, which would otherwise wake a sleeping loop into a second one.
+    this.asleep = false
+    this.idleFrames = 0
+    this.raf = requestAnimationFrame(this.frame)
+    this.resize()
+    if (this.map) void this.setMap(this.map, this.startView)
+  }
+
+  private setProblem(problem: Problem) {
+    this.problem = problem
+    this.reportLoadState()
+  }
+
+  private reportLoadState() {
+    this.onLoadState({ problem: this.problem, opened: this.ready, hasTiles: this.masks.size > 0 })
   }
 
   private resize = () => {
@@ -296,6 +384,7 @@ export class MapEngine {
   async setMap(map: MapInfo, view?: View) {
     if (this.disposed) return
     const gen = ++this.generation
+    clearTimeout(this.refreshTimer)
     this.clearTiles()
     this.map = map
     this.flight = null
@@ -307,25 +396,18 @@ export class MapEngine {
     this.startView = view
     // Subscribe first so an update published while loading isn't missed.
     this.listen()
-    let manifest: Manifest
-    // A fresh server publishes each map once its first render starts, and the
-    // textures come with it. Asking for both at once saves a round trip.
-    let textures = fetch(`/maps/${map.id}/textures.bin`)
-    for (;;) {
-      const res = await fetch(`/maps/${map.id}/map.json`, { cache: 'no-cache' })
-      if (gen !== this.generation) return
-      if (res.ok) {
-        manifest = await res.json()
-        break
-      }
-      await new Promise((r) => setTimeout(r, 3000))
-      textures = fetch(`/maps/${map.id}/textures.bin`)
-    }
-    const texData = new Uint8Array(await (await textures).arrayBuffer())
-    if (gen !== this.generation) return
+    this.masks = new Map()
+    this.failingSince = 0
+    // It opens when the context comes back.
+    if (this.lost) return
+    this.setProblem(null)
+    const loaded = await this.fetchMap(map, gen)
+    if (!loaded || gen !== this.generation) return
+    const [manifest, texData] = loaded
     this.setManifest(manifest)
     this.renderer.setBlockTextures(texData, manifest.textures)
     this.ready = true
+    this.setProblem(null)
 
     const start = this.startView
     if (start) this.placeCamera(start.x, start.z, start.dist, start.az, start.polar)
@@ -333,6 +415,34 @@ export class MapEngine {
     if (this.pendingUpdate) this.refreshManifest(gen)
     this.dirty = true
     this.wake()
+  }
+
+  /**
+   * A map's manifest and textures, once it has them. A fresh server publishes each
+   * map once its first render starts, and the textures come with it, so asking for
+   * both at once saves a round trip. Returns null if another map got opened meanwhile.
+   */
+  private async fetchMap(map: MapInfo, gen: number): Promise<[Manifest, Uint8Array] | null> {
+    let retry = RETRY_FIRST_MS
+    for (;;) {
+      let problem: Problem = 'unreachable'
+      try {
+        const [res, tex] = await Promise.all([fetch(`/maps/${map.id}/map.json`, { cache: 'no-cache' }), fetch(`/maps/${map.id}/textures.bin`)])
+        if (gen !== this.generation) return null
+        if (res.ok && tex.ok) return [(await res.json()) as Manifest, new Uint8Array(await tex.arrayBuffer())]
+        // Only a map with no render yet is expected to be missing.
+        if (res.status === 404 || tex.status === 404) problem = 'waiting'
+      } catch (e) {
+        if (gen !== this.generation) return null
+        console.warn(`map ${map.id}: ${e}`)
+      }
+      this.setProblem(problem)
+      const delay = problem === 'waiting' ? WAIT_MS : retry
+      if (problem !== 'waiting') retry = Math.min(retry * 2, RETRY_LAST_MS)
+      else retry = RETRY_FIRST_MS
+      await new Promise((r) => setTimeout(r, delay))
+      if (gen !== this.generation) return null
+    }
   }
 
   private setManifest(m: Manifest) {
@@ -390,6 +500,7 @@ export class MapEngine {
       if (!listed) this.dropTile(t)
     }
     this.lastPlan = 0
+    this.reportLoadState()
   }
 
   /** Visits every LOD node. Only for rare, whole-map work. */
@@ -438,8 +549,20 @@ export class MapEngine {
   }
 
   private async refreshManifest(gen: number) {
+    if (gen !== this.generation) return
     this.pendingUpdate = false
-    const m: Manifest = await (await fetch(`/maps/${this.map!.id}/map.json`, { cache: 'no-cache' })).json()
+    clearTimeout(this.refreshTimer)
+    let m: Manifest
+    try {
+      const res = await fetch(`/maps/${this.map!.id}/map.json`, { cache: 'no-cache' })
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`)
+      m = await res.json()
+    } catch (e) {
+      // The map on screen is still good. Try again in a while.
+      console.warn(`map ${this.map?.id}: ${e}`)
+      if (gen === this.generation) this.refreshTimer = window.setTimeout(() => this.refreshManifest(gen), WAIT_MS)
+      return
+    }
     if (gen !== this.generation || !this.manifest) return
     const wasEmpty = this.masks.size === 0
     this.setManifest(m)
@@ -630,8 +753,13 @@ export class MapEngine {
   }
 
   private listen() {
+    clearTimeout(this.reconnectTimer)
     this.events?.close()
     const es = new EventSource('/api/events')
+    es.addEventListener('status', (e) => {
+      const msg = JSON.parse((e as MessageEvent).data) as { map: string; status: MapStatus }
+      this.onMapStatus(msg.map, msg.status)
+    })
     es.addEventListener('update', (e) => {
       const msg = JSON.parse((e as MessageEvent).data) as {
         map: string
@@ -650,6 +778,13 @@ export class MapEngine {
       // Revalidate resident tiles too; unchanged ones come back as 304s.
       for (const t of this.tiles.values()) t.stale = true
       this.refreshManifest(this.generation)
+    }
+    // A browser reconnects by itself after a dropped stream, but gives up for good
+    // on an error response, like a proxy's during a restart.
+    es.onerror = () => {
+      if (es.readyState !== EventSource.CLOSED || this.events !== es || this.disposed) return
+      clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = window.setTimeout(() => this.listen(), WAIT_MS)
     }
     this.events = es
   }
@@ -797,6 +932,11 @@ export class MapEngine {
     }
     for (const t of off) t.drawn = false
     this.visible = [...draw]
+    // Whatever kept failing, the map no longer wants it.
+    if (this.problem === 'unreachable' && ![...this.tiles.values()].some((t) => t.retryAt > 0)) {
+      this.failingSince = 0
+      this.setProblem(null)
+    }
     for (const t of this.fading) if (!t.drawn && t.mesh) this.visible.push(t)
     this.visible.sort((a, b) => a.distance - b.distance)
 
@@ -869,6 +1009,12 @@ export class MapEngine {
       this.wake()
       if (res.kind === 'error') {
         console.warn(`tile ${level}:${x},${z}: ${res.message}`)
+        // One tile that won't decode isn't the server being away.
+        if (!res.arrived) {
+          const failed = performance.now()
+          this.failingSince ||= failed
+          if (failed - this.failingSince > TILES_FAILING_MS && !this.problem) this.setProblem('unreachable')
+        }
         // Keep an old mesh; with nothing to show, retry later instead of
         // treating the tile as empty and leaving a hole.
         if (tile.mesh) tile.state = 'ready'
@@ -879,6 +1025,9 @@ export class MapEngine {
         return
       }
       if (res.kind !== 'tile') return
+      tile.retryAt = 0
+      this.failingSince = 0
+      if (this.problem === 'unreachable') this.setProblem(null)
       this.downloaded += res.bytes
       if (!res.tile) {
         this.fading.delete(tile)
@@ -968,7 +1117,7 @@ export class MapEngine {
   // ---------------------------------------------------------------- frame
 
   private sleepTick = () => {
-    if (this.disposed) return
+    if (this.disposed || this.lost) return
     this.plan(performance.now())
     if (this.planWants || this.dirty) this.wake()
     else this.sleepTimer = window.setTimeout(this.sleepTick, SLEEP_MS)
@@ -977,7 +1126,7 @@ export class MapEngine {
   private wake = () => {
     clearTimeout(this.sleepTimer)
     this.idleFrames = 0
-    if (!this.asleep || this.disposed) return
+    if (!this.asleep || this.disposed || this.lost) return
     this.asleep = false
     this.raf = requestAnimationFrame(this.frame)
   }

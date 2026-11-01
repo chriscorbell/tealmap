@@ -97,6 +97,9 @@ pub struct Update {
     pub lod: Vec<[i32; 3]>,
     #[serde(skip)]
     pub stats: Stats,
+    /// In a batch's update, tiles the pass has rendered so far and has in all.
+    #[serde(skip)]
+    pub progress: (usize, usize),
 }
 
 impl Update {
@@ -151,7 +154,7 @@ impl MapCtx {
 
     pub fn with_baker(cfg: MapConfig, data_dir: &Path, baker: Baker) -> Result<Self> {
         let out = data_dir.join("maps").join(&cfg.id);
-        std::fs::create_dir_all(&out)?;
+        std::fs::create_dir_all(&out).with_context(|| format!("creating {}", out.display()))?;
         let settings = Settings {
             min_y: cfg.min_y,
             remove_caves_below_y: cfg.remove_caves_below_y,
@@ -167,6 +170,17 @@ impl MapCtx {
             skipped: Mutex::new(BTreeSet::new()),
             batch_tiles: BATCH_TILES_PER_THREAD,
         })
+    }
+
+    /// Whether the map has anything to show.
+    pub fn has_tiles(&self) -> bool {
+        let mut guard = self.index.lock().unwrap();
+        !self.index_mut(&mut guard).hires.is_empty()
+    }
+
+    /// Whether the last pass left out a region it couldn't read.
+    pub fn skipping_regions(&self) -> bool {
+        !self.skipped.lock().unwrap().is_empty()
     }
 
     fn region_dir(&self) -> PathBuf {
@@ -191,6 +205,16 @@ impl MapCtx {
         }
         let dir = self.region_dir();
         let regions = list_regions(&dir)?;
+        // A dimension nobody has visited looks like this too, but not with these in it.
+        for inner in ["dimensions/minecraft/overworld", "world"] {
+            if regions.is_empty() && !dir.exists() && world.join(inner).is_dir() {
+                bail!(
+                    "{} has no region/ folder, but it has {inner}/. `world` should probably be {}",
+                    world.display(),
+                    world.join(inner).display()
+                );
+            }
+        }
         if regions.is_empty() && !self.stored_regions()?.is_empty() {
             bail!(
                 "{} has no region files, but this map was rendered from some. Keeping its tiles. \
@@ -213,6 +237,18 @@ impl MapCtx {
         &self,
         pool: &rayon::ThreadPool,
         full: bool,
+        publish: impl FnMut(&Update),
+    ) -> Result<Update> {
+        self.render_reporting(pool, full, |_| {}, publish)
+    }
+
+    /// `render`, also telling `started` how many tiles the pass has to render,
+    /// once it knows and before it renders any.
+    pub fn render_reporting(
+        &self,
+        pool: &rayon::ThreadPool,
+        full: bool,
+        started: impl FnOnce(usize),
         mut publish: impl FnMut(&Update),
     ) -> Result<Update> {
         let t0 = Instant::now();
@@ -288,6 +324,7 @@ impl MapCtx {
         let jobs = nearest_first(tiles);
         let batches = batches(&jobs, self.batch_tiles * pool.current_num_threads());
         let total: usize = jobs.iter().map(|j| j.1.len()).sum();
+        started(total);
         let queued: BTreeSet<(i32, i32)> = jobs.iter().map(|j| j.0).collect();
         let scanned: BTreeSet<(i32, i32)> = scans.iter().map(|s| (s.rx, s.rz)).collect();
         let mut finished = BTreeSet::new();
@@ -330,6 +367,7 @@ impl MapCtx {
             if rendered < total {
                 tracing::info!("{}: {rendered}/{total} tiles", self.cfg.id);
             }
+            up.progress = (rendered, total);
             publish(&up);
             // Failed chunks can be one bad file, which the next pass retries.
             // If the whole world has gone, every batch left would fail too, and
@@ -548,7 +586,7 @@ impl MapCtx {
         let mut mesher = Mesher::new();
         let mut gz = Vec::new();
         let dir = self.out.join("hires").join(format!("{rx}_{rz}"));
-        std::fs::create_dir_all(&dir)?;
+        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
 
         let mut current_row = i32::MIN;
         for &(tz, tx) in &tiles.iter().map(|&(x, z)| (z, x)).collect::<BTreeSet<_>>() {
@@ -602,7 +640,8 @@ impl MapCtx {
                 None => {
                     res.empty += 1;
                     if path.exists() {
-                        std::fs::remove_file(&path)?;
+                        std::fs::remove_file(&path)
+                            .with_context(|| format!("removing {}", path.display()))?;
                         res.tiles.push((tx, tz));
                     }
                 }
@@ -640,7 +679,8 @@ impl MapCtx {
                 write_if_changed(&path, &gz)?
             }
             None if path.exists() => {
-                std::fs::remove_file(&path)?;
+                std::fs::remove_file(&path)
+                    .with_context(|| format!("removing {}", path.display()))?;
                 true
             }
             None => false,
@@ -698,7 +738,8 @@ impl MapCtx {
             let _ = std::fs::remove_file(&path);
             return Ok(());
         }
-        std::fs::create_dir_all(path.parent().unwrap())?;
+        let dir = path.parent().unwrap();
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         let mut b = Vec::with_capacity(4 + 16 + 1024 * 8);
         b.extend_from_slice(STATE_MAGIC);
         let (mtime, size) = stamp.unwrap_or(NO_STAMP);
@@ -1019,14 +1060,14 @@ pub fn write_if_changed(path: &Path, data: &[u8]) -> Result<bool> {
 
 pub fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
     let tmp = path.with_extension(format!(
         "{}.tmp",
         path.extension().and_then(|e| e.to_str()).unwrap_or("")
     ));
     std::fs::write(&tmp, data).with_context(|| format!("writing {}", tmp.display()))?;
-    std::fs::rename(&tmp, path)?;
+    std::fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
 
@@ -1394,6 +1435,21 @@ mod tests {
         render("unvisited", false).unwrap();
         assert!(base.join("unvisited/maps/test/map.json").exists());
 
+        // Or a world root, with its dimensions further in, which the error points at.
+        let root_map = |world: &Path| {
+            MapCtx::with_baker(
+                map_config(world),
+                &base.join("root"),
+                Baker::new(AssetFiles::new()),
+            )
+            .unwrap()
+            .render(&pool, false, |_| {})
+        };
+        let root = base.join("root-world");
+        std::fs::create_dir_all(root.join("dimensions/minecraft/overworld")).unwrap();
+        let err = format!("{:#}", root_map(&root).unwrap_err());
+        assert!(err.contains("dimensions/minecraft/overworld"), "{err}");
+
         // When the world comes back, nothing has changed and nothing re-renders.
         std::fs::remove_dir_all(&world).unwrap();
         std::fs::rename(&moved, &world).unwrap();
@@ -1751,9 +1807,14 @@ mod tests {
             ctx.batch_tiles = batch_tiles;
             ctx
         };
+        let mut told = None;
         let whole_pass = ctx("a", BATCH_TILES_PER_THREAD)
-            .render(&pool, false, |_| {})
+            .render_reporting(&pool, false, |total| told = Some(total), |_| {})
             .unwrap();
+        assert_eq!(
+            told,
+            Some(whole_pass.stats.tiles + whole_pass.stats.empty_tiles)
+        );
         let whole = snapshot(&base.join("a/maps/test"));
 
         // One region job per batch. Each batch publishes its tiles, with a
@@ -1764,6 +1825,7 @@ mod tests {
         let pass = ctx("b", 1)
             .render(&pool, false, |up| {
                 batches += 1;
+                assert!(up.progress.0 > 0 && up.progress.0 <= up.progress.1);
                 published.extend(up.hires.iter().copied());
                 assert_eq!(listed_hires(&map), hires_paths(&snapshot(&map)));
             })

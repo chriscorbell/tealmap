@@ -37,7 +37,7 @@ services:
       - /path/to/server:/worlds/main:ro
 ```
 
-Copy [`tealmap.example.toml`](tealmap.example.toml) to `tealmap.toml` and point each map's `world` at a dimension directory. To render once without serving, run `tealmap render`. Add `--full` to ignore saved state.
+Copy [`tealmap.example.toml`](tealmap.example.toml) to `tealmap.toml` and point each map's `world` at a dimension directory. The image runs as uid 1000, so create the data directory first with `mkdir data && chown 1000:1000 data`. If Docker creates it, root owns it and tealmap can't write there. To render once without serving, run `tealmap render`. Add `--full` to ignore saved state.
 
 If a map's world goes missing or has no region files left, tealmap logs an error and keeps the map's tiles until the world comes back. If the world is gone for good, stop the server, remove the map from the config, and delete its folder under `data/maps`. To start a map over from a world that's empty for now, delete its folder and keep it in the config.
 

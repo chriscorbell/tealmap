@@ -1,14 +1,17 @@
 import { Activity, ChevronDown, Layers } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Coords } from './Coords'
-import { type CameraState, type MapInfo, MapEngine, type Stats } from './map/engine'
+import { type CameraState, type LoadState, type MapInfo, MapEngine, type Stats, WebGL2Missing } from './map/engine'
 import { PinCard } from './PinCard'
 import { parseHash, type Pin } from './route'
+import { type MapStatus, statusLine } from './status'
 
 /** Moving less than this between press and release, in CSS pixels, counts as a click. */
 const CLICK_SLOP = { mouse: 5, other: 10 }
 const CLICK_MS = 500
 const NOTICE_MS = 6000
+const RETRY_FIRST_MS = 1000
+const RETRY_LAST_MS = 30_000
 /** How far the pin's card stays from the screen's edges, in CSS pixels. */
 const CARD_MARGIN = 8
 /** How far down the screen a card below its pin starts, to clear the top bars. */
@@ -32,8 +35,12 @@ export default function App() {
   const [bench] = useState(() => new URLSearchParams(location.search).has('bench'))
   const [statsOpen, setStatsOpen] = useState(bench)
   const [menu, setMenu] = useState(false)
+  /** Why the viewer can't run at all, or why the open map failed. */
   const [error, setError] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
+  const [noServer, setNoServer] = useState(false)
+  const [load, setLoad] = useState<LoadState>({ problem: null, opened: false, hasTiles: false })
+  const [statuses, setStatuses] = useState<Record<string, MapStatus>>({})
 
   const placeMarker = useCallback(() => {
     const el = markerRef.current
@@ -72,21 +79,38 @@ export default function App() {
   }
 
   useEffect(() => {
-    const engine = new MapEngine(canvasRef.current!, {
-      onStats: setStats,
-      // Straight to the DOM: this runs every frame the camera moves.
-      onCamera: (c: CameraState) => {
-        writeCoords(c)
-        placeMarker()
-      },
-      bench,
-    })
+    let engine: MapEngine
+    try {
+      engine = new MapEngine(canvasRef.current!, {
+        onStats: setStats,
+        // Straight to the DOM: this runs every frame the camera moves.
+        onCamera: (c: CameraState) => {
+          writeCoords(c)
+          placeMarker()
+        },
+        onLoadState: setLoad,
+        onMapStatus: (id, status) => setStatuses((all) => ({ ...all, [id]: status })),
+        bench,
+      })
+    } catch (e) {
+      console.error(e)
+      const why =
+        e instanceof WebGL2Missing
+          ? 'This map needs WebGL2, which this browser or device doesn’t provide.'
+          : 'This map’s renderer couldn’t start in this browser.'
+      queueMicrotask(() => setError(why))
+      return
+    }
     engineRef.current = engine
     ;(window as unknown as { tealmap: MapEngine }).tealmap = engine
 
     const open = (m: MapInfo, view: Parameters<MapEngine['setMap']>[1]) => {
       setCurrent(m)
-      engine.setMap(m, view).catch((e) => setError(String(e)))
+      setError(null)
+      engine.setMap(m, view).catch((e) => {
+        console.error(e)
+        setError('This map couldn’t be opened.')
+      })
     }
 
     // Startup, links pasted into the address bar and the Back button all come through here.
@@ -104,15 +128,27 @@ export default function App() {
       setPin(target ? (linked ?? null) : null)
     }
 
-    fetch('/api/maps')
-      .then((r) => r.json() as Promise<MapInfo[]>)
-      .then((list) => {
+    let closed = false
+    let retryTimer = 0
+    const loadMaps = async (retry: number) => {
+      try {
+        const res = await fetch('/api/maps')
+        if (!res.ok) throw new Error(`${res.status} ${res.statusText}`)
+        const list = (await res.json()) as MapInfo[]
+        if (closed) return
+        setNoServer(false)
         mapsRef.current = list
         setMaps(list)
-        if (!list.length) setError('No maps configured.')
-        else follow()
-      })
-      .catch((e) => setError(String(e)))
+        setStatuses(Object.fromEntries(list.flatMap((m) => (m.status ? [[m.id, m.status]] : []))))
+        follow()
+      } catch (e) {
+        if (closed) return
+        console.warn(`maps: ${e}`)
+        setNoServer(true)
+        retryTimer = window.setTimeout(() => loadMaps(Math.min(retry * 2, RETRY_LAST_MS)), retry)
+      }
+    }
+    void loadMaps(RETRY_FIRST_MS)
     // popstate comes first, in the same task as the URL changing, so no pending
     // write can replace the URL before it's read. hashchange covers the rest.
     window.addEventListener('popstate', follow)
@@ -125,6 +161,8 @@ export default function App() {
       window.removeEventListener('popstate', follow)
       window.removeEventListener('hashchange', follow)
       window.removeEventListener('keydown', escape)
+      closed = true
+      clearTimeout(retryTimer)
       engine.dispose()
     }
   }, [bench, placeMarker, writeCoords])
@@ -146,7 +184,11 @@ export default function App() {
     history.pushState(null, '', `#${m.id}`)
     setPin(null)
     setCurrent(m)
-    engine.setMap(m).catch((e) => setError(String(e)))
+    setError(null)
+    engine.setMap(m).catch((e) => {
+      console.error(e)
+      setError('This map couldn’t be opened.')
+    })
   }
 
   const goToCoords = (to: { x?: number; z?: number }) => {
@@ -192,6 +234,13 @@ export default function App() {
   }
 
   const loading = (stats?.pending ?? 0) > 0
+  const line = error
+    ? { text: error, alert: true }
+    : noServer
+      ? { text: 'Can’t reach the server. Retrying…', alert: true }
+      : notice
+        ? { text: notice, alert: false }
+        : statusLine(current?.name, load.problem, current ? statuses[current.id] : undefined, load.opened, load.hasTiles)
 
   return (
     <div className="app">
@@ -286,7 +335,11 @@ export default function App() {
         link={linkHere}
       />
 
-      {(error ?? notice) && <div className="error">{error ?? notice}</div>}
+      {line && (
+        <div className={`status ${line.alert ? 'alert' : ''}`} role="status">
+          {line.text}
+        </div>
+      )}
     </div>
   )
 }
