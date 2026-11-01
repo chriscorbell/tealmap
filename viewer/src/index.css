@@ -129,7 +129,14 @@ button {
   background: rgba(255, 255, 255, 0.08);
 }
 
+.picker-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .picker-button svg {
+  flex: none;
   color: var(--muted);
   transition: transform 0.25s var(--ease);
 }
@@ -285,6 +292,7 @@ button {
 .places li button {
   display: block;
   width: 100%;
+  overflow-wrap: anywhere;
   padding: 7px 8px;
   text-align: left;
   border-radius: 7px;
@@ -568,6 +576,12 @@ button {
     padding: 14px 10px;
   }
 
+  /* iOS zooms the page into any smaller field it focuses. */
+  .places input,
+  .coords input {
+    font-size: 16px;
+  }
+
   .places input {
     padding: 13px 10px;
   }
@@ -603,7 +617,22 @@ button {
     display: none;
   }
 
+  .picker-name {
+    /* What the bar on the right leaves, with three 44 px buttons in it. */
+    max-width: calc(100vw - 280px);
+  }
+
   .bottom-right {
     bottom: 76px;
+  }
+}
+
+@media (max-width: 360px) {
+  .brand {
+    display: none;
+  }
+
+  .picker-name {
+    max-width: calc(100vw - 250px);
   }
 }

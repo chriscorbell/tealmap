@@ -6,16 +6,20 @@ export interface Place {
   z: number
 }
 
+/** A name as far as searching goes: what it looks like on screen, in any case. */
+const comparable = (name: string) => name.normalize('NFC').toLowerCase().replace(/\s+/g, ' ').trim()
+
 /** The map's named places, narrowed down by typing. */
 export function Places({ places, open, go }: { places: Place[]; open: boolean; go: (place: Place) => void }) {
   const [query, setQuery] = useState('')
   const input = useRef<HTMLInputElement>(null)
   useEffect(() => {
-    if (open) input.current?.focus()
+    // On a touch screen that would raise a keyboard over the list.
+    if (open && !matchMedia('(pointer: coarse)').matches) input.current?.focus()
   }, [open])
   const found = useMemo(() => {
-    const q = query.trim().toLowerCase()
-    return q ? places.filter((p) => p.name.toLowerCase().includes(q)) : places
+    const q = comparable(query)
+    return q ? places.filter((p) => comparable(p.name).includes(q)) : places
   }, [places, query])
   const choose = (place: Place) => {
     setQuery('')
@@ -33,7 +37,8 @@ export function Places({ places, open, go }: { places: Place[]; open: boolean; g
         value={query}
         onChange={(e) => setQuery(e.target.value)}
         onKeyDown={(e) => {
-          if (e.key === 'Enter' && found[0]) choose(found[0])
+          // Enter in the middle of composing text is part of the composing.
+          if (e.key === 'Enter' && open && !e.repeat && !e.nativeEvent.isComposing && found[0]) choose(found[0])
         }}
       />
       {found.length > 0 ? (

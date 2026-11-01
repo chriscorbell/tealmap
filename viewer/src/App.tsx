@@ -201,7 +201,8 @@ export default function App() {
         else if (pinRef.current) setPin(null)
         return
       }
-      const typing = e.target instanceof HTMLElement && e.target.closest('input, textarea, select, [contenteditable]')
+      // In the list of places, the arrow keys scroll the list.
+      const typing = e.target instanceof HTMLElement && e.target.closest('input, textarea, select, [contenteditable], .places')
       if (typing || e.ctrlKey || e.metaKey || e.altKey) {
         // Whatever was held stops too, or the map would move under the typing.
         engine.releaseKeys()
@@ -386,7 +387,7 @@ export default function App() {
               aria-controls="maps"
               aria-label={`Map: ${current?.name ?? 'loading'}`}
             >
-              {current?.name ?? '…'}
+              <span className="picker-name">{current?.name ?? '…'}</span>
               <ChevronDown size={14} className={menu ? 'flip' : ''} />
             </button>
             <ul id="maps" className={`menu ${menu ? 'open' : ''}`}>
