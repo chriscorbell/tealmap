@@ -72,6 +72,8 @@ const MAX_COLORS: usize = 1 << 13;
 
 pub struct Settings {
     pub min_y: i32,
+    /// Blocks at this y and above aren't there, which is how a map sees under a roof.
+    pub max_y: i32,
     pub remove_caves_below_y: i32,
     /// Meshing a LOD tile: no halo faces, and the halo is a stand-in, not real blocks.
     pub lod: bool,
@@ -160,6 +162,10 @@ impl Volume {
                 }
             }
         }
+        yhi = yhi.min(settings.max_y - 1);
+        if yhi < ylo {
+            return false;
+        }
         self.x0 = x0;
         self.z0 = z0;
         self.y0 = ylo - 1;
@@ -214,7 +220,9 @@ impl Volume {
                     }
                     for ly in 0..16 {
                         let wy = sy0 + ly;
-                        if wy < self.y0 || wy >= self.y0 + self.h as i32 {
+                        // The layer over the cut stays as it started, air in full
+                        // sky light, so cut faces draw like any other surface.
+                        if wy < self.y0 || wy >= self.y0 + self.h as i32 || wy >= settings.max_y {
                             continue;
                         }
                         let vy = (wy - self.y0) as usize;
@@ -1391,6 +1399,56 @@ mod tests {
         })
     }
 
+    /// The top faces' heights in a tile of the made-up Nether, cut off at `max_y`.
+    fn nether_tops(max_y: i32) -> std::collections::BTreeSet<u16> {
+        let reg = registry();
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/nether/region/r.0.0.mca"
+        );
+        let region = crate::region::Region::open(std::path::Path::new(path), 0, 0).unwrap();
+        let (mut raw, mut buf, mut cache) = (Vec::new(), Vec::new(), Default::default());
+        let chunks: std::collections::BTreeMap<(i32, i32), crate::world::Chunk> = (0..16)
+            .map(|i| {
+                let (x, z) = (i % 4, i / 4);
+                assert!(region.read_chunk(x, z, &mut raw, &mut buf).unwrap());
+                let chunk = crate::world::decode_chunk(&buf, &reg, 0, &mut cache).unwrap();
+                ((x as i32, z as i32), chunk.unwrap())
+            })
+            .collect();
+        let s = Settings {
+            min_y: 0,
+            max_y,
+            remove_caves_below_y: 55,
+            lod: false,
+        };
+        let mut v = Volume::new();
+        assert!(v.fill(0, 0, &s, &reg, &|x, z| chunks.get(&(x, z))));
+        let tile = Mesher::new().mesh(&v, &reg, &s).unwrap();
+        decode(&tile)
+            .iter()
+            .filter(|q| q.dir == UP as usize)
+            // The tile's origin is one block under min_y.
+            .map(|q| q.y)
+            .collect()
+    }
+
+    #[test]
+    fn max_y_cuts_through_a_roof() {
+        // Heights count from one block under min_y, so the roof at y=127 is 128.
+        let uncut = nether_tops(320);
+        assert_eq!(uncut.iter().max(), Some(&128));
+
+        let cut = nether_tops(100);
+        assert_eq!(cut.iter().max(), Some(&100), "the top is y=99");
+        assert!(cut.contains(&100), "the cut itself draws");
+        // Cave floors and lava are still under it, to look down on.
+        assert!(
+            cut.iter().any(|&y| y < 100),
+            "no caves under the cut: {cut:?}"
+        );
+    }
+
     #[test]
     fn skirts_cover_ground_under_a_roof() {
         let reg = registry();
@@ -1412,6 +1470,7 @@ mod tests {
         assert!(v.fill_grid(&g, 0, 0, &reg, 2));
         let s = Settings {
             min_y: 0,
+            max_y: i32::MAX,
             remove_caves_below_y: i32::MIN,
             lod: true,
         };
@@ -1449,6 +1508,7 @@ mod tests {
         assert!(v.fill_grid(&g, 0, 0, &reg, 2));
         let s = Settings {
             min_y: 0,
+            max_y: i32::MAX,
             remove_caves_below_y: i32::MIN,
             lod: true,
         };

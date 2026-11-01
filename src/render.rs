@@ -154,6 +154,7 @@ impl MapCtx {
         std::fs::create_dir_all(&out)?;
         let settings = Settings {
             min_y: cfg.min_y,
+            max_y: cfg.max_y,
             remove_caves_below_y: cfg.remove_caves_below_y,
             lod: false,
         };

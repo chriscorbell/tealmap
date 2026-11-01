@@ -57,6 +57,7 @@ Append `?bench` to the viewer URL to render every frame and show the stats panel
 - Worlds from Minecraft 1.18 through 26.x. Both the `world/region` and `world/dimensions/<ns>/<dim>/region` layouts work.
 - Vanilla block models: variants, multipart, parent models, element and variant rotations, uvlock, and biome tints. Mod jars can supply biome colors.
 - Water and lava, waterlogging, saved sky and block light, and BlueMap-style cave removal.
+- The Nether and other dimensions with a roof, by cutting them at `max_y`. See [`tealmap.example.toml`](tealmap.example.toml).
 
 Not yet supported: block entities (chests, signs, beds), entities and players, markers, ambient occlusion, animated textures, resource packs, and mod block models. Blocks without a model render as magenta-checkered cubes.
 
