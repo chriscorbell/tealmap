@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 #[derive(Deserialize, Clone, Debug)]
@@ -35,10 +36,16 @@ pub struct MapConfig {
     pub min_y: i32,
     #[serde(default = "default_max_y")]
     pub max_y: i32,
+    /// Where the map starts and its Home button goes, as [x, z]. Defaults to the
+    /// middle of what's rendered.
+    pub start: Option<Vec<f64>>,
     /// Skip unlit blocks below this y and the ocean floor (BlueMap's default is 55).
     #[serde(default = "default_caves")]
     pub remove_caves_below_y: i32,
 }
+
+/// Further than any Minecraft world goes.
+const MAX_COORD: f64 = 30_000_000.0;
 
 fn default_listen() -> String {
     "0.0.0.0:8200".into()
@@ -62,7 +69,17 @@ impl Config {
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let cfg: Config =
             toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
-        for m in &cfg.maps {
+        cfg.validate()
+            .with_context(|| format!("checking {}", path.display()))?;
+        Ok(cfg)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.maps.is_empty() {
+            bail!("it has no [[maps]]");
+        }
+        let mut ids = HashSet::new();
+        for m in &self.maps {
             if m.id.is_empty()
                 || !m
                     .id
@@ -74,6 +91,26 @@ impl Config {
                     m.id
                 );
             }
+            if !ids.insert(&m.id) {
+                bail!("map id {:?} is used twice", m.id);
+            }
+            if m.min_y >= m.max_y {
+                bail!(
+                    "map {}: min_y ({}) must be below max_y ({})",
+                    m.id,
+                    m.min_y,
+                    m.max_y
+                );
+            }
+            if let Some(start) = &m.start {
+                let [x, z] = start[..] else {
+                    bail!("map {}: start is [x, z], with no y", m.id);
+                };
+                // Written this way round so NaN fails too.
+                if !(x.abs() <= MAX_COORD && z.abs() <= MAX_COORD) {
+                    bail!("map {}: start is outside any world", m.id);
+                }
+            }
             if m.max_y - m.min_y > 1000 {
                 bail!(
                     "map {}: world height over 1000 blocks isn't supported",
@@ -81,7 +118,26 @@ impl Config {
                 );
             }
         }
-        Ok(cfg)
+        Ok(())
+    }
+
+    /// Whether tiles can be written, to say so before any time goes on rendering.
+    /// Not always fatal: a read-only root can hold writable map directories.
+    pub fn check_data_dir(&self) -> Result<()> {
+        let hint = "In the container image tealmap runs as uid 1000, so the directory must belong to that user";
+        let dir = &self.data_dir;
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("can't create {}. {hint}", dir.display()))?;
+        let probe = dir.join(format!(".tealmap-write-check-{}", std::process::id()));
+        // Only ever a new file: a name that's somehow taken isn't this check's to touch.
+        match std::fs::File::create_new(&probe) {
+            Ok(_) => {
+                let _ = std::fs::remove_file(&probe);
+                Ok(())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(e) => Err(e).with_context(|| format!("can't write to {}. {hint}", dir.display())),
+        }
     }
 
     pub fn threads(&self) -> usize {
@@ -98,5 +154,36 @@ impl Config {
 impl MapConfig {
     pub fn display_name(&self) -> &str {
         self.name.as_deref().unwrap_or(&self.id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn error(body: &str) -> String {
+        let cfg: Config = toml::from_str(&format!("data_dir = \"/tmp/x\"\n{body}")).unwrap();
+        format!("{:#}", cfg.validate().unwrap_err())
+    }
+
+    #[test]
+    fn rejects_configs_that_cant_work() {
+        assert!(error("maps = []").contains("no [[maps]]"));
+        let map = |id: &str, extra: &str| {
+            format!("[[maps]]\nid = \"{id}\"\nworld = \"/w\"\nversion = \"26.2\"\n{extra}\n")
+        };
+        let twice = format!("{}{}", map("a", ""), map("a", ""));
+        assert!(error(&twice).contains("used twice"));
+        assert!(error(&map("a", "min_y = 10\nmax_y = 10")).contains("must be below"));
+        assert!(error(&map("a", "min_y = 0\nmax_y = 2000")).contains("over 1000"));
+        assert!(error(&map("a/b", "")).contains("only letters"));
+        assert!(error(&map("a", "start = [40000000, 0]")).contains("outside"));
+        assert!(error(&map("a", "start = [nan, 0]")).contains("outside"));
+        assert!(error(&map("a", "start = [120, 64, -340]")).contains("no y"));
+        assert!(error(&map("a", "start = [5]")).contains("no y"));
+
+        let good = format!("data_dir = \"/tmp/x\"\n{}{}", map("a", ""), map("b", ""));
+        let cfg: Config = toml::from_str(&good).unwrap();
+        cfg.validate().unwrap();
     }
 }

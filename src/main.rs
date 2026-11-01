@@ -52,6 +52,10 @@ fn main() -> Result<()> {
         .init();
     let cli = Cli::parse();
     let cfg = config::Config::load(&cli.config)?;
+    // Maps that can't write fail as they render, and `serve` still has their tiles.
+    if let Err(e) = cfg.check_data_dir() {
+        tracing::warn!("{e:#}");
+    }
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(cfg.threads())
         .thread_name(|i| format!("render-{i}"))

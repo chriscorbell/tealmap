@@ -1,6 +1,7 @@
 import { Box3, Frustum, MathUtils, Matrix4, PerspectiveCamera, Vector3 } from 'three'
 import { MapControls } from 'three/examples/jsm/controls/MapControls.js'
 import { formatHash, type Pin, type View } from '../route'
+import type { MapStatus, Problem } from '../status'
 import { type Mesh, Pass, Renderer } from './renderer'
 import { NO_TOP } from './tile'
 import type { Request, Response } from './worker'
@@ -8,6 +9,16 @@ import type { Request, Response } from './worker'
 export interface MapInfo {
   id: string
   name: string
+  status?: MapStatus
+  /** Where the map starts and Home goes, as [x, z], if it's set. */
+  start?: [number, number]
+}
+
+/** How the map being shown is doing, as far as the viewer can tell. */
+export interface LoadState {
+  problem: Problem
+  opened: boolean
+  hasTiles: boolean
 }
 
 interface Manifest {
@@ -44,6 +55,8 @@ export interface CameraState {
   x: number
   y: number
   z: number
+  /** Which way the camera is turned, in degrees. North is up at 0. */
+  az: number
 }
 
 const BG = [0x0b / 255, 0x14 / 255, 0x16 / 255]
@@ -67,6 +80,28 @@ const KEEP_MS = 10_000
 /** Idle frames before the loop sleeps, and how often it wakes to plan. */
 const IDLE_FRAMES = 30
 const SLEEP_MS = 1000
+/** Retries while the server can't be reached double from the first to the last. */
+const RETRY_FIRST_MS = 1000
+const RETRY_LAST_MS = 30_000
+/** How often to look for a map whose first render hasn't started. */
+const WAIT_MS = 3000
+/** How long tiles have to keep failing before that's worth saying. */
+const TILES_FAILING_MS = 10_000
+/** How far past the mapped area the camera can look, in blocks. */
+const PAN_MARGIN = 128
+const START_DIST = 900
+const START_AZ = 35
+const START_POLAR = 50
+/** What each held key does, per second: moves a share of the view, or turns in degrees. */
+const KEY_PAN = 0.9
+const KEY_TURN = 70
+const KEY_TILT = 45
+const KEY_ZOOM = 1.6
+const MAX_KEY_STEP_MS = 250
+/** How far two fingers have to twist before it counts as rotating, in radians. */
+const TWIST_START = 0.14
+/** Top-down, just off vertical so north stays up. */
+const TOP_DOWN_POLAR = 1
 /** How long the camera takes to move to somewhere nearby. */
 const FLY_MS = 600
 /** Longest a ray goes looking for terrain, in steps. */
@@ -104,6 +139,12 @@ const overlap = (a: Tile, b: Tile) => {
   return fine.x >> up === coarse.x && fine.z >> up === coarse.z
 }
 const CHILD_OFFSETS = [[0, 0], [1, 0], [0, 1], [1, 1]]
+const KEYS = new Set([
+  'KeyW', 'KeyA', 'KeyS', 'KeyD',
+  'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight',
+  'KeyQ', 'KeyE', 'KeyR', 'KeyF',
+  'Equal', 'NumpadAdd', 'Minus', 'NumpadSubtract',
+])
 const EMPTY_KIDS: [number, number, number][] = []
 
 class Workers {
@@ -145,6 +186,9 @@ class Workers {
   }
 }
 
+
+/** Thrown when the browser or device can't give the viewer the graphics it needs. */
+export class WebGL2Missing extends Error {}
 
 export class MapEngine {
   readonly camera: PerspectiveCamera
@@ -192,6 +236,15 @@ export class MapEngine {
   private triangles = 0
   private onStats: (s: Stats) => void
   private onCamera: (c: CameraState) => void
+  private onLoadState: (s: LoadState) => void
+  private onMapStatus: (id: string, s: MapStatus) => void
+  private problem: Problem = null
+  /** When tiles started failing without any loading in between, or 0. */
+  private failingSince = 0
+  private refreshTimer = 0
+  private reconnectTimer = 0
+  /** The GPU context is gone until the browser gives it back. */
+  private lost = false
   private hashTimer = 0
   private gpuTimer: GpuTimer | null = null
   private pin: Pin | null = null
@@ -199,6 +252,11 @@ export class MapEngine {
   /** Where to start once the map being opened has loaded. */
   private startView: View | undefined
   private point = new Vector3()
+  /** What's mapped, in blocks, with some room around it. */
+  private bounds: { minX: number; maxX: number; minZ: number; maxZ: number } | null = null
+  private keys = new Set<string>()
+  private lastFrame = 0
+  private twist: { angle: number; turned: number; engaged: boolean } | null = null
 
   private canvas: HTMLCanvasElement
   private disposed = false
@@ -218,11 +276,19 @@ export class MapEngine {
 
   constructor(
     canvas: HTMLCanvasElement,
-    opts: { onStats: (s: Stats) => void; onCamera: (c: CameraState) => void; bench?: boolean },
+    opts: {
+      onStats: (s: Stats) => void
+      onCamera: (c: CameraState) => void
+      onLoadState: (s: LoadState) => void
+      onMapStatus: (id: string, s: MapStatus) => void
+      bench?: boolean
+    },
   ) {
     this.canvas = canvas
     this.onStats = opts.onStats
     this.onCamera = opts.onCamera
+    this.onLoadState = opts.onLoadState
+    this.onMapStatus = opts.onMapStatus
     this.bench = opts.bench ?? false
     const gl = canvas.getContext('webgl2', {
       // On a high-density screen, edges are already fine, and multisampling
@@ -232,7 +298,10 @@ export class MapEngine {
       stencil: false,
       powerPreference: 'high-performance',
     })
-    if (!gl) throw new Error('WebGL2 is not available')
+    if (!gl) {
+      this.workers.dispose()
+      throw new WebGL2Missing()
+    }
     this.gl = gl
     this.renderer = new Renderer(gl)
     gl.clearColor(BG[0], BG[1], BG[2], 1)
@@ -262,6 +331,12 @@ export class MapEngine {
     this.resize()
     window.addEventListener('resize', this.resize)
     for (const event of ['pointerdown', 'wheel', 'touchstart']) canvas.addEventListener(event, this.wake, { passive: true })
+    canvas.addEventListener('webglcontextlost', this.contextLost)
+    canvas.addEventListener('webglcontextrestored', this.contextRestored)
+    canvas.addEventListener('touchstart', this.twistMove, { passive: true })
+    canvas.addEventListener('touchmove', this.twistMove, { passive: true })
+    canvas.addEventListener('touchend', this.twistMove, { passive: true })
+    canvas.addEventListener('touchcancel', this.twistMove, { passive: true })
     this.raf = requestAnimationFrame(this.frame)
   }
 
@@ -271,13 +346,61 @@ export class MapEngine {
     cancelAnimationFrame(this.raf)
     clearTimeout(this.sleepTimer)
     clearTimeout(this.hashTimer)
+    clearTimeout(this.refreshTimer)
+    clearTimeout(this.reconnectTimer)
     window.removeEventListener('resize', this.resize)
     for (const event of ['pointerdown', 'wheel', 'touchstart']) this.canvas.removeEventListener(event, this.wake)
+    this.canvas.removeEventListener('webglcontextlost', this.contextLost)
+    this.canvas.removeEventListener('webglcontextrestored', this.contextRestored)
+    for (const event of ['touchstart', 'touchmove', 'touchend', 'touchcancel']) this.canvas.removeEventListener(event, this.twistMove as EventListener)
     this.events?.close()
     this.clearTiles()
     this.workers.dispose()
     this.controls.dispose()
     this.renderer.dispose()
+  }
+
+  /** Asking for the event's default not to happen is how a page says it'll rebuild. */
+  private contextLost = (e: Event) => {
+    e.preventDefault()
+    // A camera nobody has moved stays free to frame the map as tiles arrive.
+    if (this.ready) this.startView = this.autoView ? undefined : (this.flight?.to ?? this.view())
+    this.lost = true
+    // Browsers paint a lost canvas white, whatever is behind it.
+    this.canvas.style.visibility = 'hidden'
+    this.generation++
+    this.ready = false
+    cancelAnimationFrame(this.raf)
+    clearTimeout(this.sleepTimer)
+    clearTimeout(this.refreshTimer)
+    this.asleep = true
+    this.clearTiles()
+    this.setProblem('lost')
+  }
+
+  /** Everything on the GPU went with the context: tiles and textures load again, from the HTTP cache. */
+  private contextRestored = () => {
+    this.lost = false
+    this.canvas.style.visibility = ''
+    this.problem = null
+    this.renderer = new Renderer(this.gl)
+    this.gl.clearColor(BG[0], BG[1], BG[2], 1)
+    if (this.gpuTimer) this.gpuTimer = GpuTimer.create(this.gl)
+    // Before resizing, which would otherwise wake a sleeping loop into a second one.
+    this.asleep = false
+    this.idleFrames = 0
+    this.raf = requestAnimationFrame(this.frame)
+    this.resize()
+    if (this.map) void this.setMap(this.map, this.startView)
+  }
+
+  private setProblem(problem: Problem) {
+    this.problem = problem
+    this.reportLoadState()
+  }
+
+  private reportLoadState() {
+    this.onLoadState({ problem: this.problem, opened: this.ready, hasTiles: this.masks.size > 0 })
   }
 
   private resize = () => {
@@ -296,6 +419,8 @@ export class MapEngine {
   async setMap(map: MapInfo, view?: View) {
     if (this.disposed) return
     const gen = ++this.generation
+    clearTimeout(this.refreshTimer)
+    this.keys.clear()
     this.clearTiles()
     this.map = map
     this.flight = null
@@ -307,25 +432,18 @@ export class MapEngine {
     this.startView = view
     // Subscribe first so an update published while loading isn't missed.
     this.listen()
-    let manifest: Manifest
-    // A fresh server publishes each map once its first render starts, and the
-    // textures come with it. Asking for both at once saves a round trip.
-    let textures = fetch(`/maps/${map.id}/textures.bin`)
-    for (;;) {
-      const res = await fetch(`/maps/${map.id}/map.json`, { cache: 'no-cache' })
-      if (gen !== this.generation) return
-      if (res.ok) {
-        manifest = await res.json()
-        break
-      }
-      await new Promise((r) => setTimeout(r, 3000))
-      textures = fetch(`/maps/${map.id}/textures.bin`)
-    }
-    const texData = new Uint8Array(await (await textures).arrayBuffer())
-    if (gen !== this.generation) return
+    this.masks = new Map()
+    this.failingSince = 0
+    // It opens when the context comes back.
+    if (this.lost) return
+    this.setProblem(null)
+    const loaded = await this.fetchMap(map, gen)
+    if (!loaded || gen !== this.generation) return
+    const [manifest, texData] = loaded
     this.setManifest(manifest)
     this.renderer.setBlockTextures(texData, manifest.textures)
     this.ready = true
+    this.setProblem(null)
 
     const start = this.startView
     if (start) this.placeCamera(start.x, start.z, start.dist, start.az, start.polar)
@@ -335,11 +453,55 @@ export class MapEngine {
     this.wake()
   }
 
+  /**
+   * A map's manifest and textures, once it has them. A fresh server publishes each
+   * map once its first render starts, and the textures come with it, so asking for
+   * both at once saves a round trip. Returns null if another map got opened meanwhile.
+   */
+  private async fetchMap(map: MapInfo, gen: number): Promise<[Manifest, Uint8Array] | null> {
+    let retry = RETRY_FIRST_MS
+    for (;;) {
+      let problem: Problem = 'unreachable'
+      try {
+        const [res, tex] = await Promise.all([fetch(`/maps/${map.id}/map.json`, { cache: 'no-cache' }), fetch(`/maps/${map.id}/textures.bin`)])
+        if (gen !== this.generation) return null
+        if (res.ok && tex.ok) return [(await res.json()) as Manifest, new Uint8Array(await tex.arrayBuffer())]
+        // Only a map with no render yet is expected to be missing.
+        if (res.status === 404 || tex.status === 404) problem = 'waiting'
+      } catch (e) {
+        if (gen !== this.generation) return null
+        console.warn(`map ${map.id}: ${e}`)
+      }
+      this.setProblem(problem)
+      const delay = problem === 'waiting' ? WAIT_MS : retry
+      if (problem !== 'waiting') retry = Math.min(retry * 2, RETRY_LAST_MS)
+      else retry = RETRY_FIRST_MS
+      await new Promise((r) => setTimeout(r, delay))
+      if (gen !== this.generation) return null
+    }
+  }
+
   private setManifest(m: Manifest) {
     this.manifest = m
     // A level 1–3 node is a 2^(3-level) grid cell of a region's mask, so masks
     // answer those without a set. Only nodes bigger than a region need one.
     this.masks = new Map((m.hires ?? []).map(([rx, rz, lo, hi]) => [key(0, rx, rz), [lo, hi]]))
+    let bounds: { minX: number; maxX: number; minZ: number; maxZ: number } | null = null
+    this.forEachHires(m, (x, z) => {
+      bounds ??= { minX: x, maxX: x, minZ: z, maxZ: z }
+      bounds.minX = Math.min(bounds.minX, x)
+      bounds.maxX = Math.max(bounds.maxX, x)
+      bounds.minZ = Math.min(bounds.minZ, z)
+      bounds.maxZ = Math.max(bounds.maxZ, z)
+    })
+    // TypeScript can't see the callback assign it.
+    const tiles = bounds as { minX: number; maxX: number; minZ: number; maxZ: number } | null
+    this.bounds = tiles && {
+      minX: tiles.minX * TILE - PAN_MARGIN,
+      maxX: (tiles.maxX + 1) * TILE + PAN_MARGIN,
+      minZ: tiles.minZ * TILE - PAN_MARGIN,
+      maxZ: (tiles.maxZ + 1) * TILE + PAN_MARGIN,
+    }
     this.bigNodes = new Set()
     this.roots = []
     let row: [number, number][] = (m.hires ?? []).map(([rx, rz]) => [rx, rz])
@@ -390,6 +552,7 @@ export class MapEngine {
       if (!listed) this.dropTile(t)
     }
     this.lastPlan = 0
+    this.reportLoadState()
   }
 
   /** Visits every LOD node. Only for rare, whole-map work. */
@@ -402,23 +565,27 @@ export class MapEngine {
     for (const [x, z] of this.roots) walk(m.lodLevels, x, z)
   }
 
-  /** Starts over the mapped tile closest to the middle of everything mapped. */
-  private placeDefault() {
+  /** Visits every hires tile a manifest lists. */
+  private forEachHires(m: Manifest, f: (x: number, z: number) => void) {
+    for (const [rx, rz, lo, hi] of m.hires ?? []) {
+      for (let bit = 0; bit < 64; bit++) {
+        if (((bit < 32 ? lo : hi) >>> (bit & 31)) & 1) f(rx * 8 + (bit & 7), rz * 8 + (bit >> 3))
+      }
+    }
+  }
+
+  /** Where the map starts: its configured spot, or the mapped tile closest to the middle of everything mapped. */
+  homeView(): View {
+    const view = (x: number, z: number) => ({ x, z, dist: START_DIST, az: START_AZ, polar: START_POLAR })
+    if (this.map?.start) return view(this.map.start[0], this.map.start[1])
     const m = this.manifest
     // Hires tiles always exist where anything is mapped; LOD meshes may not.
     const hires = m?.hires ?? []
-    if (!hires.length) return this.placeCamera(0, 0, 520, 35, 50)
+    if (!hires.length) return { ...view(0, 0), dist: 520 }
     let cx = 0
     let cz = 0
     let n = 0
-    const each = (f: (x: number, z: number) => void) => {
-      for (const [rx, rz, lo, hi] of hires) {
-        for (let bit = 0; bit < 64; bit++) {
-          if (((bit < 32 ? lo : hi) >>> (bit & 31)) & 1) f(rx * 8 + (bit & 7), rz * 8 + (bit >> 3))
-        }
-      }
-    }
-    each((x, z) => {
+    this.forEachHires(m!, (x, z) => {
       cx += x
       cz += z
       n++
@@ -427,19 +594,149 @@ export class MapEngine {
     cz /= n
     let best = [0, 0]
     let bestD = Infinity
-    each((x, z) => {
+    this.forEachHires(m!, (x, z) => {
       const d = (x - cx) ** 2 + (z - cz) ** 2
       if (d < bestD) {
         bestD = d
         best = [x, z]
       }
     })
-    this.placeCamera((best[0] + 0.5) * TILE, (best[1] + 0.5) * TILE, 900, 35, 50)
+    return view((best[0] + 0.5) * TILE, (best[1] + 0.5) * TILE)
+  }
+
+  private placeDefault() {
+    const v = this.homeView()
+    this.placeCamera(v.x, v.z, v.dist, v.az, v.polar)
+  }
+
+  /** Keeps the view on the map, however it got pointed elsewhere. */
+  private clampTarget() {
+    const b = this.bounds
+    if (!b) return
+    const t = this.controls.target
+    const dx = Math.min(Math.max(t.x, b.minX), b.maxX) - t.x
+    const dz = Math.min(Math.max(t.z, b.minZ), b.maxZ) - t.z
+    // Past rounding error only: correcting that would keep a resting map drawing.
+    if (Math.abs(dx) < 1e-6 && Math.abs(dz) < 1e-6) return
+    t.x += dx
+    t.z += dz
+    this.camera.position.x += dx
+    this.camera.position.z += dz
+    this.dirty = true
+    this.lastPlan = 0
+    this.scheduleHash()
+  }
+
+  /** Starts doing what a key does, if it does anything. Returns whether it does. */
+  keyDown(code: string) {
+    if (!KEYS.has(code)) return false
+    if (!this.ready) return true
+    if (!this.keys.size) this.stopInertia()
+    this.keys.add(code)
+    this.autoView = false
+    this.flight = null
+    this.lastFrame = 0
+    this.wake()
+    return true
+  }
+
+  /** A key repeating: nothing to start, but the browser mustn't act on it either. */
+  keyHeld(code: string) {
+    return KEYS.has(code)
+  }
+
+  keyUp(code: string) {
+    this.keys.delete(code)
+  }
+
+  releaseKeys() {
+    this.keys.clear()
+  }
+
+  private stepKeys(now: number) {
+    const dt = Math.min(now - (this.lastFrame || now - 16), MAX_KEY_STEP_MS) / 1000
+    const held = (...codes: string[]) => codes.some((c) => this.keys.has(c))
+    const axis = (plus: string[], minus: string[]) => (held(...plus) ? 1 : 0) - (held(...minus) ? 1 : 0)
+    const t = this.controls.target
+    const off = this.camera.position.clone().sub(t)
+    let dist = off.length()
+    let az = Math.atan2(off.x, off.z)
+    let polar = Math.acos(MathUtils.clamp(off.y / dist, -1, 1))
+    const forward = axis(['KeyW', 'ArrowUp'], ['KeyS', 'ArrowDown']) * dist * KEY_PAN * dt
+    const right = axis(['KeyD', 'ArrowRight'], ['KeyA', 'ArrowLeft']) * dist * KEY_PAN * dt
+    const x = t.x - Math.sin(az) * forward + Math.cos(az) * right
+    const z = t.z - Math.cos(az) * forward - Math.sin(az) * right
+    az += MathUtils.degToRad(axis(['KeyE'], ['KeyQ']) * KEY_TURN * dt)
+    polar += MathUtils.degToRad(axis(['KeyF'], ['KeyR']) * KEY_TILT * dt)
+    polar = MathUtils.clamp(polar, MathUtils.degToRad(TOP_DOWN_POLAR), this.controls.maxPolarAngle)
+    dist *= Math.exp(axis(['Minus', 'NumpadSubtract'], ['Equal', 'NumpadAdd']) * KEY_ZOOM * dt)
+    dist = MathUtils.clamp(dist, this.controls.minDistance, this.controls.maxDistance)
+    this.placeCamera(x, z, dist, MathUtils.radToDeg(az), MathUtils.radToDeg(polar), t.y)
+    this.dirty = true
+  }
+
+  /** Twisting two fingers turns the map with them. Pinching and dragging stay with the controls. */
+  private twistMove = (e: TouchEvent) => {
+    // Only fingers on the map: one resting on a button is no part of this.
+    if (e.targetTouches.length !== 2) {
+      this.twist = null
+      this.controls.enableRotate = true
+      return
+    }
+    const [a, b] = [e.targetTouches[0], e.targetTouches[1]]
+    const angle = Math.atan2(b.clientY - a.clientY, b.clientX - a.clientX)
+    if (!this.twist) {
+      this.twist = { angle, turned: 0, engaged: false }
+      return
+    }
+    // The short way round.
+    const delta = Math.atan2(Math.sin(angle - this.twist.angle), Math.cos(angle - this.twist.angle))
+    this.twist.angle = angle
+    this.twist.turned += delta
+    if (!this.twist.engaged && Math.abs(this.twist.turned) > TWIST_START) {
+      this.twist.engaged = true
+      // The controls read the same fingers' midpoint as rotating and tilting. Twisting
+      // around one still finger moves that midpoint in a circle, so it's one or the
+      // other, and what they'd already started stops too.
+      this.controls.enableRotate = false
+      this.stopInertia()
+    }
+    if (!this.twist.engaged || !this.ready) return
+    const t = this.controls.target
+    const off = this.camera.position.clone().sub(t)
+    const dist = off.length()
+    const polar = Math.acos(MathUtils.clamp(off.y / dist, -1, 1))
+    const az = Math.atan2(off.x, off.z) + delta
+    this.autoView = false
+    this.placeCamera(t.x, t.z, dist, MathUtils.radToDeg(az), MathUtils.radToDeg(polar), t.y)
+    this.dirty = true
+    this.wake()
+  }
+
+  /** Eases to north up. Already there, it goes top-down, and from top-down back to a slant. */
+  pointNorth() {
+    if (!this.ready) return
+    const v = this.view()
+    const north = Math.abs(v.az) < 1
+    const top = v.polar <= TOP_DOWN_POLAR + 1
+    this.flyTo({ ...v, az: 0, polar: !north ? v.polar : top ? START_POLAR : TOP_DOWN_POLAR })
   }
 
   private async refreshManifest(gen: number) {
+    if (gen !== this.generation) return
     this.pendingUpdate = false
-    const m: Manifest = await (await fetch(`/maps/${this.map!.id}/map.json`, { cache: 'no-cache' })).json()
+    clearTimeout(this.refreshTimer)
+    let m: Manifest
+    try {
+      const res = await fetch(`/maps/${this.map!.id}/map.json`, { cache: 'no-cache' })
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`)
+      m = await res.json()
+    } catch (e) {
+      // The map on screen is still good. Try again in a while.
+      console.warn(`map ${this.map?.id}: ${e}`)
+      if (gen === this.generation) this.refreshTimer = window.setTimeout(() => this.refreshManifest(gen), WAIT_MS)
+      return
+    }
     if (gen !== this.generation || !this.manifest) return
     const wasEmpty = this.masks.size === 0
     this.setManifest(m)
@@ -502,6 +799,12 @@ export class MapEngine {
   /** Moves to a view as a step the browser's Back button undoes. */
   jumpTo(to: View) {
     if (!this.map) return
+    // Going nowhere isn't a step to go back from, and the map's edge stops a view.
+    const b = this.bounds
+    if (b) to = { ...to, x: Math.min(Math.max(to.x, b.minX), b.maxX), z: Math.min(Math.max(to.z, b.minZ), b.maxZ) }
+    to = { ...to, x: Math.round(to.x), z: Math.round(to.z) }
+    const here = this.flight?.to ?? this.view()
+    if (to.x === here.x && to.z === here.z && to.dist === here.dist && to.az === here.az && to.polar === here.polar) return
     this.cancelHashWrite()
     history.replaceState(null, '', this.hash())
     history.pushState(null, '', formatHash(this.map.id, to, this.pin))
@@ -630,8 +933,13 @@ export class MapEngine {
   }
 
   private listen() {
+    clearTimeout(this.reconnectTimer)
     this.events?.close()
     const es = new EventSource('/api/events')
+    es.addEventListener('status', (e) => {
+      const msg = JSON.parse((e as MessageEvent).data) as { map: string; status: MapStatus }
+      this.onMapStatus(msg.map, msg.status)
+    })
     es.addEventListener('update', (e) => {
       const msg = JSON.parse((e as MessageEvent).data) as {
         map: string
@@ -650,6 +958,13 @@ export class MapEngine {
       // Revalidate resident tiles too; unchanged ones come back as 304s.
       for (const t of this.tiles.values()) t.stale = true
       this.refreshManifest(this.generation)
+    }
+    // A browser reconnects by itself after a dropped stream, but gives up for good
+    // on an error response, like a proxy's during a restart.
+    es.onerror = () => {
+      if (es.readyState !== EventSource.CLOSED || this.events !== es || this.disposed) return
+      clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = window.setTimeout(() => this.listen(), WAIT_MS)
     }
     this.events = es
   }
@@ -797,6 +1112,11 @@ export class MapEngine {
     }
     for (const t of off) t.drawn = false
     this.visible = [...draw]
+    // Whatever kept failing, the map no longer wants it.
+    if (this.problem === 'unreachable' && ![...this.tiles.values()].some((t) => t.retryAt > 0)) {
+      this.failingSince = 0
+      this.setProblem(null)
+    }
     for (const t of this.fading) if (!t.drawn && t.mesh) this.visible.push(t)
     this.visible.sort((a, b) => a.distance - b.distance)
 
@@ -869,6 +1189,12 @@ export class MapEngine {
       this.wake()
       if (res.kind === 'error') {
         console.warn(`tile ${level}:${x},${z}: ${res.message}`)
+        // One tile that won't decode isn't the server being away.
+        if (!res.arrived) {
+          const failed = performance.now()
+          this.failingSince ||= failed
+          if (failed - this.failingSince > TILES_FAILING_MS && !this.problem) this.setProblem('unreachable')
+        }
         // Keep an old mesh; with nothing to show, retry later instead of
         // treating the tile as empty and leaving a hole.
         if (tile.mesh) tile.state = 'ready'
@@ -879,6 +1205,9 @@ export class MapEngine {
         return
       }
       if (res.kind !== 'tile') return
+      tile.retryAt = 0
+      this.failingSince = 0
+      if (this.problem === 'unreachable') this.setProblem(null)
       this.downloaded += res.bytes
       if (!res.tile) {
         this.fading.delete(tile)
@@ -968,7 +1297,7 @@ export class MapEngine {
   // ---------------------------------------------------------------- frame
 
   private sleepTick = () => {
-    if (this.disposed) return
+    if (this.disposed || this.lost) return
     this.plan(performance.now())
     if (this.planWants || this.dirty) this.wake()
     else this.sleepTimer = window.setTimeout(this.sleepTick, SLEEP_MS)
@@ -977,7 +1306,7 @@ export class MapEngine {
   private wake = () => {
     clearTimeout(this.sleepTimer)
     this.idleFrames = 0
-    if (!this.asleep || this.disposed) return
+    if (!this.asleep || this.disposed || this.lost) return
     this.asleep = false
     this.raf = requestAnimationFrame(this.frame)
   }
@@ -997,8 +1326,11 @@ export class MapEngine {
 
   private frame = (now: number) => {
     this.raf = requestAnimationFrame(this.frame)
+    if (this.keys.size) this.stepKeys(now)
+    this.lastFrame = now
     if (this.flight) this.stepFlight(now)
     const moved = this.controls.update()
+    this.clampTarget()
 
     // Nothing is closer than the top of the world, so the near plane can follow
     // the camera up. Depth precision depends on it: at a whole-map view, a near
@@ -1049,7 +1381,8 @@ export class MapEngine {
       this.frameMsAcc += performance.now() - t0
       this.frames++
       this.dirty = false
-      this.onCamera({ x: t.x, y: t.y, z: t.z })
+      const off = this.camera.position
+      this.onCamera({ x: t.x, y: t.y, z: t.z, az: MathUtils.radToDeg(Math.atan2(off.x - t.x, off.z - t.z)) })
     }
 
     if (now - this.lastStats > 1000) this.reportStats(now)

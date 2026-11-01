@@ -1,18 +1,32 @@
-import { Activity, ChevronDown, Layers } from 'lucide-react'
+import { Activity, ChevronDown, CircleHelp, House, Layers, Navigation2 } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Coords } from './Coords'
-import { type CameraState, type MapInfo, MapEngine, type Stats } from './map/engine'
+import { Help } from './Help'
+import { type CameraState, type LoadState, type MapInfo, MapEngine, type Stats, WebGL2Missing } from './map/engine'
 import { PinCard } from './PinCard'
 import { parseHash, type Pin } from './route'
+import { type MapStatus, statusLine } from './status'
 
 /** Moving less than this between press and release, in CSS pixels, counts as a click. */
 const CLICK_SLOP = { mouse: 5, other: 10 }
 const CLICK_MS = 500
 const NOTICE_MS = 6000
+const RETRY_FIRST_MS = 1000
+const RETRY_LAST_MS = 30_000
 /** How far the pin's card stays from the screen's edges, in CSS pixels. */
 const CARD_MARGIN = 8
 /** How far down the screen a card below its pin starts, to clear the top bars. */
 const CARD_CLEAR_TOP = 64
+
+/**
+ * Letters and arrows go by where they are on the keyboard, like in the game. Plus
+ * and minus go by what they say, since they're somewhere else on many layouts.
+ */
+function keyCode(e: KeyboardEvent) {
+  if (e.key === '+' || e.key === '=') return 'Equal'
+  if (e.key === '-' || e.key === '_') return 'Minus'
+  return e.code
+}
 
 export default function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null)
@@ -21,6 +35,9 @@ export default function App() {
   const xRef = useRef<HTMLInputElement>(null)
   const yRef = useRef<HTMLElement>(null)
   const zRef = useRef<HTMLInputElement>(null)
+  const compassRef = useRef<HTMLSpanElement>(null)
+  const pickerRef = useRef<HTMLDivElement>(null)
+  const pickerButtonRef = useRef<HTMLButtonElement>(null)
   const markerRef = useRef<HTMLDivElement>(null)
   const pinRef = useRef<Pin | null>(null)
   const pressRef = useRef<{ id: number; x: number; y: number; at: number; kind: string } | null>(null)
@@ -30,10 +47,22 @@ export default function App() {
   const [stats, setStats] = useState<Stats | null>(null)
   const [pin, setPinState] = useState<Pin | null>(null)
   const [bench] = useState(() => new URLSearchParams(location.search).has('bench'))
-  const [statsOpen, setStatsOpen] = useState(bench)
+  const [panel, setPanel] = useState<'stats' | 'help' | null>(bench ? 'stats' : null)
   const [menu, setMenu] = useState(false)
+  /** Why the viewer can't run at all, or why the open map failed. */
   const [error, setError] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
+  const [noServer, setNoServer] = useState(false)
+  const [load, setLoad] = useState<LoadState>({ problem: null, opened: false, hasTiles: false })
+  const [statuses, setStatuses] = useState<Record<string, MapStatus>>({})
+
+  // For the listeners set up once, which would otherwise only see the first value.
+  const menuRef = useRef(menu)
+  const panelRef = useRef(panel)
+  useEffect(() => {
+    menuRef.current = menu
+    panelRef.current = panel
+  }, [menu, panel])
 
   const placeMarker = useCallback(() => {
     const el = markerRef.current
@@ -48,15 +77,17 @@ export default function App() {
     el.style.visibility = onScreen ? 'visible' : 'hidden'
     if (!onScreen) return
     el.style.transform = `translate(${at.x}px, ${at.y}px)`
-    el.classList.toggle('below', at.y < 90)
+    const card = el.querySelector<HTMLElement>('.pin-card')
+    const above = (card?.offsetHeight ?? 0) + (el.querySelector<HTMLElement>('.pin-mark')?.offsetHeight ?? 0) + 14
+    el.classList.toggle('below', at.y < above)
     // Under the top bars, a card's buttons couldn't be reached.
     el.style.setProperty('--drop', `${Math.max(0, CARD_CLEAR_TOP - at.y)}px`)
-    const half = (el.querySelector<HTMLElement>('.pin-card')?.offsetWidth ?? 0) / 2
+    const half = (card?.offsetWidth ?? 0) / 2
     const nudge = Math.min(Math.max(at.x, half + CARD_MARGIN), width - half - CARD_MARGIN) - at.x
     el.style.setProperty('--nudge', `${nudge}px`)
   }, [])
 
-  const writeCoords = useCallback((c: CameraState) => {
+  const writeCoords = useCallback((c: Pick<CameraState, 'x' | 'y' | 'z'>) => {
     if (yRef.current) yRef.current.textContent = String(Math.round(c.y))
     // Don't type over someone typing, in either field.
     const typing = document.activeElement === xRef.current || document.activeElement === zRef.current
@@ -72,21 +103,39 @@ export default function App() {
   }
 
   useEffect(() => {
-    const engine = new MapEngine(canvasRef.current!, {
-      onStats: setStats,
-      // Straight to the DOM: this runs every frame the camera moves.
-      onCamera: (c: CameraState) => {
-        writeCoords(c)
-        placeMarker()
-      },
-      bench,
-    })
+    let engine: MapEngine
+    try {
+      engine = new MapEngine(canvasRef.current!, {
+        onStats: setStats,
+        // Straight to the DOM: this runs every frame the camera moves.
+        onCamera: (c: CameraState) => {
+          writeCoords(c)
+          placeMarker()
+          if (compassRef.current) compassRef.current.style.transform = `rotate(${c.az}deg)`
+        },
+        onLoadState: setLoad,
+        onMapStatus: (id, status) => setStatuses((all) => ({ ...all, [id]: status })),
+        bench,
+      })
+    } catch (e) {
+      console.error(e)
+      const why =
+        e instanceof WebGL2Missing
+          ? 'This map needs WebGL2, which this browser or device doesn’t provide.'
+          : 'This map’s renderer couldn’t start in this browser.'
+      queueMicrotask(() => setError(why))
+      return
+    }
     engineRef.current = engine
     ;(window as unknown as { tealmap: MapEngine }).tealmap = engine
 
     const open = (m: MapInfo, view: Parameters<MapEngine['setMap']>[1]) => {
       setCurrent(m)
-      engine.setMap(m, view).catch((e) => setError(String(e)))
+      setError(null)
+      engine.setMap(m, view).catch((e) => {
+        console.error(e)
+        setError('This map couldn’t be opened.')
+      })
     }
 
     // Startup, links pasted into the address bar and the Back button all come through here.
@@ -104,27 +153,90 @@ export default function App() {
       setPin(target ? (linked ?? null) : null)
     }
 
-    fetch('/api/maps')
-      .then((r) => r.json() as Promise<MapInfo[]>)
-      .then((list) => {
+    let closed = false
+    let retryTimer = 0
+    const loadMaps = async (retry: number) => {
+      try {
+        const res = await fetch('/api/maps')
+        if (!res.ok) throw new Error(`${res.status} ${res.statusText}`)
+        const list = (await res.json()) as MapInfo[]
+        if (closed) return
+        setNoServer(false)
         mapsRef.current = list
         setMaps(list)
-        if (!list.length) setError('No maps configured.')
-        else follow()
-      })
-      .catch((e) => setError(String(e)))
+        setStatuses(Object.fromEntries(list.flatMap((m) => (m.status ? [[m.id, m.status]] : []))))
+        follow()
+      } catch (e) {
+        if (closed) return
+        console.warn(`maps: ${e}`)
+        setNoServer(true)
+        retryTimer = window.setTimeout(() => loadMaps(Math.min(retry * 2, RETRY_LAST_MS)), retry)
+      }
+    }
+    void loadMaps(RETRY_FIRST_MS)
     // popstate comes first, in the same task as the URL changing, so no pending
     // write can replace the URL before it's read. hashchange covers the rest.
     window.addEventListener('popstate', follow)
     window.addEventListener('hashchange', follow)
-    const escape = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && pinRef.current) setPin(null)
+    const held = new Map<string, string>()
+    // Typing and browser shortcuts keep their keys. Everything else on the page
+    // can share them with the map, which is most of what the page is.
+    const keyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        // One thing per press: held down, it'd go on to take the pin as well.
+        if (e.repeat) return
+        const menuOpen = menuRef.current
+        if (menuOpen) {
+          setMenu(false)
+          pickerButtonRef.current?.focus()
+        } else if (panelRef.current) setPanel(null)
+        else if (pinRef.current) setPin(null)
+        return
+      }
+      const typing = e.target instanceof HTMLElement && e.target.closest('input, textarea, select, [contenteditable]')
+      if (typing || e.ctrlKey || e.metaKey || e.altKey) {
+        // Whatever was held stops too, or the map would move under the typing.
+        engine.releaseKeys()
+        return
+      }
+      if (e.key === '?') {
+        if (!e.repeat) {
+          setMenu(false)
+          setPanel((p) => (p === 'help' ? null : 'help'))
+        }
+        return
+      }
+      const code = keyCode(e)
+      if (!e.repeat) held.set(e.code, code)
+      if (e.repeat ? engine.keyHeld(code) : engine.keyDown(code)) e.preventDefault()
     }
-    window.addEventListener('keydown', escape)
+    // A key can say something else by the time it's released, if Shift changed.
+    const keyUp = (e: KeyboardEvent) => {
+      engine.keyUp(held.get(e.code) ?? keyCode(e))
+      held.delete(e.code)
+    }
+    const leave = () => engine.releaseKeys()
+    const focused = (e: FocusEvent) => {
+      if (e.target instanceof HTMLElement && e.target.closest('input, textarea, select, [contenteditable]')) engine.releaseKeys()
+    }
+    const clickAway = (e: PointerEvent) => {
+      if (menuRef.current && !pickerRef.current?.contains(e.target as Node)) setMenu(false)
+    }
+    window.addEventListener('keydown', keyDown)
+    window.addEventListener('keyup', keyUp)
+    window.addEventListener('blur', leave)
+    window.addEventListener('focusin', focused)
+    window.addEventListener('pointerdown', clickAway)
     return () => {
       window.removeEventListener('popstate', follow)
       window.removeEventListener('hashchange', follow)
-      window.removeEventListener('keydown', escape)
+      window.removeEventListener('keydown', keyDown)
+      window.removeEventListener('keyup', keyUp)
+      window.removeEventListener('blur', leave)
+      window.removeEventListener('focusin', focused)
+      window.removeEventListener('pointerdown', clickAway)
+      closed = true
+      clearTimeout(retryTimer)
       engine.dispose()
     }
   }, [bench, placeMarker, writeCoords])
@@ -138,6 +250,8 @@ export default function App() {
 
   const switchMap = (m: MapInfo) => {
     setMenu(false)
+    // The button just chosen is about to hide, and focus would fall off the page.
+    pickerButtonRef.current?.focus()
     const engine = engineRef.current
     if (!engine || m.id === current?.id) return
     setNotice(null)
@@ -146,7 +260,11 @@ export default function App() {
     history.pushState(null, '', `#${m.id}`)
     setPin(null)
     setCurrent(m)
-    engine.setMap(m).catch((e) => setError(String(e)))
+    setError(null)
+    engine.setMap(m).catch((e) => {
+      console.error(e)
+      setError('This map couldn’t be opened.')
+    })
   }
 
   const goToCoords = (to: { x?: number; z?: number }) => {
@@ -166,8 +284,9 @@ export default function App() {
     if (e.isPrimary) pointersRef.current.clear()
     pointersRef.current.add(e.pointerId)
     // A second finger makes this a gesture, not a tap, until they're all lifted.
+    // Clicking away from the open menu is only that.
     pressRef.current =
-      pointersRef.current.size === 1 && e.button === 0
+      pointersRef.current.size === 1 && e.button === 0 && !menuRef.current
         ? { id: e.pointerId, x: e.clientX, y: e.clientY, at: e.timeStamp, kind: e.pointerType }
         : null
   }
@@ -192,12 +311,22 @@ export default function App() {
   }
 
   const loading = (stats?.pending ?? 0) > 0
+  const line = error
+    ? { text: error, alert: true }
+    : noServer
+      ? { text: 'Can’t reach the server. Retrying…', alert: true }
+      : notice
+        ? { text: notice, alert: false }
+        : statusLine(current?.name, load.problem, current ? statuses[current.id] : undefined, load.opened, load.hasTiles)
 
   return (
     <div className="app">
       <canvas
         ref={canvasRef}
         className="map"
+        tabIndex={0}
+        role="application"
+        aria-label="Map. Arrow keys or W A S D pan, Q and E rotate, R and F tilt, plus and minus zoom."
         onContextMenu={(e) => e.preventDefault()}
         onPointerDown={press}
         onPointerMove={move}
@@ -223,15 +352,30 @@ export default function App() {
           <span>tealmap</span>
         </div>
         {maps.length > 0 && (
-          <div className="picker">
-            <button className="picker-button" onClick={() => setMenu((v) => !v)} aria-expanded={menu}>
+          <div className="picker" ref={pickerRef}>
+            <button
+              ref={pickerButtonRef}
+              className="picker-button"
+              onClick={() => {
+                setMenu((v) => !v)
+                // On a phone the panel would cover the menu. Stats stay, for benchmarks.
+                setPanel((p) => (p === 'stats' ? p : null))
+              }}
+              aria-expanded={menu}
+              aria-controls="maps"
+              aria-label={`Map: ${current?.name ?? 'loading'}`}
+            >
               {current?.name ?? '…'}
               <ChevronDown size={14} className={menu ? 'flip' : ''} />
             </button>
-            <ul className={`menu ${menu ? 'open' : ''}`} role="menu">
+            <ul id="maps" className={`menu ${menu ? 'open' : ''}`}>
               {maps.map((m) => (
                 <li key={m.id}>
-                  <button className={m.id === current?.id ? 'active' : ''} onClick={() => switchMap(m)}>
+                  <button
+                    className={m.id === current?.id ? 'active' : ''}
+                    aria-current={m.id === current?.id ? 'true' : undefined}
+                    onClick={() => switchMap(m)}
+                  >
                     {m.name}
                   </button>
                 </li>
@@ -242,12 +386,56 @@ export default function App() {
       </header>
 
       <div className="bar top-right">
-        <button className={`icon ${statsOpen ? 'active' : ''}`} onClick={() => setStatsOpen((v) => !v)} aria-label="Stats">
+        <button
+          className={`icon ${panel === 'help' ? 'active' : ''}`}
+          onClick={() => {
+            setMenu(false)
+            setPanel((p) => (p === 'help' ? null : 'help'))
+          }}
+          aria-label="Controls"
+          aria-expanded={panel === 'help'}
+          title="Controls"
+        >
+          <CircleHelp size={16} />
+        </button>
+        <button
+          className={`icon ${panel === 'stats' ? 'active' : ''}`}
+          onClick={() => {
+            setMenu(false)
+            setPanel((p) => (p === 'stats' ? null : 'stats'))
+          }}
+          aria-label="Stats"
+          aria-expanded={panel === 'stats'}
+          title="Stats"
+        >
           <Activity size={16} />
         </button>
       </div>
 
-      <section className={`panel ${statsOpen ? 'open' : ''}`} aria-hidden={!statsOpen}>
+      <div className="bar bottom-right">
+        <button className="icon" onClick={() => engineRef.current?.pointNorth()} aria-label="Point north" title="Point north">
+          <span ref={compassRef} className="compass">
+            <Navigation2 size={16} />
+          </span>
+        </button>
+        <button
+          className="icon"
+          onClick={() => {
+            const engine = engineRef.current
+            if (engine?.loaded) engine.jumpTo(engine.homeView())
+          }}
+          aria-label="Go to the map's start"
+          title="Go to the map's start"
+        >
+          <House size={16} />
+        </button>
+      </div>
+
+      <section className={`panel ${panel === 'help' ? 'open' : ''}`} aria-hidden={panel !== 'help'}>
+        <Help />
+      </section>
+
+      <section className={`panel ${panel === 'stats' ? 'open' : ''}`} aria-hidden={panel !== 'stats'}>
         {stats && (
           <dl className="stats">
             <dt>fps</dt>
@@ -286,7 +474,11 @@ export default function App() {
         link={linkHere}
       />
 
-      {(error ?? notice) && <div className="error">{error ?? notice}</div>}
+      {line && (
+        <div className={`status ${line.alert ? 'alert' : ''}`} role="status">
+          {line.text}
+        </div>
+      )}
     </div>
   )
 }
