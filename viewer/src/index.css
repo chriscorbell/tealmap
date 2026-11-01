@@ -53,14 +53,13 @@ button {
   display: block;
   width: 100%;
   height: 100%;
-  /* A lost GPU context shows the element's background rather than a frame. */
-  background: var(--bg);
   touch-action: none;
   outline: none;
 }
 
 .bar {
   position: absolute;
+  z-index: 2;
   display: flex;
   align-items: center;
   gap: 6px;
@@ -208,6 +207,7 @@ button {
 
 .panel {
   position: absolute;
+  z-index: 2;
   top: 62px;
   right: 14px;
   width: 220px;

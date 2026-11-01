@@ -331,6 +331,8 @@ export class MapEngine {
     // A camera nobody has moved stays free to frame the map as tiles arrive.
     if (this.ready) this.startView = this.autoView ? undefined : (this.flight?.to ?? this.view())
     this.lost = true
+    // Browsers paint a lost canvas white, whatever is behind it.
+    this.canvas.style.visibility = 'hidden'
     this.generation++
     this.ready = false
     cancelAnimationFrame(this.raf)
@@ -344,6 +346,7 @@ export class MapEngine {
   /** Everything on the GPU went with the context: tiles and textures load again, from the HTTP cache. */
   private contextRestored = () => {
     this.lost = false
+    this.canvas.style.visibility = ''
     this.problem = null
     this.renderer = new Renderer(this.gl)
     this.gl.clearColor(BG[0], BG[1], BG[2], 1)

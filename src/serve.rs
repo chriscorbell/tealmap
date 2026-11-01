@@ -202,17 +202,19 @@ pub fn run(cfg: Config, pool: rayon::ThreadPool) -> Result<()> {
                 setups.try_iter().for_each(&mut finish_setup);
                 for (i, (slot, map)) in slots.iter_mut().zip(&render_cfg.maps).enumerate() {
                     let Some(ctx) = &slot.ctx else { continue };
-                    // A pass that keeps failing doesn't get to say it's rendering
-                    // until a batch of it has worked.
-                    let failing = slot.failing.is_some();
+                    // A map in trouble doesn't get to say it's rendering until a
+                    // batch of it has worked, or the line would flip every poll.
+                    let in_trouble = statuses.get(&map.id) == Some(MapStatus::Error);
                     let started = |total| {
-                        if total > 0 && !failing {
+                        if total > 0 && !in_trouble {
                             statuses.set(i, MapStatus::Rendering { done: 0, total });
                         }
                     };
                     let publish = |up: &Update| {
                         let (done, total) = up.progress;
-                        statuses.set(i, MapStatus::Rendering { done, total });
+                        if !in_trouble || up.stats.failed_chunks == 0 {
+                            statuses.set(i, MapStatus::Rendering { done, total });
+                        }
                         if !up.hires.is_empty() || !up.lod.is_empty() {
                             let msg = serde_json::json!({ "map": ctx.cfg.id, "update": up });
                             let _ = tx.send(("update", msg.to_string()));
@@ -231,7 +233,7 @@ pub fn run(cfg: Config, pool: rayon::ThreadPool) -> Result<()> {
                                     MapStatus::Ready
                                 },
                             );
-                            if slot.failing.take().is_some() {
+                            if !broken && slot.failing.take().is_some() {
                                 tracing::info!("map {}: working again", map.id);
                             }
                             if !up.hires.is_empty() || !up.lod.is_empty() {
