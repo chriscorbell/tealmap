@@ -130,6 +130,7 @@ button {
 }
 
 .picker-name {
+  max-width: min(36vw, 320px);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -580,6 +581,11 @@ button {
   .places input,
   .coords input {
     font-size: 16px;
+  }
+
+  /* That's wider per character, and the bar still has to fit a small phone. */
+  .coords input {
+    width: calc(6ch + 8px);
   }
 
   .places input {

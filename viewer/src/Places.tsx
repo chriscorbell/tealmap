@@ -37,8 +37,13 @@ export function Places({ places, open, go }: { places: Place[]; open: boolean; g
         value={query}
         onChange={(e) => setQuery(e.target.value)}
         onKeyDown={(e) => {
-          // Enter in the middle of composing text is part of the composing.
-          if (e.key === 'Enter' && open && !e.repeat && !e.nativeEvent.isComposing && found[0]) choose(found[0])
+          if (e.key !== 'Enter') return
+          // Focus moves to a button on choosing, and this same press would then click it.
+          e.preventDefault()
+          // Enter in the middle of composing text is part of the composing. Safari
+          // doesn't always say so, except with this key code.
+          const composing = e.nativeEvent.isComposing || e.keyCode === 229
+          if (open && !e.repeat && !composing && found[0]) choose(found[0])
         }}
       />
       {found.length > 0 ? (

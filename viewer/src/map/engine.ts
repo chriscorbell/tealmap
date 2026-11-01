@@ -809,8 +809,11 @@ export class MapEngine {
     const here = this.flight?.to ?? this.view()
     if (to.x === here.x && to.z === here.z && to.dist === here.dist && to.az === here.az && to.polar === here.polar) return
     this.cancelHashWrite()
-    history.replaceState(null, '', this.hash())
-    history.pushState(null, '', formatHash(this.map.id, to, this.pin))
+    // Until a map opens, this only changes where it starts, so there's nothing to go back to.
+    if (this.ready) {
+      history.replaceState(null, '', this.hash())
+      history.pushState(null, '', formatHash(this.map.id, to, this.pin))
+    } else history.replaceState(null, '', formatHash(this.map.id, to, this.pin))
     this.flyTo(to)
   }
 

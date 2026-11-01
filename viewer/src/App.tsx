@@ -412,6 +412,10 @@ export default function App() {
           <button
             ref={placesButtonRef}
             className={`icon ${panel === 'places' ? 'active' : ''}`}
+            // An Enter still held from choosing a place shouldn't open the list again.
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && e.repeat) e.preventDefault()
+            }}
             onClick={() => {
               setMenu(false)
               setPanel((p) => (p === 'places' ? null : 'places'))
