@@ -27,6 +27,8 @@ const MAX_Y = 4096
 const MAX_DIST = 1_000_000
 const DECIMAL = /^-?\d+(\.\d+)?$/
 const INTEGER = /^-?\d+$/
+/** Anything meant as a number, whether or not it's one a position can have. */
+const NUMERIC = /^[-+]?\.?\d[\d.]*(e[-+]?\d+)?$/i
 
 export function parseHash(hash: string): Route {
   const [id, ...parts] = hash.slice(1).split('/')
@@ -66,16 +68,16 @@ export function parseCoord(text: string): number | null {
  * Reads a position out of pasted or typed text, such as `120 64 -340`, `120, -340`,
  * `XYZ: 120.5 / 64 / -340.5` or `/tp @s 120 64 -340`. Two numbers are x and z; with
  * more, the first three are x, y, z. Words with digits in them aren't numbers, and
- * neither are relative coordinates like `~10`.
+ * a position with relative coordinates like `~10` isn't one to go to.
  */
 export function parseCoords(text: string): { x: number; z: number } | null {
   const t = text.trim()
   // A link has plenty of numbers in it, and none of them are a position to go to.
   if (t.startsWith('#') || /^[a-z]+:\/\//i.test(t)) return null
-  const n = t
-    .split(/[\s,;:/()[\]{}]+/)
-    .map(parseCoord)
-    .filter((v) => v !== null)
+  const tokens = t.split(/[\s,;:/()[\]{}]+/)
+  // Dropping one of a position's numbers would turn y and z into x and z.
+  if (tokens.some((w) => /^[~^]/.test(w) || (NUMERIC.test(w) && parseCoord(w) === null))) return null
+  const n = tokens.map(parseCoord).filter((v) => v !== null)
   if (n.length === 2) return { x: n[0], z: n[1] }
   if (n.length >= 3) return { x: n[0], z: n[2] }
   return null

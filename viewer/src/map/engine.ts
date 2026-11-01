@@ -531,7 +531,7 @@ export class MapEngine {
     if (t === Infinity) return null
     // A ray only hits by coming down onto a surface. A column's top says nothing
     // about a camera under it, like one beneath a tree or an overhang.
-    let above = !below(t)
+    let above = o.y > m.maxY || !below(t)
     let before = t
     for (let i = 0; ; i++) {
       if (i === PICK_STEPS || o.y + dir.y * t < m.minY) return null
