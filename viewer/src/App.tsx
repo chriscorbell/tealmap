@@ -179,21 +179,29 @@ export default function App() {
         return
       }
       const typing = e.target instanceof HTMLElement && e.target.closest('input, textarea, select, [contenteditable]')
-      if (typing || e.ctrlKey || e.metaKey || e.altKey) return
+      if (typing || e.ctrlKey || e.metaKey || e.altKey) {
+        // Whatever was held stops too, or the map would move under the typing.
+        engine.releaseKeys()
+        return
+      }
       if (e.key === '?') {
-        setPanel((p) => (p === 'help' ? null : 'help'))
+        if (!e.repeat) setPanel((p) => (p === 'help' ? null : 'help'))
         return
       }
       if (e.repeat ? engine.keyHeld(e.code) : engine.keyDown(e.code)) e.preventDefault()
     }
     const keyUp = (e: KeyboardEvent) => engine.keyUp(e.code)
     const leave = () => engine.releaseKeys()
+    const focused = (e: FocusEvent) => {
+      if (e.target instanceof HTMLElement && e.target.closest('input, textarea, select, [contenteditable]')) engine.releaseKeys()
+    }
     const clickAway = (e: PointerEvent) => {
       if (menuRef.current && !pickerRef.current?.contains(e.target as Node)) setMenu(false)
     }
     window.addEventListener('keydown', keyDown)
     window.addEventListener('keyup', keyUp)
     window.addEventListener('blur', leave)
+    window.addEventListener('focusin', focused)
     window.addEventListener('pointerdown', clickAway)
     return () => {
       window.removeEventListener('popstate', follow)
@@ -201,6 +209,7 @@ export default function App() {
       window.removeEventListener('keydown', keyDown)
       window.removeEventListener('keyup', keyUp)
       window.removeEventListener('blur', leave)
+      window.removeEventListener('focusin', focused)
       window.removeEventListener('pointerdown', clickAway)
       closed = true
       clearTimeout(retryTimer)
@@ -320,7 +329,11 @@ export default function App() {
             <button
               ref={pickerButtonRef}
               className="picker-button"
-              onClick={() => setMenu((v) => !v)}
+              onClick={() => {
+                setMenu((v) => !v)
+                // On a phone the panel would cover the menu. Stats stay, for benchmarks.
+                setPanel((p) => (p === 'stats' ? p : null))
+              }}
               aria-expanded={menu}
               aria-controls="maps"
               aria-label={`Map: ${current?.name ?? 'loading'}`}
@@ -348,7 +361,10 @@ export default function App() {
       <div className="bar top-right">
         <button
           className={`icon ${panel === 'help' ? 'active' : ''}`}
-          onClick={() => setPanel((p) => (p === 'help' ? null : 'help'))}
+          onClick={() => {
+            setMenu(false)
+            setPanel((p) => (p === 'help' ? null : 'help'))
+          }}
           aria-label="Controls"
           aria-expanded={panel === 'help'}
           title="Controls"
@@ -357,7 +373,10 @@ export default function App() {
         </button>
         <button
           className={`icon ${panel === 'stats' ? 'active' : ''}`}
-          onClick={() => setPanel((p) => (p === 'stats' ? null : 'stats'))}
+          onClick={() => {
+            setMenu(false)
+            setPanel((p) => (p === 'stats' ? null : 'stats'))
+          }}
           aria-label="Stats"
           aria-expanded={panel === 'stats'}
           title="Stats"

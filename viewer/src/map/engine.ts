@@ -485,16 +485,22 @@ export class MapEngine {
     // A level 1–3 node is a 2^(3-level) grid cell of a region's mask, so masks
     // answer those without a set. Only nodes bigger than a region need one.
     this.masks = new Map((m.hires ?? []).map(([rx, rz, lo, hi]) => [key(0, rx, rz), [lo, hi]]))
-    const regions = m.hires ?? []
-    const region = TILE * 8
-    this.bounds = regions.length
-      ? {
-          minX: Math.min(...regions.map((r) => r[0])) * region - PAN_MARGIN,
-          maxX: (Math.max(...regions.map((r) => r[0])) + 1) * region + PAN_MARGIN,
-          minZ: Math.min(...regions.map((r) => r[1])) * region - PAN_MARGIN,
-          maxZ: (Math.max(...regions.map((r) => r[1])) + 1) * region + PAN_MARGIN,
-        }
-      : null
+    let bounds: { minX: number; maxX: number; minZ: number; maxZ: number } | null = null
+    this.forEachHires(m, (x, z) => {
+      bounds ??= { minX: x, maxX: x, minZ: z, maxZ: z }
+      bounds.minX = Math.min(bounds.minX, x)
+      bounds.maxX = Math.max(bounds.maxX, x)
+      bounds.minZ = Math.min(bounds.minZ, z)
+      bounds.maxZ = Math.max(bounds.maxZ, z)
+    })
+    // TypeScript can't see the callback assign it.
+    const tiles = bounds as { minX: number; maxX: number; minZ: number; maxZ: number } | null
+    this.bounds = tiles && {
+      minX: tiles.minX * TILE - PAN_MARGIN,
+      maxX: (tiles.maxX + 1) * TILE + PAN_MARGIN,
+      minZ: tiles.minZ * TILE - PAN_MARGIN,
+      maxZ: (tiles.maxZ + 1) * TILE + PAN_MARGIN,
+    }
     this.bigNodes = new Set()
     this.roots = []
     let row: [number, number][] = (m.hires ?? []).map(([rx, rz]) => [rx, rz])
@@ -558,6 +564,15 @@ export class MapEngine {
     for (const [x, z] of this.roots) walk(m.lodLevels, x, z)
   }
 
+  /** Visits every hires tile a manifest lists. */
+  private forEachHires(m: Manifest, f: (x: number, z: number) => void) {
+    for (const [rx, rz, lo, hi] of m.hires ?? []) {
+      for (let bit = 0; bit < 64; bit++) {
+        if (((bit < 32 ? lo : hi) >>> (bit & 31)) & 1) f(rx * 8 + (bit & 7), rz * 8 + (bit >> 3))
+      }
+    }
+  }
+
   /** Where the map starts: its configured spot, or the mapped tile closest to the middle of everything mapped. */
   homeView(): View {
     const view = (x: number, z: number) => ({ x, z, dist: START_DIST, az: START_AZ, polar: START_POLAR })
@@ -569,14 +584,7 @@ export class MapEngine {
     let cx = 0
     let cz = 0
     let n = 0
-    const each = (f: (x: number, z: number) => void) => {
-      for (const [rx, rz, lo, hi] of hires) {
-        for (let bit = 0; bit < 64; bit++) {
-          if (((bit < 32 ? lo : hi) >>> (bit & 31)) & 1) f(rx * 8 + (bit & 7), rz * 8 + (bit >> 3))
-        }
-      }
-    }
-    each((x, z) => {
+    this.forEachHires(m!, (x, z) => {
       cx += x
       cz += z
       n++
@@ -585,7 +593,7 @@ export class MapEngine {
     cz /= n
     let best = [0, 0]
     let bestD = Infinity
-    each((x, z) => {
+    this.forEachHires(m!, (x, z) => {
       const d = (x - cx) ** 2 + (z - cz) ** 2
       if (d < bestD) {
         bestD = d
@@ -607,7 +615,8 @@ export class MapEngine {
     const t = this.controls.target
     const dx = Math.min(Math.max(t.x, b.minX), b.maxX) - t.x
     const dz = Math.min(Math.max(t.z, b.minZ), b.maxZ) - t.z
-    if (dx === 0 && dz === 0) return
+    // Past rounding error only: correcting that would keep a resting map drawing.
+    if (Math.abs(dx) < 1e-6 && Math.abs(dz) < 1e-6) return
     t.x += dx
     t.z += dz
     this.camera.position.x += dx
