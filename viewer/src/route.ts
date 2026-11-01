@@ -73,7 +73,7 @@ export function parseCoord(text: string): number | null {
 export function parseCoords(text: string): { x: number; z: number } | null {
   const t = text.trim()
   // A link has plenty of numbers in it, and none of them are a position to go to.
-  if (t.startsWith('#') || /^[a-z]+:\/\//i.test(t)) return null
+  if (t.includes('#') || /^[a-z]+:\/\//i.test(t)) return null
   const tokens = t.split(/[\s,;:/()[\]{}]+/)
   // Dropping one of a position's numbers would turn y and z into x and z.
   if (tokens.some((w) => /^[~^]/.test(w) || (NUMERIC.test(w) && parseCoord(w) === null))) return null

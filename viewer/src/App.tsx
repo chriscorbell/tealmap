@@ -11,6 +11,8 @@ const CLICK_MS = 500
 const NOTICE_MS = 6000
 /** How far the pin's card stays from the screen's edges, in CSS pixels. */
 const CARD_MARGIN = 8
+/** How far down the screen a card below its pin starts, to clear the top bars. */
+const CARD_CLEAR_TOP = 64
 
 export default function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null)
@@ -41,11 +43,14 @@ export default function App() {
     // On top of the block, not inside it.
     const at = engine.project(p.x + 0.5, p.y + 1, p.z + 0.5)
     const { clientWidth: width, clientHeight: height } = canvasRef.current!
-    const onScreen = at && at.x >= 0 && at.x <= width && at.y >= 0 && at.y <= height
+    // While another map opens, the camera is still looking at the last one.
+    const onScreen = engine.loaded && at && at.x >= 0 && at.x <= width && at.y >= 0 && at.y <= height
     el.style.visibility = onScreen ? 'visible' : 'hidden'
     if (!onScreen) return
     el.style.transform = `translate(${at.x}px, ${at.y}px)`
     el.classList.toggle('below', at.y < 90)
+    // Under the top bars, a card's buttons couldn't be reached.
+    el.style.setProperty('--drop', `${Math.max(0, CARD_CLEAR_TOP - at.y)}px`)
     const half = (el.querySelector<HTMLElement>('.pin-card')?.offsetWidth ?? 0) / 2
     const nudge = Math.min(Math.max(at.x, half + CARD_MARGIN), width - half - CARD_MARGIN) - at.x
     el.style.setProperty('--nudge', `${nudge}px`)
@@ -146,7 +151,8 @@ export default function App() {
 
   const goToCoords = (to: { x?: number; z?: number }) => {
     const engine = engineRef.current
-    if (!engine?.mapId) return
+    // Until the map opens, there's no camera to go from.
+    if (!engine?.mapId || !engine.loaded) return
     const here = engine.view()
     const x = Math.round(to.x ?? here.x)
     const z = Math.round(to.z ?? here.z)
@@ -179,8 +185,10 @@ export default function App() {
     const p = pressRef.current
     pressRef.current = null
     if (!p || p.id !== e.pointerId || e.timeStamp - p.at > CLICK_MS) return
-    // The first click away from a pin only clears it, so a stray click can't lose your place.
-    setPin(pinRef.current ? null : (engineRef.current?.pick(e.clientX, e.clientY) ?? null))
+    // The first click away from a pin you can see only clears it, so a stray click
+    // can't lose your place.
+    const showing = pinRef.current && markerRef.current?.style.visibility !== 'hidden'
+    setPin(showing ? null : (engineRef.current?.pick(e.clientX, e.clientY) ?? null))
   }
 
   const loading = (stats?.pending ?? 0) > 0
@@ -193,6 +201,11 @@ export default function App() {
         onContextMenu={(e) => e.preventDefault()}
         onPointerDown={press}
         onPointerMove={move}
+        // Zooming moves the camera, so what's in the fields is out of date.
+        onWheel={() => {
+          const active = document.activeElement
+          if (active === xRef.current || active === zRef.current) (active as HTMLElement).blur()
+        }}
         onPointerUp={release}
         onPointerCancel={(e) => {
           pointersRef.current.delete(e.pointerId)

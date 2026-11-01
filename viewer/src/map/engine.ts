@@ -453,6 +453,18 @@ export class MapEngine {
     return this.map?.id ?? null
   }
 
+  /** Whether the map being shown has opened, so the camera is on it. */
+  get loaded() {
+    return this.ready
+  }
+
+  /** Stops a fling, so it doesn't carry the camera on from wherever it's sent next. */
+  private stopInertia() {
+    this.controls.enableDamping = false
+    this.controls.update()
+    this.controls.enableDamping = true
+  }
+
   goTo(v: View) {
     this.autoView = false
     this.flight = null
@@ -461,6 +473,7 @@ export class MapEngine {
       this.startView = v
       return
     }
+    this.stopInertia()
     this.placeCamera(v.x, v.z, v.dist, v.az, v.polar)
     this.lastPlan = 0
     this.dirty = true
@@ -475,6 +488,7 @@ export class MapEngine {
     const far = Math.hypot(to.x - from.x, to.z - from.z) > 3 * Math.max(from.dist, to.dist)
     if (far || !this.ready || matchMedia('(prefers-reduced-motion: reduce)').matches) return this.goTo(to)
     this.autoView = false
+    this.stopInertia()
     this.flight = { from, to, start: 0 }
     this.wake()
   }
@@ -975,7 +989,7 @@ export class MapEngine {
     const e = 1 - (1 - p) ** 3
     const mix = (a: number, b: number) => a + (b - a) * e
     // Around the short way.
-    const az = f.from.az + (((f.to.az - f.from.az + 540) % 360) - 180) * e
+    const az = f.from.az + ((((f.to.az - f.from.az) % 360) + 540) % 360 - 180) * e
     this.placeCamera(mix(f.from.x, f.to.x), mix(f.from.z, f.to.z), mix(f.from.dist, f.to.dist), az, mix(f.from.polar, f.to.polar), this.controls.target.y)
     this.dirty = true
     if (p === 1) this.flight = null
