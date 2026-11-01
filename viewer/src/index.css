@@ -53,6 +53,8 @@ button {
   display: block;
   width: 100%;
   height: 100%;
+  /* A lost GPU context shows the element's background rather than a frame. */
+  background: var(--bg);
   touch-action: none;
   outline: none;
 }
@@ -371,17 +373,37 @@ button {
   animation-play-state: running;
 }
 
-.error {
+.status {
   position: absolute;
   bottom: 14px;
   left: 50%;
-  transform: translateX(-50%);
+  translate: -50% 0;
+  width: max-content;
+  max-width: calc(100vw - 28px);
   padding: 8px 14px;
+  overflow-wrap: anywhere;
+  text-align: center;
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  pointer-events: none;
+  animation: rise 0.4s var(--ease) both;
+}
+
+.status.alert {
   color: #fecaca;
   background: rgba(60, 16, 16, 0.85);
-  border: 1px solid rgba(248, 113, 113, 0.25);
-  border-radius: 10px;
-  animation: rise 0.4s var(--ease) both;
+  border-color: rgba(248, 113, 113, 0.25);
+}
+
+/* Too narrow to sit beside the coordinates. */
+@media (max-width: 860px) {
+  .status {
+    bottom: 62px;
+  }
 }
 
 @keyframes enter {
