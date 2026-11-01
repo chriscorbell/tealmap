@@ -5,6 +5,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// The subset of jar entries tealmap needs, held in memory.
 pub struct AssetFiles {
@@ -102,7 +103,8 @@ pub fn client_jar(version: &str, cache_dir: &Path) -> Result<PathBuf> {
     let sha1 = client["sha1"].as_str().unwrap_or_default().to_owned();
 
     let mut body = Vec::new();
-    ureq::get(jar_url)
+    agent()
+        .get(jar_url)
         .call()?
         .into_body()
         .with_config()
@@ -120,7 +122,17 @@ pub fn client_jar(version: &str, cache_dir: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
+/// Nothing else sets a time limit, and a hung download would hold up every map
+/// still waiting to be set up.
+fn agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_connect(Some(Duration::from_secs(30)))
+        .timeout_global(Some(Duration::from_secs(600)))
+        .build()
+        .into()
+}
+
 fn get_json(url: &str) -> Result<serde_json::Value> {
-    let text = ureq::get(url).call()?.into_body().read_to_string()?;
+    let text = agent().get(url).call()?.into_body().read_to_string()?;
     Ok(serde_json::from_str(&text)?)
 }

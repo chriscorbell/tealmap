@@ -202,8 +202,11 @@ pub fn run(cfg: Config, pool: rayon::ThreadPool) -> Result<()> {
                 setups.try_iter().for_each(&mut finish_setup);
                 for (i, (slot, map)) in slots.iter_mut().zip(&render_cfg.maps).enumerate() {
                     let Some(ctx) = &slot.ctx else { continue };
+                    // A pass that keeps failing doesn't get to say it's rendering
+                    // until a batch of it has worked.
+                    let failing = slot.failing.is_some();
                     let started = |total| {
-                        if total > 0 {
+                        if total > 0 && !failing {
                             statuses.set(i, MapStatus::Rendering { done: 0, total });
                         }
                     };

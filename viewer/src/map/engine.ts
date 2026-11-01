@@ -217,6 +217,7 @@ export class MapEngine {
   /** When tiles started failing without any loading in between, or 0. */
   private failingSince = 0
   private refreshTimer = 0
+  private reconnectTimer = 0
   /** The GPU context is gone until the browser gives it back. */
   private lost = false
   private hashTimer = 0
@@ -312,6 +313,7 @@ export class MapEngine {
     clearTimeout(this.sleepTimer)
     clearTimeout(this.hashTimer)
     clearTimeout(this.refreshTimer)
+    clearTimeout(this.reconnectTimer)
     window.removeEventListener('resize', this.resize)
     for (const event of ['pointerdown', 'wheel', 'touchstart']) this.canvas.removeEventListener(event, this.wake)
     this.canvas.removeEventListener('webglcontextlost', this.contextLost)
@@ -326,7 +328,8 @@ export class MapEngine {
   /** Asking for the event's default not to happen is how a page says it'll rebuild. */
   private contextLost = (e: Event) => {
     e.preventDefault()
-    if (this.ready) this.startView = this.view()
+    // A camera nobody has moved stays free to frame the map as tiles arrive.
+    if (this.ready) this.startView = this.autoView ? undefined : (this.flight?.to ?? this.view())
     this.lost = true
     this.generation++
     this.ready = false
@@ -747,6 +750,7 @@ export class MapEngine {
   }
 
   private listen() {
+    clearTimeout(this.reconnectTimer)
     this.events?.close()
     const es = new EventSource('/api/events')
     es.addEventListener('status', (e) => {
@@ -771,6 +775,13 @@ export class MapEngine {
       // Revalidate resident tiles too; unchanged ones come back as 304s.
       for (const t of this.tiles.values()) t.stale = true
       this.refreshManifest(this.generation)
+    }
+    // A browser reconnects by itself after a dropped stream, but gives up for good
+    // on an error response, like a proxy's during a restart.
+    es.onerror = () => {
+      if (es.readyState !== EventSource.CLOSED || this.events !== es || this.disposed) return
+      clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = window.setTimeout(() => this.listen(), WAIT_MS)
     }
     this.events = es
   }
@@ -995,9 +1006,12 @@ export class MapEngine {
       this.wake()
       if (res.kind === 'error') {
         console.warn(`tile ${level}:${x},${z}: ${res.message}`)
-        const failed = performance.now()
-        this.failingSince ||= failed
-        if (failed - this.failingSince > TILES_FAILING_MS && !this.problem) this.setProblem('unreachable')
+        // One tile that won't decode isn't the server being away.
+        if (!res.arrived) {
+          const failed = performance.now()
+          this.failingSince ||= failed
+          if (failed - this.failingSince > TILES_FAILING_MS && !this.problem) this.setProblem('unreachable')
+        }
         // Keep an old mesh; with nothing to show, retry later instead of
         // treating the tile as empty and leaving a hole.
         if (tile.mesh) tile.state = 'ready'

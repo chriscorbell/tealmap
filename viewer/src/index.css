@@ -375,7 +375,7 @@ button {
 
 .status {
   position: absolute;
-  bottom: 14px;
+  top: 64px;
   left: 50%;
   translate: -50% 0;
   width: max-content;
@@ -397,13 +397,6 @@ button {
   color: #fecaca;
   background: rgba(60, 16, 16, 0.85);
   border-color: rgba(248, 113, 113, 0.25);
-}
-
-/* Too narrow to sit beside the coordinates. */
-@media (max-width: 860px) {
-  .status {
-    bottom: 62px;
-  }
 }
 
 @keyframes enter {

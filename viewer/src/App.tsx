@@ -336,7 +336,7 @@ export default function App() {
       />
 
       {line && (
-        <div className={`status ${line.alert ? 'alert' : ''}`} role="status" key={line.text}>
+        <div className={`status ${line.alert ? 'alert' : ''}`} role="status">
           {line.text}
         </div>
       )}

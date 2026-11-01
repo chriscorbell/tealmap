@@ -9,7 +9,8 @@ export type Request = { kind: 'tile'; id: number; url: string; fresh: boolean } 
 
 export type Response =
   | { kind: 'tile'; id: number; tile: DecodedTile | null; bytes: number }
-  | { kind: 'error'; id: number; message: string }
+  /** `arrived` says the server answered, and the problem is with what it sent. */
+  | { kind: 'error'; id: number; message: string; arrived: boolean }
 
 const inflight = new Map<number, AbortController>()
 
@@ -22,6 +23,7 @@ self.onmessage = async (e: MessageEvent<Request>) => {
   }
   const ctl = new AbortController()
   inflight.set(req.id, ctl)
+  let arrived = false
   try {
     const res = await fetch(req.url, { signal: ctl.signal, cache: req.fresh ? 'no-cache' : 'default' })
     if (res.status === 404) {
@@ -30,13 +32,14 @@ self.onmessage = async (e: MessageEvent<Request>) => {
     }
     if (!res.ok) throw new Error(`${res.status} ${res.statusText}`)
     const buf = await res.arrayBuffer()
+    arrived = true
     const tile = decodeTile(buf)
     // Count bytes on the wire: Content-Length is the gzipped size.
     const wire = Number(res.headers.get('content-length')) || buf.byteLength
     post({ kind: 'tile', id: req.id, tile, bytes: wire }, [tile.quads.buffer, tile.tables.buffer, tile.tops.buffer])
   } catch (err) {
     if ((err as Error).name === 'AbortError') return
-    post({ kind: 'error', id: req.id, message: String(err) })
+    post({ kind: 'error', id: req.id, message: String(err), arrived })
   } finally {
     inflight.delete(req.id)
   }

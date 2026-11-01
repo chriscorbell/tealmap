@@ -635,7 +635,8 @@ impl MapCtx {
                 None => {
                     res.empty += 1;
                     if path.exists() {
-                        std::fs::remove_file(&path)?;
+                        std::fs::remove_file(&path)
+                            .with_context(|| format!("removing {}", path.display()))?;
                         res.tiles.push((tx, tz));
                     }
                 }
@@ -673,7 +674,8 @@ impl MapCtx {
                 write_if_changed(&path, &gz)?
             }
             None if path.exists() => {
-                std::fs::remove_file(&path)?;
+                std::fs::remove_file(&path)
+                    .with_context(|| format!("removing {}", path.display()))?;
                 true
             }
             None => false,

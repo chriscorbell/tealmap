@@ -26,9 +26,11 @@ export function statusLine(
   opened: boolean,
   hasTiles: boolean,
 ): StatusLine | null {
-  if (problem === 'lost') return { text: 'Restoring the map’s graphics…', alert: false }
+  if (problem === 'lost') return { text: 'Restoring the map’s graphics. If this stays, reload the page.', alert: false }
   if (problem === 'unreachable') return { text: 'Can’t reach the server. Retrying…', alert: true }
   const map = name ?? 'this map'
+  // Until the map's manifest answers, there's no telling whether it has tiles.
+  if (!opened && problem !== 'waiting') return null
   switch (status?.state) {
     case 'error':
       return {
